@@ -1,0 +1,57 @@
+-- 33_check_archive_default.sql: check_archive_default + reindex_queue
+-- pg_regress test for ulak
+SET client_min_messages = warning;
+-- ============================================================================
+-- CHECK_ARCHIVE_DEFAULT: empty default partition
+-- ============================================================================
+-- Should return 0 with no warning
+SELECT ulak.check_archive_default() = 0 AS empty_default;
+ empty_default 
+---------------
+ t
+(1 row)
+
+-- ============================================================================
+-- CHECK_ARCHIVE_DEFAULT: with rows in default partition
+-- ============================================================================
+-- Insert directly into default partition (simulate missing monthly partition)
+INSERT INTO ulak.archive_default (id, endpoint_id, payload, status, created_at, updated_at)
+VALUES (999999, 1, '{"test": "default"}'::jsonb, 'completed', '2020-01-01'::timestamptz, '2020-01-01'::timestamptz);
+-- Should return 1 with WARNING
+SELECT ulak.check_archive_default() = 1 AS one_in_default;
+WARNING:  [ulak] 1 row(s) found in archive_default partition — missing monthly partitions may need to be created
+ one_in_default 
+----------------
+ t
+(1 row)
+
+-- Cleanup
+DELETE FROM ulak.archive_default WHERE id = 999999;
+-- Verify back to 0
+SELECT ulak.check_archive_default() = 0 AS back_to_zero;
+ back_to_zero 
+--------------
+ t
+(1 row)
+
+-- ============================================================================
+-- REINDEX_QUEUE: function exists and is callable
+-- ============================================================================
+-- The function exists
+SELECT EXISTS(
+    SELECT 1 FROM pg_proc p
+    JOIN pg_namespace n ON p.pronamespace = n.oid
+    WHERE n.nspname = 'ulak' AND p.proname = 'reindex_queue'
+) AS reindex_func_exists;
+ reindex_func_exists 
+---------------------
+ t
+(1 row)
+
+-- Note: REINDEX CONCURRENTLY cannot run inside a transaction block,
+-- so we just verify the function exists and is properly defined.
+-- Actual reindex testing would need to be done outside pg_regress.
+-- ============================================================================
+-- CLEANUP
+-- ============================================================================
+RESET client_min_messages;

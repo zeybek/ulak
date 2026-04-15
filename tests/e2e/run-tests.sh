@@ -112,10 +112,11 @@ send_msg() {
 cleanup() {
   echo ""
   echo -e "${CYAN}Cleaning up...${NC}"
-  # Drop all test endpoints
   $PSQL -c "DELETE FROM ulak.queue;" 2>/dev/null || true
   $PSQL -c "DELETE FROM ulak.dlq;" 2>/dev/null || true
+  $PSQL -c "DELETE FROM ulak.event_types CASCADE;" 2>/dev/null || true
   $PSQL -c "DELETE FROM ulak.endpoints;" 2>/dev/null || true
+  $PSQL -c "DROP FUNCTION IF EXISTS public.test_transform_upper(jsonb);" 2>/dev/null || true
   webhook_clear
 }
 
@@ -633,6 +634,235 @@ else
   echo -e "  ${RED}✗${NC} TTL: message not expired (status: $TTL_STATUS)"
   FAIL=$((FAIL + 1))
 fi
+
+# ═════════════════════════════════════════════════
+# TEST 21: on_conflict Modes (raise/skip/replace)
+# ═════════════════════════════════════════════════
+section "TEST 21: on_conflict Modes"
+
+# Use unreachable endpoint to keep messages in pending state
+create_endpoint "test-conflict" "{\"url\": \"http://192.0.2.1:9999/blackhole\", \"method\": \"POST\"}"
+
+# raise (default) — duplicate key should error
+$PSQL -c "SELECT ulak.send_with_options('test-conflict', '{\"v\": 1}'::jsonb, p_idempotency_key := 'conflict-key-1');" > /dev/null
+RAISE_ERR=$($PSQL_OUT -c "SELECT ulak.send_with_options('test-conflict', '{\"v\": 2}'::jsonb, p_idempotency_key := 'conflict-key-1', p_on_conflict := 'raise');" 2>&1 || true)
+assert_contains "on_conflict=raise: duplicate rejected" "Idempotency" "$RAISE_ERR"
+
+# skip — return existing ID silently
+SKIP_ID=$($PSQL_OUT -c "SELECT ulak.send_with_options('test-conflict', '{\"v\": 3}'::jsonb, p_idempotency_key := 'conflict-key-1', p_on_conflict := 'skip');")
+TOTAL=$((TOTAL + 1))
+if [ -n "$SKIP_ID" ]; then
+  echo -e "  ${GREEN}✓${NC} on_conflict=skip: returned existing ID ($SKIP_ID)"
+  PASS=$((PASS + 1))
+else
+  echo -e "  ${RED}✗${NC} on_conflict=skip: no ID returned"
+  FAIL=$((FAIL + 1))
+fi
+
+# replace — update payload
+$PSQL -c "SELECT ulak.send_with_options('test-conflict', '{\"v\": 99, \"replaced\": true}'::jsonb, p_idempotency_key := 'conflict-key-1', p_on_conflict := 'replace');" > /dev/null
+REPLACED=$($PSQL_OUT -c "SELECT payload->>'replaced' FROM ulak.queue WHERE idempotency_key = 'conflict-key-1';")
+assert_eq "on_conflict=replace: payload updated" "true" "$REPLACED"
+
+# ═════════════════════════════════════════════════
+# TEST 22: Debounce
+# ═════════════════════════════════════════════════
+section "TEST 22: Debounce"
+
+create_endpoint "test-debounce" "{\"url\": \"http://192.0.2.1:9999/blackhole\", \"method\": \"POST\"}"
+
+ID1=$($PSQL_OUT -c "SELECT ulak.send_with_options('test-debounce', '{\"seq\": 1}'::jsonb, p_idempotency_key := 'debounce-key-1', p_debounce_seconds := 30);")
+ID2=$($PSQL_OUT -c "SELECT ulak.send_with_options('test-debounce', '{\"seq\": 2}'::jsonb, p_idempotency_key := 'debounce-key-1', p_debounce_seconds := 30);")
+assert_eq "Debounce: same ID returned" "$ID1" "$ID2"
+
+MSG_COUNT=$($PSQL_OUT -c "SELECT count(*) FROM ulak.queue WHERE idempotency_key = 'debounce-key-1';")
+assert_eq "Debounce: only 1 message in queue" "1" "$MSG_COUNT"
+
+DEBOUNCE_ERR=$($PSQL_OUT -c "SELECT ulak.send_with_options('test-debounce', '{\"x\": 1}'::jsonb, p_debounce_seconds := 10);" 2>&1 || true)
+assert_contains "Debounce: requires idempotency_key" "idempotency_key" "$DEBOUNCE_ERR"
+
+# ═════════════════════════════════════════════════
+# TEST 23: Transform Hooks
+# ═════════════════════════════════════════════════
+section "TEST 23: Transform Hooks"
+
+$PSQL -c "
+CREATE OR REPLACE FUNCTION public.test_transform_upper(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql AS \$\$
+BEGIN RETURN jsonb_set(p, '{transformed}', '\"yes\"') || jsonb_build_object('upper_name', upper(p->>'name'));
+END; \$\$;
+"
+
+create_endpoint "test-transform-ep" "{\"url\": \"${WEBHOOK_URL}/echo/transform\", \"method\": \"POST\"}"
+$PSQL -c "SELECT ulak.create_event_type('transform.test', 'Test transform hooks');" > /dev/null
+$PSQL -c "SELECT ulak.subscribe('transform.test', 'test-transform-ep', NULL, 'public.test_transform_upper');" > /dev/null
+
+$PSQL -c "SELECT ulak.publish('transform.test', '{\"name\": \"ahmet\", \"value\": 42}'::jsonb);" > /dev/null
+
+wait_queue_drain
+sleep 1
+
+assert_eq "Transform: message delivered" "1" "$(webhook_count 'echo/transform')"
+
+TRANSFORM_BODY=$(webhook_get "echo/transform" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)['requests']
+b = data[0].get('bodyJson', {}) if data else {}
+t = b.get('transformed') == 'yes'
+u = b.get('upper_name') == 'AHMET'
+print(f't={t},u={u}')
+" 2>/dev/null)
+assert_contains "Transform: fields added" "t=True,u=True" "$TRANSFORM_BODY"
+
+# ═════════════════════════════════════════════════
+# TEST 24: Transform + Plain Subscription Fan-Out
+# ═════════════════════════════════════════════════
+section "TEST 24: Transform + Plain Fan-Out"
+
+create_endpoint "test-plain-ep" "{\"url\": \"${WEBHOOK_URL}/echo/plain\", \"method\": \"POST\"}"
+$PSQL -c "SELECT ulak.subscribe('transform.test', 'test-plain-ep', NULL, NULL);" > /dev/null
+
+webhook_clear
+$PSQL -c "SELECT ulak.publish('transform.test', '{\"name\": \"test\", \"mixed\": true}'::jsonb);" > /dev/null
+
+wait_queue_drain
+sleep 1
+
+assert_eq "Fan-out: plain received" "1" "$(webhook_count 'echo/plain')"
+assert_eq "Fan-out: transform received" "1" "$(webhook_count 'echo/transform')"
+
+PLAIN_BODY=$(webhook_get "echo/plain" | python3 -c "
+import sys, json
+b = json.load(sys.stdin)['requests'][0].get('bodyJson', {})
+print('clean' if 'transformed' not in b and 'upper_name' not in b else 'dirty')
+" 2>/dev/null)
+assert_eq "Fan-out: plain has no transform fields" "clean" "$PLAIN_BODY"
+
+# ═════════════════════════════════════════════════
+# TEST 25: Schema Validation
+# ═════════════════════════════════════════════════
+section "TEST 25: Schema Validation"
+
+$PSQL -c "
+SELECT ulak.create_event_type('schema.validated', 'Validated events',
+  '{\"type\": \"object\", \"required\": [\"user_id\", \"action\"], \"properties\": {\"user_id\": {\"type\": \"number\"}, \"action\": {\"type\": \"string\"}}}'::jsonb
+);" > /dev/null
+
+create_endpoint "test-schema-ep" "{\"url\": \"${WEBHOOK_URL}/ok/schema\", \"method\": \"POST\"}"
+$PSQL -c "SELECT ulak.subscribe('schema.validated', 'test-schema-ep', NULL, NULL);" > /dev/null
+
+# Valid payload
+$PSQL -c "SELECT ulak.publish('schema.validated', '{\"user_id\": 123, \"action\": \"login\"}'::jsonb);" > /dev/null
+wait_queue_drain
+sleep 1
+assert_eq "Schema: valid payload delivered" "1" "$(webhook_count 'ok/schema')"
+
+# Missing required field
+SCHEMA_ERR=$($PSQL_OUT -c "SELECT ulak.publish('schema.validated', '{\"user_id\": 123}'::jsonb);" 2>&1 || true)
+assert_contains "Schema: missing field rejected" "required" "$SCHEMA_ERR"
+
+# Wrong type
+SCHEMA_ERR2=$($PSQL_OUT -c "SELECT ulak.publish('schema.validated', '{\"user_id\": \"str\", \"action\": \"test\"}'::jsonb);" 2>&1 || true)
+assert_contains "Schema: wrong type rejected" "expected number" "$SCHEMA_ERR2"
+
+# ═════════════════════════════════════════════════
+# TEST 26: Purge Endpoint
+# ═════════════════════════════════════════════════
+section "TEST 26: Purge Endpoint"
+
+create_endpoint "test-purge" "{\"url\": \"http://192.0.2.1:9999/blackhole\", \"method\": \"POST\"}"
+
+$PSQL -c "
+DO \$\$ BEGIN
+  FOR i IN 1..20 LOOP PERFORM ulak.send('test-purge', jsonb_build_object('i', i)); END LOOP;
+END; \$\$;"
+sleep 2
+
+BEFORE=$($PSQL_OUT -c "SELECT count(*) FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'test-purge') AND status = 'pending';")
+assert_gt "Purge: messages pending" "0" "$BEFORE"
+
+PURGE_N=$($PSQL_OUT -c "SELECT ulak.purge_endpoint('test-purge');")
+assert_gt "Purge: returned count" "0" "$PURGE_N"
+
+AFTER=$($PSQL_OUT -c "SELECT count(*) FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'test-purge') AND status = 'pending';")
+assert_eq "Purge: zero pending after" "0" "$AFTER"
+
+EVENT_LOG=$($PSQL_OUT -c "SELECT count(*) FROM ulak.event_log WHERE event_type = 'purge';")
+assert_gt "Purge: event logged" "0" "$EVENT_LOG"
+
+# ═════════════════════════════════════════════════
+# TEST 27: Queue Health
+# ═════════════════════════════════════════════════
+section "TEST 27: Queue Health"
+
+HEALTH=$($PSQL_OUT -c "SELECT total_pending, total_processing, dlq_depth FROM ulak.queue_health();")
+assert_contains "Queue health: returns data" "|" "$HEALTH"
+
+create_endpoint "test-qh" "{\"url\": \"http://192.0.2.1:9999/blackhole\", \"method\": \"POST\"}"
+for i in $(seq 1 5); do
+  $PSQL -c "SELECT ulak.send('test-qh', '{\"h\": $i}'::jsonb);" > /dev/null
+done
+
+PENDING=$($PSQL_OUT -c "SELECT total_pending FROM ulak.queue_health();")
+assert_gt "Queue health: shows pending" "0" "$PENDING"
+$PSQL -c "DELETE FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'test-qh');" > /dev/null
+
+# ═════════════════════════════════════════════════
+# TEST 28: Concurrency Limit
+# ═════════════════════════════════════════════════
+section "TEST 28: Concurrency Limit"
+
+create_endpoint "test-conc" "{\"url\": \"${WEBHOOK_URL}/ok/concurrency\", \"method\": \"POST\"}"
+$PSQL -c "UPDATE ulak.endpoints SET concurrency_limit = 2 WHERE name = 'test-conc';" > /dev/null
+
+CONC_VAL=$($PSQL_OUT -c "SELECT concurrency_limit FROM ulak.endpoints WHERE name = 'test-conc';")
+assert_eq "Concurrency: limit set" "2" "$CONC_VAL"
+
+CONC_ERR=$($PSQL_OUT -c "UPDATE ulak.endpoints SET concurrency_limit = 0 WHERE name = 'test-conc';" 2>&1 || true)
+assert_contains "Concurrency: zero rejected" "violates check" "$CONC_ERR"
+
+for i in $(seq 1 10); do
+  $PSQL -c "SELECT ulak.send('test-conc', '{\"c\": $i}'::jsonb);" > /dev/null
+done
+wait_queue_drain 15
+sleep 1
+assert_eq "Concurrency: all 10 delivered" "10" "$(webhook_count 'ok/concurrency')"
+
+# ═════════════════════════════════════════════════
+# TEST 29: Transform Validation
+# ═════════════════════════════════════════════════
+section "TEST 29: Transform Validation"
+
+MULTI_DOT=$($PSQL_OUT -c "SELECT ulak._apply_transform('a.b.c', '{}'::jsonb);" 2>&1 || true)
+assert_contains "Multi-dot function name rejected" "ERROR" "$MULTI_DOT"
+
+NOSUCH=$($PSQL_OUT -c "SELECT ulak.subscribe('transform.test', 'test-transform-ep', NULL, 'public.nonexistent_fn');" 2>&1 || true)
+assert_contains "Nonexistent function rejected" "does not exist" "$NOSUCH"
+
+# ═════════════════════════════════════════════════
+# TEST 30: Reindex Queue + Archive Default
+# ═════════════════════════════════════════════════
+section "TEST 30: Reindex & Archive"
+
+REINDEX=$($PSQL_OUT -c "SELECT ulak.reindex_queue();")
+assert_gt "Reindex: rebuilt indexes" "0" "$REINDEX"
+
+ARCHIVE=$($PSQL_OUT -c "SELECT ulak.check_archive_default();")
+assert_eq "Archive default: returns 0" "0" "$ARCHIVE"
+
+# ═════════════════════════════════════════════════
+# TEST 31: Metrics & Monitoring
+# ═════════════════════════════════════════════════
+section "TEST 31: Metrics & Monitoring"
+
+METRICS=$($PSQL_OUT -c "SELECT count(*) FROM ulak.metrics();")
+assert_gt "Metrics: returns rows" "0" "$METRICS"
+
+WORKERS=$($PSQL_OUT -c "SELECT count(*) FROM ulak.get_worker_status();")
+assert_gt "Worker status: returns data" "0" "$WORKERS"
+
+HEALTH_S=$($PSQL_OUT -c "SELECT status FROM ulak.health_check() LIMIT 1;")
+assert_eq "Health check: healthy" "healthy" "$HEALTH_S"
 
 # ═════════════════════════════════════════════════
 # SUMMARY

@@ -21,11 +21,11 @@
 /* Global pointer to shared memory state */
 UlakShmemState *ulak_shmem = NULL;
 
-/* Previous hooks to chain */
-static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+/* Previous hooks to chain (non-static for _PG_fini restoration) */
+shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 #if PG_VERSION_NUM >= 150000
-static shmem_request_hook_type prev_shmem_request_hook = NULL;
+shmem_request_hook_type prev_shmem_request_hook = NULL;
 #endif
 
 /**
@@ -60,6 +60,10 @@ static void ulak_shmem_startup(void) {
 
         /* First time - initialize the structure */
         memset(ulak_shmem, 0, ulak_shmem_size());
+
+        /* Set integrity markers for cross-version safety */
+        ulak_shmem->magic = ULAK_SHMEM_MAGIC;
+        ulak_shmem->version = ULAK_SHMEM_VERSION;
 
         /* Get the LWLock tranche we requested (1 lock).
          * GetNamedLWLockTranche() internally ereport(ERROR)s if the tranche
@@ -220,6 +224,7 @@ void ulak_register_database(const char *dbname, Oid dboid) {
                 ulak_shmem->databases[i].last_error_at[j] = 0;
                 ulak_shmem->databases[i].last_error_msg[j][0] = '\0';
                 ulak_shmem->databases[i].last_activity[j] = 0;
+                ulak_shmem->databases[i].worker_latches[j] = NULL;
             }
             /* Initialize circuit breaker state */
             ulak_shmem->databases[i].consecutive_spawn_failures = 0;
@@ -857,4 +862,105 @@ void ulak_register_worker(void) {
     }
 
     elog(LOG, "[ulak] Registered %d background worker(s)", num_workers);
+}
+
+/**
+ * @brief Validate shared memory integrity markers.
+ *
+ * Checks that magic and version fields match what this binary expects.
+ * Call from worker startup before touching any other shared memory fields.
+ *
+ * @return true if shared memory is valid, false on mismatch.
+ */
+bool ulak_shmem_validate(void) {
+    if (ulak_shmem == NULL)
+        return false;
+
+    if (ulak_shmem->magic != ULAK_SHMEM_MAGIC) {
+        elog(WARNING,
+             "[ulak] Shared memory magic mismatch: expected 0x%08X, found 0x%08X",
+             ULAK_SHMEM_MAGIC, ulak_shmem->magic);
+        return false;
+    }
+
+    if (ulak_shmem->version != ULAK_SHMEM_VERSION) {
+        elog(WARNING,
+             "[ulak] Shared memory version mismatch: expected %u, found %u. "
+             "Restart PostgreSQL after upgrading the ulak extension.",
+             ULAK_SHMEM_VERSION, ulak_shmem->version);
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief Register a worker's latch pointer in shared memory.
+ *
+ * Called from worker startup so that send() can wake workers via SetLatch.
+ */
+void ulak_register_worker_latch(Oid dboid, int worker_id, Latch *latch) {
+    int i;
+
+    if (!ulak_shmem || worker_id < 0 || worker_id >= ULAK_MAX_WORKERS)
+        return;
+
+    LWLockAcquire(ulak_shmem->lock, LW_EXCLUSIVE);
+    for (i = 0; i < ULAK_MAX_DATABASES; i++) {
+        if (ulak_shmem->databases[i].active && ulak_shmem->databases[i].dboid == dboid) {
+            ulak_shmem->databases[i].worker_latches[worker_id] = latch;
+            break;
+        }
+    }
+    LWLockRelease(ulak_shmem->lock);
+}
+
+/**
+ * @brief Clear a worker's latch pointer from shared memory.
+ *
+ * Must be called before worker exit to prevent stale latch references.
+ */
+void ulak_clear_worker_latch(Oid dboid, int worker_id) {
+    int i;
+
+    if (!ulak_shmem || worker_id < 0 || worker_id >= ULAK_MAX_WORKERS)
+        return;
+
+    LWLockAcquire(ulak_shmem->lock, LW_EXCLUSIVE);
+    for (i = 0; i < ULAK_MAX_DATABASES; i++) {
+        if (ulak_shmem->databases[i].active && ulak_shmem->databases[i].dboid == dboid) {
+            ulak_shmem->databases[i].worker_latches[worker_id] = NULL;
+            break;
+        }
+    }
+    LWLockRelease(ulak_shmem->lock);
+}
+
+/**
+ * @brief Wake one worker for the given database by setting its latch.
+ *
+ * Called from send()/publish() path to achieve near-zero dispatch latency.
+ * Uses LW_SHARED to minimize contention with worker registration.
+ * Only wakes the first worker with a non-NULL latch (worker 0 preferred).
+ */
+void ulak_wake_workers(Oid dboid) {
+    int i, w;
+
+    if (!ulak_shmem || !ulak_shmem->lock)
+        return;
+
+    LWLockAcquire(ulak_shmem->lock, LW_SHARED);
+    for (i = 0; i < ULAK_MAX_DATABASES; i++) {
+        if (ulak_shmem->databases[i].active && ulak_shmem->databases[i].dboid == dboid) {
+            for (w = 0; w < ULAK_MAX_WORKERS; w++) {
+                Latch *latch = ulak_shmem->databases[i].worker_latches[w];
+                if (latch != NULL) {
+                    SetLatch(latch);
+                    break; /* Wake only one worker */
+                }
+            }
+            break;
+        }
+    }
+    LWLockRelease(ulak_shmem->lock);
 }

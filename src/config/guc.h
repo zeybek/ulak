@@ -112,6 +112,12 @@ extern int ulak_archive_retention_months;
 /* Queue Backpressure Configuration */
 extern int ulak_max_queue_size;
 
+/* Notification Configuration */
+extern bool ulak_enable_notify;
+
+/* Archive Partition Configuration */
+extern int ulak_archive_premake_months;
+
 /* CloudEvents Configuration */
 extern char *ulak_cloudevents_source;
 

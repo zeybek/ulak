@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -14,10 +15,16 @@ def extract_control_value(text: str, key: str) -> str | None:
     return None
 
 
+def extract_h_version(text: str) -> str | None:
+    m = re.search(r'#define\s+ULAK_VERSION\s+"([^"]+)"', text)
+    return m.group(1) if m else None
+
+
 def main() -> int:
     version = Path("version.txt").read_text().strip()
     control = Path("ulak.control").read_text()
     meta = json.loads(Path("META.json").read_text())
+    ulak_h = Path("include/ulak.h").read_text()
 
     errors: list[str] = []
     fixed: list[str] = []
@@ -26,6 +33,12 @@ def main() -> int:
     if control_version != version:
         errors.append(
             f"ulak.control default_version={control_version!r} does not match version.txt={version!r}"
+        )
+
+    h_version = extract_h_version(ulak_h)
+    if h_version != version:
+        errors.append(
+            f"include/ulak.h ULAK_VERSION={h_version!r} does not match version.txt={version!r}"
         )
 
     if meta.get("version") != version:
@@ -43,6 +56,20 @@ def main() -> int:
         provides["file"] = expected_sql_file
         Path("META.json").write_text(json.dumps(meta, indent=2) + "\n")
         fixed.append(f"Auto-fixed META.json provides.ulak.file to {expected_sql_file}")
+
+    # Check upgrade script exists (unless this is the initial version)
+    initial_version = "0.0.1"
+    if version != initial_version:
+        upgrade_scripts = sorted(Path("sql").glob(f"ulak--*--{version}.sql"))
+        if not upgrade_scripts:
+            errors.append(
+                f"No upgrade script found targeting version {version}. "
+                f"Expected at least one sql/ulak--X.Y.Z--{version}.sql file "
+                f"for existing users to upgrade via ALTER EXTENSION ulak UPDATE."
+            )
+        else:
+            for script in upgrade_scripts:
+                print(f"Upgrade script found: {script}")
 
     for msg in fixed:
         print(msg)

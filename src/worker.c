@@ -28,6 +28,11 @@
 #include "utils/memutils.h"
 #include "utils/numeric.h"
 #include "utils/rate_limit.h"
+#if PG_VERSION_NUM >= 150000
+#include "utils/backend_status.h"
+#else
+#include "pgstat.h"
+#endif
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
@@ -74,8 +79,7 @@ typedef struct {
 /* Database name from GUC */
 static char worker_dbname[NAMEDATALEN] = "";
 
-/* Cached database index in shared memory for fast counter updates */
-static int cached_db_index = -1;
+/* (cached_db_index removed — was unused dead code) */
 
 /* Multi-worker partitioning info (set at startup from DSM params) */
 static Oid worker_dboid = InvalidOid;
@@ -127,6 +131,8 @@ static void process_endpoint_batch(MessageBatchInfo *messages, int count, const 
 static void ulak_worker_loop(void);
 static void ulak_worker_init_libs(void);
 static void ulak_worker_cleanup_libs(void);
+static void run_maintenance_task(const char *query, const char *task_name, int nargs,
+                                 Oid *argtypes, Datum *values);
 static void mark_expired_messages(void);
 static void recover_stale_processing_messages(void);
 static void archive_completed_messages(void);
@@ -197,6 +203,19 @@ static void worker_update_stats_local(bool success, const char *error_msg) {
  * Flushes batch-local metrics into the shared-memory worker slot,
  * then resets the local accumulators.
  */
+/**
+ * @brief before_shmem_exit callback for worker shared memory cleanup.
+ * @private
+ *
+ * Guarantees latch, PID, and worker state cleanup even on elog(FATAL).
+ * Idempotent — safe to call when explicit cleanup has already run.
+ */
+static void worker_shmem_exit_callback(int code, Datum arg) {
+    ulak_clear_worker_latch(worker_dboid, worker_id);
+    ulak_remove_worker_pid(worker_dboid, MyProcPid);
+    ulak_clear_worker();
+}
+
 static void worker_flush_stats_to_shmem(void) {
     /* Skip if nothing to flush */
     if (worker_local_stats.messages_processed == 0 && worker_local_stats.error_count == 0)
@@ -233,6 +252,13 @@ PGDLLEXPORT void ulak_worker_main(Datum main_arg) {
     if (total_workers < 1)
         total_workers = 1;
 
+    /* Validate shared memory integrity before touching it */
+    if (!ulak_shmem_validate()) {
+        elog(FATAL,
+             "[ulak] Shared memory validation failed. "
+             "Restart PostgreSQL after upgrading the ulak extension.");
+    }
+
     /* Initialize external libraries */
     ulak_worker_init_libs();
 
@@ -247,12 +273,28 @@ PGDLLEXPORT void ulak_worker_main(Datum main_arg) {
     ulak_set_target_workers(worker_dboid, total_workers);
     (void)ulak_add_worker_pid(worker_dboid, MyProcPid, worker_id);
 
+    /* Report worker identity in pg_stat_activity for monitoring */
+    {
+        char appname[NAMEDATALEN];
+        snprintf(appname, sizeof(appname), "ulak worker %d/%d [%s]",
+                 worker_id + 1, total_workers, worker_dbname);
+        pgstat_report_appname(appname);
+    }
+
     /* Set up signal handlers - MyLatch is now initialized */
     ulak_pqsignal(SIGTERM, ulak_sigterm_handler);
     ulak_pqsignal(SIGHUP, ulak_sighup_handler);
 
     /* We're now ready to receive signals */
     BackgroundWorkerUnblockSignals();
+
+    /* Register latch in shared memory so send() can wake us via SetLatch */
+    ulak_register_worker_latch(worker_dboid, worker_id, MyLatch);
+
+    /* Register exit callbacks for guaranteed cleanup on elog(FATAL).
+     * before_shmem_exit runs on proc_exit — system still operational. */
+    before_shmem_exit(worker_shmem_exit_callback, (Datum)0);
+    before_shmem_exit(dispatcher_cache_exit_callback, (Datum)0);
 
     /* Mark worker as started in shared memory */
     ulak_set_worker_started(MyProcPid);
@@ -269,6 +311,7 @@ PGDLLEXPORT void ulak_worker_main(Datum main_arg) {
     ulak_worker_loop();
 
     /* Cleanup */
+    ulak_clear_worker_latch(worker_dboid, worker_id);
     ulak_update_worker_activity(worker_dboid, worker_id);
     ulak_remove_worker_pid(worker_dboid, MyProcPid);
     ulak_clear_worker();
@@ -382,6 +425,9 @@ static int64 process_pending_messages_batch(void) {
                              "JOIN ulak.endpoints e ON q.endpoint_id = e.id "
                              "WHERE q.status = '%s' "
                              "  AND e.enabled = true "
+                             "  AND (e.concurrency_limit IS NULL OR e.concurrency_limit > "
+                             "       (SELECT count(*) FROM ulak.queue q3 "
+                             "        WHERE q3.endpoint_id = e.id AND q3.status = 'processing')) "
                              "  AND (q.next_retry_at IS NULL OR q.next_retry_at <= NOW()) "
                              "  AND (q.scheduled_at IS NULL OR q.scheduled_at <= NOW()) "
                              "  AND (q.expires_at IS NULL OR q.expires_at > NOW()) "
@@ -412,6 +458,9 @@ static int64 process_pending_messages_batch(void) {
                              "JOIN ulak.endpoints e ON q.endpoint_id = e.id "
                              "WHERE q.status = '%s' "
                              "  AND e.enabled = true "
+                             "  AND (e.concurrency_limit IS NULL OR e.concurrency_limit > "
+                             "       (SELECT count(*) FROM ulak.queue q3 "
+                             "        WHERE q3.endpoint_id = e.id AND q3.status = 'processing')) "
                              "  AND (q.next_retry_at IS NULL OR q.next_retry_at <= NOW()) "
                              "  AND (q.scheduled_at IS NULL OR q.scheduled_at <= NOW()) "
                              "  AND (q.expires_at IS NULL OR q.expires_at > NOW()) "
@@ -829,15 +878,21 @@ static int64 process_pending_messages_batch(void) {
                     "WHERE q.id = v.id";
                 static const char *batch_dlq_query = "SELECT ulak.archive_single_to_dlq(id) "
                                                      "FROM unnest($1::bigint[]) AS id";
-                /* Individual query for response capture (unique per message) */
-                static const char *success_response_query =
-                    "UPDATE ulak.queue SET status = $1, last_error = NULL, "
-                    "completed_at = NOW(), response = $2::jsonb WHERE id = $3";
+                /* Batch query for response capture (replaces per-message UPDATEs) */
+                static const char *batch_success_response_query =
+                    "UPDATE ulak.queue q SET status = 'completed', last_error = NULL, "
+                    "completed_at = NOW(), response = v.response::jsonb "
+                    "FROM (SELECT unnest($1::bigint[]) AS id, "
+                    "             unnest($2::text[]) AS response) v "
+                    "WHERE q.id = v.id";
                 static const char *cb_query_str = "SELECT ulak.update_circuit_breaker($1, $2)";
 
                 /* Batch collection arrays */
                 Datum *success_ids = palloc(sizeof(Datum) * total_messages);
                 int success_count = 0;
+                Datum *response_ids = palloc(sizeof(Datum) * total_messages);
+                Datum *response_texts = palloc(sizeof(Datum) * total_messages);
+                int response_count = 0;
                 Datum *rate_limited_ids = palloc(sizeof(Datum) * total_messages);
                 int rate_limited_count = 0;
                 Datum *perm_fail_ids = palloc(sizeof(Datum) * total_messages);
@@ -867,7 +922,7 @@ static int64 process_pending_messages_batch(void) {
                     if (all_messages[i].success) {
                         messages_processed++;
                         if (all_messages[i].result && ulak_capture_response) {
-                            /* Response capture: individual UPDATE (unique response per msg) */
+                            /* Response capture: collect into batch arrays */
                             ProtocolType proto_type;
                             Jsonb *response_jsonb;
                             if (!protocol_string_to_type(all_messages[i].protocol, &proto_type)) {
@@ -883,21 +938,11 @@ static int64 process_pending_messages_batch(void) {
                             if (response_jsonb) {
                                 char *response_str = JsonbToCString(NULL, &response_jsonb->root,
                                                                     VARSIZE(response_jsonb));
-                                Oid argtypes[3] = {TEXTOID, TEXTOID, INT8OID};
-                                Datum values[3];
-                                char nulls[3] = {' ', ' ', ' '};
-                                values[0] = CStringGetTextDatum(STATUS_COMPLETED);
-                                values[1] = CStringGetTextDatum(response_str);
-                                values[2] = Int64GetDatum(all_messages[i].message_id);
-                                ret = SPI_execute_with_args(success_response_query, 3, argtypes,
-                                                            values, nulls, false, 0);
-                                if (ret != SPI_OK_UPDATE) {
-                                    elog(WARNING,
-                                         "[ulak] Failed to update message %lld status: SPI "
-                                         "error %d",
-                                         (long long)all_messages[i].message_id, ret);
-                                    failed_updates++;
-                                }
+                                response_ids[response_count] =
+                                    Int64GetDatum(all_messages[i].message_id);
+                                response_texts[response_count] =
+                                    CStringGetTextDatum(response_str);
+                                response_count++;
                             } else {
                                 success_ids[success_count++] =
                                     Int64GetDatum(all_messages[i].message_id);
@@ -924,6 +969,31 @@ static int64 process_pending_messages_batch(void) {
                             delay_seconds = all_messages[i].result->retry_after_seconds;
                             elog(DEBUG1, "[ulak] Using Retry-After=%d for message %lld",
                                  delay_seconds, (long long)all_messages[i].message_id);
+                        }
+
+                        /* Snooze path: 429 throttle → revert to pending without
+                         * incrementing retry_count (inspired by River's snooze) */
+                        if (all_messages[i].result != NULL &&
+                            all_messages[i].result->is_throttle && delay_seconds > 0) {
+                            char snooze_delay_str[32];
+                            snprintf(snooze_delay_str, sizeof(snooze_delay_str), "%d",
+                                     delay_seconds);
+                            retry_fail_ids[retry_fail_count] =
+                                Int64GetDatum(all_messages[i].message_id);
+                            /* Keep same retry count (no increment) for snooze */
+                            retry_fail_retries[retry_fail_count] =
+                                Int32GetDatum(all_messages[i].retry_count);
+                            retry_fail_errors[retry_fail_count] =
+                                CStringGetTextDatum(error_str);
+                            retry_fail_delays[retry_fail_count] =
+                                CStringGetTextDatum(snooze_delay_str);
+                            retry_fail_count++;
+                            elog(DEBUG1,
+                                 "[ulak] Snoozing message %lld for %d seconds "
+                                 "(throttle, retry_count unchanged at %d)",
+                                 (long long)all_messages[i].message_id, delay_seconds,
+                                 all_messages[i].retry_count);
+                            goto next_message;
                         }
 
                         /* 410 Gone auto-disable: check error string for [DISABLE] marker */
@@ -991,6 +1061,7 @@ static int64 process_pending_messages_batch(void) {
                         }
                     }
 
+                next_message:
                     /* Circuit breaker: track last result per endpoint.
                      * We call update_circuit_breaker once per endpoint after the
                      * loop, avoiding N SPI calls for N messages to the same endpoint. */
@@ -1071,7 +1142,7 @@ static int64 process_pending_messages_batch(void) {
                     }
                 }
 
-                /* Batch success UPDATE */
+                /* Batch success UPDATE (without response) */
                 if (success_count > 0) {
                     ArrayType *id_array = construct_array(success_ids, success_count, INT8OID,
                                                           sizeof(int64), true, TYPALIGN_DOUBLE);
@@ -1083,6 +1154,24 @@ static int64 process_pending_messages_batch(void) {
                     if (ret != SPI_OK_UPDATE) {
                         elog(WARNING, "[ulak] Batch success UPDATE failed: SPI error %d", ret);
                         failed_updates += success_count;
+                    }
+                }
+
+                /* Batch success UPDATE with response capture */
+                if (response_count > 0) {
+                    ArrayType *id_array = construct_array(response_ids, response_count, INT8OID,
+                                                          sizeof(int64), true, TYPALIGN_DOUBLE);
+                    ArrayType *resp_array = construct_array(response_texts, response_count, TEXTOID,
+                                                            -1, false, TYPALIGN_INT);
+                    Oid argtypes[2] = {INT8ARRAYOID, TEXTARRAYOID};
+                    Datum values[2] = {PointerGetDatum(id_array), PointerGetDatum(resp_array)};
+                    char nulls[2] = {' ', ' '};
+                    ret = SPI_execute_with_args(batch_success_response_query, 2, argtypes, values,
+                                                nulls, false, 0);
+                    if (ret != SPI_OK_UPDATE) {
+                        elog(WARNING, "[ulak] Batch response capture UPDATE failed: SPI error %d",
+                             ret);
+                        failed_updates += response_count;
                     }
                 }
 
@@ -1792,29 +1881,8 @@ static void ulak_worker_cleanup_libs(void) {
  * transaction.
  */
 static void mark_expired_messages(void) {
-    int ret;
-    int spi_ret;
-
-    SetCurrentStatementStartTimestamp();
-    StartTransactionCommand();
-    spi_ret = SPI_connect();
-    if (spi_ret != SPI_OK_CONNECT) {
-        elog(WARNING, "[ulak] SPI_connect failed in mark_expired_messages: %s",
-             SPI_result_code_string(spi_ret));
-        AbortCurrentTransaction();
-        return;
-    }
-    PushActiveSnapshot(GetTransactionSnapshot());
-
-    ret =
-        SPI_execute_with_args("SELECT ulak.mark_expired_messages()", 0, NULL, NULL, NULL, false, 0);
-    if (ret != SPI_OK_SELECT) {
-        elog(WARNING, "[ulak] Failed to call mark_expired_messages: SPI error %d", ret);
-    }
-
-    PopActiveSnapshot();
-    SPI_finish();
-    CommitTransactionCommand();
+    run_maintenance_task("SELECT ulak.mark_expired_messages()",
+                         "mark_expired_messages", 0, NULL, NULL);
 }
 
 /**
@@ -1826,48 +1894,21 @@ static void mark_expired_messages(void) {
  * reset to 'pending' status.
  */
 static void recover_stale_processing_messages(void) {
-    int ret;
-    int spi_ret;
-    int stale_timeout_seconds = config_get_stale_recovery_timeout();
+    static const char *recovery_sql =
+        "UPDATE ulak.queue SET status = 'pending', "
+        "retry_count = retry_count + 1, "
+        "last_error = 'Recovered from stale processing state (continuous recovery)', "
+        "next_retry_at = NOW(), updated_at = NOW() "
+        "WHERE status = 'processing' "
+        "AND processing_started_at < NOW() - ($1 || ' seconds')::interval";
+    Oid argtypes[1] = {TEXTOID};
+    Datum values[1];
+    char timeout_str[32];
 
-    SetCurrentStatementStartTimestamp();
-    StartTransactionCommand();
-    spi_ret = SPI_connect();
-    if (spi_ret != SPI_OK_CONNECT) {
-        elog(WARNING, "[ulak] SPI_connect failed in recover_stale_processing_messages: %s",
-             SPI_result_code_string(spi_ret));
-        AbortCurrentTransaction();
-        return;
-    }
-    PushActiveSnapshot(GetTransactionSnapshot());
+    snprintf(timeout_str, sizeof(timeout_str), "%d", config_get_stale_recovery_timeout());
+    values[0] = CStringGetTextDatum(timeout_str);
 
-    /* Parameterized recovery query with configurable timeout */
-    {
-        static const char *recovery_sql =
-            "UPDATE ulak.queue SET status = 'pending', "
-            "retry_count = retry_count + 1, "
-            "last_error = 'Recovered from stale processing state (continuous recovery)', "
-            "next_retry_at = NOW(), updated_at = NOW() "
-            "WHERE status = 'processing' "
-            "AND processing_started_at < NOW() - ($1 || ' seconds')::interval";
-        Oid argtypes[1] = {TEXTOID};
-        Datum values[1];
-        char nulls[1] = {' '};
-        char timeout_str[32];
-
-        snprintf(timeout_str, sizeof(timeout_str), "%d", stale_timeout_seconds);
-        values[0] = CStringGetTextDatum(timeout_str);
-
-        ret = SPI_execute_with_args(recovery_sql, 1, argtypes, values, nulls, false, 0);
-        if (ret == SPI_OK_UPDATE && SPI_processed > 0) {
-            elog(LOG, "[ulak] Continuous recovery: reset %lu stale processing messages",
-                 (unsigned long)SPI_processed);
-        }
-    }
-
-    PopActiveSnapshot();
-    SPI_finish();
-    CommitTransactionCommand();
+    run_maintenance_task(recovery_sql, "recover_stale_processing", 1, argtypes, values);
 }
 
 /**
@@ -1878,29 +1919,65 @@ static void recover_stale_processing_messages(void) {
  * configured retention period. Prevents queue table bloat in production.
  */
 static void archive_completed_messages(void) {
-    int ret;
-    int spi_ret;
+    run_maintenance_task("SELECT ulak.archive_completed_messages()",
+                         "archive_completed_messages", 0, NULL, NULL);
+}
 
-    SetCurrentStatementStartTimestamp();
-    StartTransactionCommand();
-    spi_ret = SPI_connect();
-    if (spi_ret != SPI_OK_CONNECT) {
-        elog(WARNING, "[ulak] SPI_connect failed in archive_completed_messages: %s",
-             SPI_result_code_string(spi_ret));
+/**
+ * @brief Execute a single maintenance task in its own transaction.
+ * @private
+ *
+ * Each task gets its own SPI connect/commit cycle so a failure in one
+ * task does not abort the others (pg_partman pattern).
+ *
+ * @param query The SQL query to execute.
+ * @param task_name Name for logging.
+ * @param nargs Number of arguments.
+ * @param argtypes Array of argument OIDs.
+ * @param values Array of argument Datums.
+ */
+static void run_maintenance_task(const char *query, const char *task_name, int nargs,
+                                 Oid *argtypes, Datum *values) {
+    volatile bool success = false;
+
+    PG_TRY();
+    {
+        int ret;
+        int spi_ret;
+
+        SetCurrentStatementStartTimestamp();
+        StartTransactionCommand();
+        spi_ret = SPI_connect();
+        if (spi_ret != SPI_OK_CONNECT) {
+            elog(WARNING, "[ulak] SPI_connect failed in %s: %s", task_name,
+                 SPI_result_code_string(spi_ret));
+            AbortCurrentTransaction();
+            return;
+        }
+        PushActiveSnapshot(GetTransactionSnapshot());
+
+        ret = SPI_execute_with_args(query, nargs, argtypes, values, NULL, false, 0);
+        if (ret < 0) {
+            elog(WARNING, "[ulak] Failed to call %s: SPI error %d", task_name, ret);
+        }
+
+        PopActiveSnapshot();
+        SPI_finish();
+        CommitTransactionCommand();
+        success = true;
+    }
+    PG_CATCH();
+    {
+        /* Roll back and continue with next task */
+        EmitErrorReport();
+        FlushErrorState();
         AbortCurrentTransaction();
-        return;
+        elog(WARNING, "[ulak] Maintenance task '%s' failed, continuing with remaining tasks",
+             task_name);
     }
-    PushActiveSnapshot(GetTransactionSnapshot());
+    PG_END_TRY();
 
-    ret = SPI_execute_with_args("SELECT ulak.archive_completed_messages()", 0, NULL, NULL, NULL,
-                                false, 0);
-    if (ret != SPI_OK_SELECT) {
-        elog(WARNING, "[ulak] Failed to call archive_completed_messages: SPI error %d", ret);
-    }
-
-    PopActiveSnapshot();
-    SPI_finish();
-    CommitTransactionCommand();
+    (void)success;
 }
 
 /**
@@ -1908,66 +1985,37 @@ static void archive_completed_messages(void) {
  * @private
  *
  * Called every ~60 iterations (~5 minutes at default poll_interval).
- * Performs: event log cleanup, DLQ cleanup, archive partition maintenance,
- * and old archive partition removal.
+ * Each task runs in its own transaction so a failure in one does not
+ * abort the others (inspired by pg_partman's run_maintenance_proc).
  */
 static void run_periodic_maintenance(void) {
-    int ret;
-    int spi_ret;
-
-    SetCurrentStatementStartTimestamp();
-    StartTransactionCommand();
-    spi_ret = SPI_connect();
-    if (spi_ret != SPI_OK_CONNECT) {
-        elog(WARNING, "[ulak] SPI_connect failed in run_periodic_maintenance: %s",
-             SPI_result_code_string(spi_ret));
-        AbortCurrentTransaction();
-        return;
-    }
-    PushActiveSnapshot(GetTransactionSnapshot());
-
     /* Cleanup old event log entries */
-    ret = SPI_execute_with_args("SELECT ulak.cleanup_event_log()", 0, NULL, NULL, NULL, false, 0);
-    if (ret != SPI_OK_SELECT) {
-        elog(WARNING, "[ulak] Failed to call cleanup_event_log: SPI error %d", ret);
-    }
+    run_maintenance_task("SELECT ulak.cleanup_event_log()", "cleanup_event_log", 0, NULL, NULL);
 
-    /* Cleanup old DLQ messages (retention via ulak.dlq_retention_days GUC).
-     * Check function existence first so startup remains safe if the SQL
-     * surface is not fully installed yet. */
-    ret = SPI_execute("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid "
-                      "WHERE n.nspname = 'ulak' AND p.proname = 'cleanup_dlq'",
-                      true, 1);
-    if (ret == SPI_OK_SELECT && SPI_processed > 0) {
-        ret = SPI_execute_with_args("SELECT ulak.cleanup_dlq()", 0, NULL, NULL, NULL, false, 0);
-        if (ret != SPI_OK_SELECT) {
-            elog(WARNING, "[ulak] Failed to call cleanup_dlq: SPI error %d", ret);
-        }
-    }
+    /* Cleanup old DLQ messages */
+    run_maintenance_task("SELECT ulak.cleanup_dlq()", "cleanup_dlq", 0, NULL, NULL);
 
     /* Ensure future archive partitions exist */
-    ret = SPI_execute_with_args("SELECT ulak.maintain_archive_partitions(3)", 0, NULL, NULL, NULL,
-                                false, 0);
-    if (ret != SPI_OK_SELECT) {
-        elog(WARNING, "[ulak] Failed to call maintain_archive_partitions: SPI error %d", ret);
+    {
+        Oid argtypes[1] = {INT4OID};
+        Datum values[1];
+        values[0] = Int32GetDatum(ulak_archive_premake_months);
+        run_maintenance_task("SELECT ulak.maintain_archive_partitions($1)",
+                             "maintain_archive_partitions", 1, argtypes, values);
     }
 
-    /* Cleanup old archive partitions (retention via ulak.archive_retention_months GUC) */
+    /* Cleanup old archive partitions */
     {
         Oid argtypes[1] = {INT4OID};
         Datum values[1];
         values[0] = Int32GetDatum(ulak_archive_retention_months);
-        ret = SPI_execute_with_args("SELECT ulak.cleanup_old_archive_partitions($1)", 1, argtypes,
-                                    values, NULL, false, 0);
-        if (ret != SPI_OK_SELECT) {
-            elog(WARNING, "[ulak] Failed to call cleanup_old_archive_partitions: SPI error %d",
-                 ret);
-        }
+        run_maintenance_task("SELECT ulak.cleanup_old_archive_partitions($1)",
+                             "cleanup_old_archive_partitions", 1, argtypes, values);
     }
 
-    PopActiveSnapshot();
-    SPI_finish();
-    CommitTransactionCommand();
+    /* Check for rows in archive default partition */
+    run_maintenance_task("SELECT ulak.check_archive_default()", "check_archive_default", 0, NULL,
+                         NULL);
 }
 
 /**
@@ -2063,6 +2111,7 @@ static void ulak_worker_loop(void) {
         if (!listener_registered) {
             StartTransactionCommand();
             Async_Listen("ulak_new_msg");
+            Async_Listen("ulak_config_change");
             CommitTransactionCommand();
             listener_registered = true;
 
@@ -2277,6 +2326,13 @@ PGDLLEXPORT void ulak_database_worker_main(Datum main_arg) {
 
     elog(DEBUG1, "[ulak] Database worker starting, main_arg=%u", DatumGetUInt32(main_arg));
 
+    /* Validate shared memory integrity before touching it */
+    if (!ulak_shmem_validate()) {
+        elog(FATAL,
+             "[ulak] Shared memory validation failed. "
+             "Restart PostgreSQL after upgrading the ulak extension.");
+    }
+
     /* Initialize external libraries */
     ulak_worker_init_libs();
 
@@ -2325,23 +2381,15 @@ PGDLLEXPORT void ulak_database_worker_main(Datum main_arg) {
     /* We're now ready to receive signals */
     BackgroundWorkerUnblockSignals();
 
-    /*
-     * Note: In the dynamic worker path the parent process may have already
-     * populated the worker slot before this worker begins its main loop.
-     */
+    /* Register latch in shared memory so send() can wake us via SetLatch */
+    ulak_register_worker_latch(worker_dboid, worker_id, MyLatch);
 
-    /* Cache our database index in shared memory for fast counter updates */
-    if (ulak_shmem != NULL && ulak_shmem->lock != NULL) {
-        int idx;
-        LWLockAcquire(ulak_shmem->lock, LW_SHARED);
-        for (idx = 0; idx < ULAK_MAX_DATABASES; idx++) {
-            if (ulak_shmem->databases[idx].active &&
-                ulak_shmem->databases[idx].dboid == worker_dboid) {
-                cached_db_index = idx;
-                break;
-            }
-        }
-        LWLockRelease(ulak_shmem->lock);
+    /* Report worker identity in pg_stat_activity for monitoring */
+    {
+        char appname[NAMEDATALEN];
+        snprintf(appname, sizeof(appname), "ulak db-worker %d/%d [%s]",
+                 worker_id + 1, total_workers, worker_dbname);
+        pgstat_report_appname(appname);
     }
 
     if (total_workers > 1) {
@@ -2352,15 +2400,19 @@ PGDLLEXPORT void ulak_database_worker_main(Datum main_arg) {
              worker_dboid, MyProcPid);
     }
 
-    /* Register exit callback for guaranteed dispatcher cache cleanup.
-     * before_shmem_exit runs even on proc_exit — system still operational. */
+    /* Register exit callbacks for guaranteed cleanup on elog(FATAL).
+     * before_shmem_exit runs on proc_exit — system still operational. */
+    before_shmem_exit(worker_shmem_exit_callback, (Datum)0);
     before_shmem_exit(dispatcher_cache_exit_callback, (Datum)0);
 
     /* Run the main worker loop */
     ulak_worker_loop();
 
-    /* Cleanup */
+    /* Cleanup (also runs via before_shmem_exit, but explicit for clarity) */
+    ulak_clear_worker_latch(worker_dboid, worker_id);
+    ulak_update_worker_activity(worker_dboid, worker_id);
     ulak_remove_worker_pid(worker_dboid, MyProcPid);
+    ulak_clear_worker();
     ulak_worker_cleanup_libs();
 
     proc_exit(0);

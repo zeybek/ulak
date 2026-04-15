@@ -120,6 +120,12 @@ int ulak_dlq_retention_days = 30;       /** Days to retain DLQ messages */
 int ulak_archive_retention_months = 6;  /** Months to retain archive partitions */
 int ulak_max_queue_size = 1000000;      /** Max pending messages, 0=unlimited */
 
+/** Notification Configuration */
+bool ulak_enable_notify = true; /** Enable LISTEN/NOTIFY for new messages */
+
+/** Archive Partition Configuration */
+int ulak_archive_premake_months = 3; /** Months of partitions to pre-create */
+
 /** CloudEvents Configuration */
 char *ulak_cloudevents_source = NULL;
 
@@ -478,6 +484,19 @@ void config_init_guc_variables(void) {
                                "Default source URI for CloudEvents envelope (ce-source header)",
                                &ulak_cloudevents_source, "/ulak", PGC_SIGHUP, GUC_NOT_IN_SAMPLE,
                                NULL, NULL, NULL);
+
+    /* Notification Configuration */
+    DefineCustomBoolVariable("ulak.enable_notify", "Enable LISTEN/NOTIFY for new messages",
+                             "When off, the notify_new_message trigger skips pg_notify(). "
+                             "Reduces lock contention at high throughput.",
+                             &ulak_enable_notify, true, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL,
+                             NULL);
+
+    /* Archive Partition Configuration */
+    DefineCustomIntVariable("ulak.archive_premake_months", "Months of archive partitions to pre-create",
+                            "Number of monthly partitions to create ahead of current month",
+                            &ulak_archive_premake_months, 3, 1, 24, PGC_SIGHUP, GUC_NOT_IN_SAMPLE,
+                            NULL, NULL, NULL);
 
     ulak_log("info", "GUC variables initialized");
 }

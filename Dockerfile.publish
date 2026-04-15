@@ -49,6 +49,7 @@ COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/ulak--*.sql \
 # libnats and libhiredis have no stable Debian package names — copy from builder
 COPY --from=builder /usr/lib/*/libnats.so* /usr/lib/
 COPY --from=builder /usr/lib/*/libhiredis.so* /usr/lib/
+COPY --from=builder /usr/lib/*/libhiredis_ssl.so* /usr/lib/
 
 # Auto-load extension via shared_preload_libraries
 RUN echo "shared_preload_libraries = 'ulak'" >> /usr/share/postgresql/postgresql.conf.sample

@@ -4,5 +4,4 @@ default_version = '0.0.2' # x-release-please-version
 module_pathname = '$libdir/ulak'
 relocatable = false
 schema = ulak
-requires = ''
 superuser = false

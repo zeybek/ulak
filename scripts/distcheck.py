@@ -21,9 +21,7 @@ def main() -> int:
     forbidden = [
         ".git/",
         ".github/",
-        ".claude/",
         ".DS_Store",
-        "BLOG_TR.md",
         "Dockerfile",
         "Dockerfile.publish",
         "Doxyfile",
@@ -35,8 +33,6 @@ def main() -> int:
         "results/",
         "tmp_check/",
         "tmp_check_iso/",
-        "docs/doxygen/",
-        "roadmap/",
     ]
 
     if not archive.exists():
@@ -62,6 +58,18 @@ def main() -> int:
         print("Archive is missing required files:", file=sys.stderr)
         for item in missing:
             print(f" - {item}", file=sys.stderr)
+        return 1
+
+    # Check upgrade scripts are included (if they exist in sql/ directory)
+    upgrade_scripts = sorted(Path("sql").glob("ulak--*--*.sql"))
+    missing_upgrades = [
+        s.name for s in upgrade_scripts
+        if prefix + f"sql/{s.name}" not in names
+    ]
+    if missing_upgrades:
+        print("Archive is missing upgrade scripts:", file=sys.stderr)
+        for item in missing_upgrades:
+            print(f" - sql/{item}", file=sys.stderr)
         return 1
 
     present_forbidden: list[str] = []

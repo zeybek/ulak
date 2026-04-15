@@ -44,8 +44,17 @@ jobs:
       - name: Extract version from release tag
         id: version
         run: |
-          VERSION="${{ github.event.release.tag_name }}"
+          # Support both release event and manual workflow_dispatch
+          if [ -n "${{ inputs.tag }}" ]; then
+            VERSION="${{ inputs.tag }}"
+          else
+            VERSION="${{ github.event.release.tag_name }}"
+          fi
           VERSION="${VERSION#v}"
+          if [ -z "$VERSION" ]; then
+            echo "::error::No version found. Provide a tag via release or workflow_dispatch."
+            exit 1
+          fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building version: ${VERSION}"
 
@@ -104,7 +113,7 @@ jobs:
             sleep 1
           done
 
-          # Verify extension is loadable
+          # Verify fresh install
           docker exec test-pg psql -U postgres -c "CREATE EXTENSION ulak;"
           docker exec test-pg psql -U postgres -c "SELECT * FROM ulak.health_check();"
 
@@ -112,5 +121,23 @@ jobs:
           docker exec test-pg psql -U postgres -c \
             "SELECT ulak.validate_endpoint_config('http', '{\"url\": \"https://example.com/webhook\"}'::jsonb);"
 
-          echo "PG ${{ matrix.pg }} image verified successfully"
+          echo "PG ${{ matrix.pg }} fresh install verified"
+
+          # Verify upgrade path from previous version (if upgrade scripts exist)
+          docker exec test-pg psql -U postgres -c "DROP EXTENSION IF EXISTS ulak CASCADE;"
+          UPGRADE_SCRIPTS=$(docker exec test-pg sh -c "ls /usr/share/postgresql/${{ matrix.pg }}/extension/ulak--*--*.sql 2>/dev/null | wc -l")
+          if [ "$UPGRADE_SCRIPTS" -gt "0" ]; then
+            # Find the earliest version that has an upgrade path to current
+            EARLIEST=$(docker exec test-pg sh -c "ls /usr/share/postgresql/${{ matrix.pg }}/extension/ulak--*.sql" \
+              | grep -oP 'ulak--\K[0-9]+\.[0-9]+\.[0-9]+(?=\.sql)' \
+              | sort -V | head -1)
+            echo "Testing upgrade path from $EARLIEST to current..."
+            docker exec test-pg psql -U postgres -c "CREATE EXTENSION ulak VERSION '$EARLIEST';"
+            docker exec test-pg psql -U postgres -c "ALTER EXTENSION ulak UPDATE;"
+            docker exec test-pg psql -U postgres -c "SELECT * FROM ulak.health_check();"
+            echo "PG ${{ matrix.pg }} upgrade path verified ($EARLIEST → current)"
+          else
+            echo "No upgrade scripts found, skipping upgrade test"
+          fi
+
           docker stop test-pg

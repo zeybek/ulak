@@ -235,7 +235,10 @@ bool http_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char 
  */
 static size_t response_write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     ResponseBuffer *buf = (ResponseBuffer *)userdata;
-    size_t total_size = size * nmemb;
+    size_t total_size;
+    if (size != 0 && nmemb > SIZE_MAX / size)
+        return 0; /* overflow protection */
+    total_size = size * nmemb;
     size_t max_size = (size_t)ulak_response_body_max_size;
     size_t remaining;
     size_t to_copy;
@@ -462,10 +465,11 @@ bool http_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, Js
         } else if (response_code >= 400 && response_code < 500) {
             /* 4xx Client Errors */
             if (response_code == 429) {
-                /* Rate limited - retryable */
+                /* Rate limited - retryable, snooze without incrementing retry count */
                 ulak_log("warning", "HTTP request rate limited: %ld (retryable)", response_code);
                 if (result) {
                     result->success = false;
+                    result->is_throttle = true;
                     result->error_msg =
                         psprintf(ERROR_PREFIX_RETRYABLE " HTTP %ld: Rate limited", response_code);
 #if LIBCURL_VERSION_NUM >= 0x075400

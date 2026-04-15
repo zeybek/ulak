@@ -12,6 +12,8 @@
 #define ULAK_SHMEM_H
 
 #include "postgres.h"
+#include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/spin.h"
 #include "utils/timestamp.h"
@@ -28,6 +30,10 @@
 
 /* Rate limiting constants */
 #define RL_SHMEM_MAX_ENDPOINTS 256
+
+/* Shared memory integrity constants */
+#define ULAK_SHMEM_MAGIC 0x554C414B   /* "ULAK" in ASCII */
+#define ULAK_SHMEM_VERSION 2          /* Bumped: added worker_latches[] to UlakDatabaseEntry */
 
 /**
  * @brief Shared memory token bucket for per-endpoint rate limiting.
@@ -60,6 +66,7 @@ typedef struct UlakDatabaseEntry {
     uint32 generation[ULAK_MAX_WORKERS]; /* Generation counter per slot (ABA protection) */
     TimestampTz registered_at;           /* When database was registered */
     TimestampTz worker_started_at[ULAK_MAX_WORKERS]; /* When each worker started */
+    Latch *worker_latches[ULAK_MAX_WORKERS]; /* Latch pointers for SetLatch wake */
 
     /* Worker metrics and error tracking (protected by metrics_mutex) */
     slock_t metrics_mutex; /* Spinlock for hot counter updates */
@@ -82,6 +89,8 @@ typedef struct UlakDatabaseEntry {
  * rate-limit buckets. Protected by an LWLock and per-field spinlocks.
  */
 typedef struct UlakShmemState {
+    uint32 magic;   /* Must equal ULAK_SHMEM_MAGIC */
+    uint32 version; /* Must equal ULAK_SHMEM_VERSION */
     LWLock *lock;
     pid_t worker_pid;
     bool worker_started;
@@ -124,6 +133,19 @@ typedef struct UlakWorkerParams {
 
 /* Global pointer to shared memory state */
 extern UlakShmemState *ulak_shmem;
+
+/**
+ * @brief Validate shared memory magic and version fields.
+ *
+ * Ensures the shared memory layout matches what this binary expects.
+ * Call from worker startup. Returns false on mismatch.
+ */
+extern bool ulak_shmem_validate(void);
+
+/* Worker latch registration for SetLatch-based wake from send() */
+extern void ulak_register_worker_latch(Oid dboid, int worker_id, Latch *latch);
+extern void ulak_clear_worker_latch(Oid dboid, int worker_id);
+extern void ulak_wake_workers(Oid dboid);
 
 /*
  * Shared memory initialization functions.

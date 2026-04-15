@@ -110,7 +110,20 @@ void _PG_init(void) {
  *
  * NOTE: External library cleanup is done in the worker process.
  */
-void _PG_fini(void) { elog(INFO, "[ulak] extension unloaded successfully"); }
+/* Previous hooks from shmem.c — needed for _PG_fini restoration */
+extern shmem_startup_hook_type prev_shmem_startup_hook;
+#if PG_VERSION_NUM >= 150000
+extern shmem_request_hook_type prev_shmem_request_hook;
+#endif
+
+void _PG_fini(void) {
+    /* Restore previous hooks to avoid dangling pointers on unload */
+    shmem_startup_hook = prev_shmem_startup_hook;
+#if PG_VERSION_NUM >= 150000
+    shmem_request_hook = prev_shmem_request_hook;
+#endif
+    elog(INFO, "[ulak] extension unloaded successfully");
+}
 
 /**
  * @brief Main function to send messages.
@@ -237,7 +250,10 @@ Datum ulak_send(PG_FUNCTION_ARGS) {
     /* Free result to avoid memory leak */
     queue_operation_result_free(result);
 
-    /* Note: pg_notify will be called by the trigger after commit */
+    /* Wake a worker via SetLatch for near-zero dispatch latency.
+     * pg_notify trigger remains as fallback for cross-process notifications. */
+    ulak_wake_workers(MyDatabaseId);
+
     elog(DEBUG1, "[ulak] Message queued successfully for endpoint_id: %lld",
          (long long)endpoint_id);
 

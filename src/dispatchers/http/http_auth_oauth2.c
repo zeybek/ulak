@@ -40,7 +40,10 @@ typedef struct {
  * @return Number of bytes consumed.
  */
 static size_t token_write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
-    size_t total = size * nmemb;
+    size_t total;
+    if (size != 0 && nmemb > SIZE_MAX / size)
+        return 0; /* overflow protection */
+    total = size * nmemb;
     ResponseBuffer *buf = (ResponseBuffer *)userp;
 
     if (buf->size + total >= buf->capacity) {

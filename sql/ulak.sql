@@ -1,6 +1,6 @@
 -- ulak extension - Authoritative SQL installation script
 -- Native transactional ulak with multi-protocol async dispatch
--- Version: 0.0.1
+-- Version: 0.0.2
 
 -- ============================================================================
 -- SCHEMA NOTE
@@ -8,8 +8,8 @@
 -- Schema ulak is created automatically by the extension
 -- (defined in ulak.control with 'schema = ulak')
 
--- Grant usage on schema
-GRANT USAGE ON SCHEMA ulak TO PUBLIC;
+-- Note: Schema access is granted to specific roles only (see RBAC section below).
+-- PUBLIC access is explicitly revoked after role setup.
 
 -- ============================================================================
 -- TABLE CREATION
@@ -24,6 +24,7 @@ CREATE TABLE ulak.endpoints (
     retry_policy jsonb DEFAULT '{"max_retries": 10, "backoff": "exponential"}'::jsonb,
     enabled boolean NOT NULL DEFAULT true,
     description text,
+    concurrency_limit integer DEFAULT NULL CHECK (concurrency_limit IS NULL OR concurrency_limit > 0),
     -- Circuit breaker state (discrete columns)
     circuit_state text NOT NULL DEFAULT 'closed' CHECK (circuit_state IN ('closed', 'open', 'half_open')),
     circuit_failure_count integer NOT NULL DEFAULT 0 CHECK (circuit_failure_count >= 0),
@@ -58,6 +59,9 @@ COMMENT ON COLUMN ulak.endpoints.retry_policy IS
 
 COMMENT ON COLUMN ulak.endpoints.enabled IS
 'Whether endpoint is active. Disabled endpoints are skipped by workers.';
+
+COMMENT ON COLUMN ulak.endpoints.concurrency_limit IS
+'Maximum number of messages that can be processing simultaneously for this endpoint. NULL means unlimited.';
 
 COMMENT ON COLUMN ulak.endpoints.circuit_failure_count IS
 'Consecutive dispatch failure count for circuit breaker. Reset to 0 on successful dispatch.';
@@ -354,6 +358,7 @@ CREATE TABLE ulak.subscriptions (
     event_type_id bigint NOT NULL REFERENCES ulak.event_types(id) ON DELETE CASCADE,
     endpoint_id bigint NOT NULL REFERENCES ulak.endpoints(id) ON DELETE CASCADE,
     filter jsonb,
+    transform_fn text DEFAULT NULL,
     enabled boolean NOT NULL DEFAULT true,
     description text,
     created_at timestamptz DEFAULT NOW(),
@@ -367,7 +372,8 @@ CREATE INDEX idx_subscriptions_endpoint ON ulak.subscriptions(endpoint_id);
 COMMENT ON TABLE ulak.subscriptions IS
 'Maps event types to endpoints for fan-out delivery.
 When publish() is called, messages are created for all active subscriptions.
-Filter uses JSONB containment (@>) for payload matching.';
+Filter uses JSONB containment (@>) for payload matching.
+transform_fn: optional qualified function name (schema.func) to transform payload before dispatch.';
 
 -- ============================================================================
 -- ROLE-BASED ACCESS CONTROL (RBAC)
@@ -460,6 +466,19 @@ CREATE TRIGGER update_event_types_updated_at
     BEFORE UPDATE ON ulak.event_types
     FOR EACH ROW EXECUTE FUNCTION ulak.update_updated_at();
 
+-- Config change notification trigger for dispatcher cache invalidation
+CREATE OR REPLACE FUNCTION ulak.notify_config_change()
+RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM pg_notify('ulak_config_change', COALESCE(OLD.id, NEW.id)::text);
+    RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER notify_endpoint_config_change
+    AFTER UPDATE OR DELETE ON ulak.endpoints
+    FOR EACH ROW EXECUTE FUNCTION ulak.notify_config_change();
+
 CREATE TRIGGER update_subscriptions_updated_at
     BEFORE UPDATE ON ulak.subscriptions
     FOR EACH ROW EXECUTE FUNCTION ulak.update_updated_at();
@@ -471,6 +490,10 @@ RETURNS TRIGGER AS $$
 BEGIN
     -- Skip NOTIFY if suppressed (e.g., during bulk COPY or send_batch)
     IF current_setting('ulak.suppress_notify', true) = 'on' THEN
+        RETURN NULL;
+    END IF;
+    -- Skip NOTIFY if disabled via GUC (reduces global lock contention at high throughput)
+    IF current_setting('ulak.enable_notify', true) = 'off' THEN
         RETURN NULL;
     END IF;
     PERFORM pg_notify('ulak_new_msg', '');
@@ -492,6 +515,13 @@ CREATE TRIGGER notify_new_message_trigger
 CREATE OR REPLACE FUNCTION ulak.prevent_payload_modification()
 RETURNS TRIGGER AS $$
 BEGIN
+    -- Allow internal updates from send_with_options SECURITY DEFINER (replace/debounce).
+    -- The GUC is set transaction-local by send_with_options and cleared immediately after.
+    -- Note: ulak_application has only SELECT on queue (no UPDATE), so they cannot exploit
+    -- this bypass. ulak_admin already has full DML access.
+    IF current_setting('ulak.internal_update', true) = 'on' THEN
+        RETURN NEW;
+    END IF;
     IF OLD.payload IS DISTINCT FROM NEW.payload THEN
         RAISE EXCEPTION 'payload modification not allowed after creation'
             USING HINT = 'Message payloads are immutable for audit integrity';
@@ -698,6 +728,38 @@ Each row has metric_name, metric_value, labels (JSONB), and metric_type (gauge/c
 Designed for Prometheus/Grafana integration via sql_exporter or similar.';
 
 -- ============================================================================
+-- QUEUE HEALTH (Unified Health Snapshot)
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION ulak.queue_health()
+RETURNS TABLE (
+    total_pending bigint,
+    total_processing bigint,
+    oldest_pending_age_seconds double precision,
+    oldest_processing_age_seconds double precision,
+    endpoints_with_open_circuit integer,
+    dlq_depth bigint,
+    archive_default_rows bigint
+)
+LANGUAGE sql STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, ulak
+AS $$
+    SELECT
+        (SELECT count(*) FROM ulak.queue WHERE status = 'pending'),
+        (SELECT count(*) FROM ulak.queue WHERE status = 'processing'),
+        (SELECT EXTRACT(EPOCH FROM NOW() - min(created_at)) FROM ulak.queue WHERE status = 'pending'),
+        (SELECT EXTRACT(EPOCH FROM NOW() - min(processing_started_at)) FROM ulak.queue WHERE status = 'processing'),
+        (SELECT count(*)::integer FROM ulak.endpoints WHERE circuit_state = 'open'),
+        (SELECT count(*) FROM ulak.dlq WHERE status = 'failed'),
+        (SELECT count(*) FROM ulak.archive_default)
+$$;
+
+COMMENT ON FUNCTION ulak.queue_health() IS
+'Returns a unified queue health snapshot: pending/processing counts, oldest message ages,
+open circuit breakers, DLQ depth, and archive default partition rows.';
+
+-- ============================================================================
 -- DLQ HELPER FUNCTIONS
 -- ============================================================================
 
@@ -762,7 +824,9 @@ CREATE OR REPLACE FUNCTION ulak.send_with_options(
     p_idempotency_key text DEFAULT NULL,
     p_correlation_id uuid DEFAULT NULL,
     p_expires_at timestamptz DEFAULT NULL,
-    p_ordering_key text DEFAULT NULL
+    p_ordering_key text DEFAULT NULL,
+    p_on_conflict text DEFAULT 'raise',
+    p_debounce_seconds integer DEFAULT NULL
 ) RETURNS bigint
 LANGUAGE plpgsql
 VOLATILE
@@ -774,7 +838,18 @@ DECLARE
     v_message_id bigint;
     v_payload_hash text;
     v_existing_hash text;
+    v_existing_created_at timestamptz;
 BEGIN
+    -- Validate on_conflict parameter
+    IF p_on_conflict NOT IN ('raise', 'skip', 'replace') THEN
+        RAISE EXCEPTION 'on_conflict must be ''raise'', ''skip'', or ''replace'', got ''%''', p_on_conflict;
+    END IF;
+
+    -- Debounce requires idempotency_key
+    IF p_debounce_seconds IS NOT NULL AND p_idempotency_key IS NULL THEN
+        RAISE EXCEPTION 'debounce_seconds requires idempotency_key to be set';
+    END IF;
+
     -- Backpressure check
     PERFORM ulak._check_backpressure();
 
@@ -796,6 +871,29 @@ BEGIN
     v_payload_hash := CASE WHEN p_idempotency_key IS NOT NULL
                           THEN md5(p_payload::text) ELSE NULL END;
 
+    -- Debounce check: if a pending message with same key exists within the window, skip
+    IF p_debounce_seconds IS NOT NULL THEN
+        SELECT id, created_at INTO v_message_id, v_existing_created_at
+        FROM ulak.queue
+        WHERE idempotency_key = p_idempotency_key
+          AND status IN ('pending', 'processing');
+
+        IF v_message_id IS NOT NULL THEN
+            IF v_existing_created_at + (p_debounce_seconds || ' seconds')::interval > NOW() THEN
+                -- Within debounce window: skip (return existing)
+                RETURN v_message_id;
+            ELSE
+                -- Outside debounce window: replace payload of existing message
+                PERFORM set_config('ulak.internal_update', 'on', true);
+                UPDATE ulak.queue SET payload = p_payload, payload_hash = v_payload_hash,
+                       updated_at = NOW()
+                WHERE id = v_message_id AND status = 'pending';
+                PERFORM set_config('ulak.internal_update', 'off', true);
+                RETURN v_message_id;
+            END IF;
+        END IF;
+    END IF;
+
     -- Insert message with all options
     INSERT INTO ulak.queue (
         endpoint_id, payload, status, retry_count, next_retry_at,
@@ -813,26 +911,41 @@ BEGIN
     RETURN v_message_id;
 EXCEPTION
     WHEN unique_violation THEN
-        -- Idempotency key collision - check payload hash match
+        -- Idempotency key collision - handle based on on_conflict mode
         SELECT id, payload_hash INTO v_message_id, v_existing_hash
         FROM ulak.queue
-        WHERE idempotency_key = p_idempotency_key;
+        WHERE idempotency_key = p_idempotency_key
+          AND status IN ('pending', 'processing');
 
-        IF v_existing_hash IS DISTINCT FROM v_payload_hash THEN
-            RAISE EXCEPTION 'Idempotency key ''%'' conflict: same key with different payload', p_idempotency_key;
+        IF p_on_conflict = 'skip' THEN
+            RETURN v_message_id;
+        ELSIF p_on_conflict = 'replace' THEN
+            -- Replace payload of existing pending message
+            PERFORM set_config('ulak.internal_update', 'on', true);
+            UPDATE ulak.queue SET payload = p_payload, payload_hash = v_payload_hash,
+                   updated_at = NOW()
+            WHERE id = v_message_id AND status = 'pending';
+            PERFORM set_config('ulak.internal_update', 'off', true);
+            RETURN v_message_id;
+        ELSE
+            -- 'raise' mode: check payload hash match
+            IF v_existing_hash IS DISTINCT FROM v_payload_hash THEN
+                RAISE EXCEPTION 'Idempotency key ''%'' conflict: same key with different payload', p_idempotency_key;
+            END IF;
+            RETURN v_message_id;
         END IF;
-
-        RETURN v_message_id;
 END;
 $$;
 
-COMMENT ON FUNCTION ulak.send_with_options(text, jsonb, smallint, timestamptz, text, uuid, timestamptz, text) IS
+COMMENT ON FUNCTION ulak.send_with_options(text, jsonb, smallint, timestamptz, text, uuid, timestamptz, text, text, integer) IS
 'Extended send function with additional options:
 - priority: 0-10 (higher = processed first)
 - scheduled_at: delay delivery until this time
 - idempotency_key: unique key for deduplication
 - correlation_id: UUID for distributed tracing
-- expires_at: TTL - message skipped if expired';
+- expires_at: TTL - message skipped if expired
+- on_conflict: raise (default), skip, or replace on idempotency collision
+- debounce_seconds: time window for dedup (requires idempotency_key)';
 
 -- ============================================================================
 -- HIGH-THROUGHPUT BATCH SEND
@@ -1015,6 +1128,48 @@ $$;
 COMMENT ON FUNCTION ulak.disable_endpoint(text) IS
 'Disable an endpoint to pause message processing.
 Pending messages will wait until endpoint is re-enabled.';
+
+-- Purge all pending messages for an endpoint
+CREATE OR REPLACE FUNCTION ulak.purge_endpoint(
+    p_endpoint_name text
+) RETURNS integer
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, ulak
+AS $$
+DECLARE
+    v_endpoint_id bigint;
+    v_deleted integer;
+BEGIN
+    SELECT id INTO v_endpoint_id
+    FROM ulak.endpoints
+    WHERE name = p_endpoint_name;
+
+    IF v_endpoint_id IS NULL THEN
+        RAISE EXCEPTION 'Endpoint ''%'' does not exist', p_endpoint_name;
+    END IF;
+
+    DELETE FROM ulak.queue
+    WHERE endpoint_id = v_endpoint_id AND status = 'pending';
+
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+
+    IF v_deleted > 0 THEN
+        RAISE LOG '[ulak] Purged % pending message(s) for endpoint ''%''', v_deleted, p_endpoint_name;
+
+        INSERT INTO ulak.event_log (event_type, entity_type, entity_id, metadata)
+        VALUES ('purge', 'endpoint', v_endpoint_id,
+                jsonb_build_object('endpoint_name', p_endpoint_name, 'messages_purged', v_deleted));
+    END IF;
+
+    RETURN v_deleted;
+END;
+$$;
+
+COMMENT ON FUNCTION ulak.purge_endpoint(text) IS
+'Delete all pending messages for an endpoint. Returns the number of messages purged.
+Processing and completed messages are not affected.';
 
 -- Reset circuit breaker for an endpoint
 CREATE OR REPLACE FUNCTION ulak.reset_circuit_breaker(
@@ -1321,6 +1476,34 @@ Should be called periodically from maintenance tasks or pg_cron.
 Returns the number of partitions created.';
 
 -- ============================================================================
+-- DEFAULT PARTITION MONITORING
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION ulak.check_archive_default()
+RETURNS integer
+LANGUAGE plpgsql VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, ulak
+AS $$
+DECLARE
+    v_count integer;
+BEGIN
+    SELECT count(*)::integer INTO v_count
+    FROM ulak.archive_default;
+
+    IF v_count > 0 THEN
+        RAISE WARNING '[ulak] % row(s) found in archive_default partition — missing monthly partitions may need to be created', v_count;
+    END IF;
+
+    RETURN v_count;
+END;
+$$;
+
+COMMENT ON FUNCTION ulak.check_archive_default() IS
+'Check if any rows landed in the archive default partition (indicating missing monthly partitions).
+Emits a WARNING if rows are found. Called during periodic maintenance.';
+
+-- ============================================================================
 -- EVENT LOG CLEANUP
 -- ============================================================================
 
@@ -1503,9 +1686,13 @@ $$;
 CREATE OR REPLACE FUNCTION ulak.subscribe(
     p_event_type text,
     p_endpoint_name text,
-    p_filter jsonb DEFAULT NULL
+    p_filter jsonb DEFAULT NULL,
+    p_transform_fn text DEFAULT NULL
 ) RETURNS bigint
-LANGUAGE plpgsql VOLATILE AS $$
+LANGUAGE plpgsql VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, ulak
+AS $$
 DECLARE
     v_event_type_id bigint;
     v_endpoint_id bigint;
@@ -1521,8 +1708,20 @@ BEGIN
         RAISE EXCEPTION 'Endpoint ''%'' does not exist', p_endpoint_name;
     END IF;
 
-    INSERT INTO ulak.subscriptions (event_type_id, endpoint_id, filter)
-    VALUES (v_event_type_id, v_endpoint_id, p_filter)
+    -- Validate transform function exists if provided
+    IF p_transform_fn IS NOT NULL THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_proc p
+            JOIN pg_namespace n ON p.pronamespace = n.oid
+            WHERE format('%I.%I', n.nspname, p.proname) = p_transform_fn
+               OR p.proname = p_transform_fn
+        ) THEN
+            RAISE EXCEPTION 'Transform function ''%'' does not exist', p_transform_fn;
+        END IF;
+    END IF;
+
+    INSERT INTO ulak.subscriptions (event_type_id, endpoint_id, filter, transform_fn)
+    VALUES (v_event_type_id, v_endpoint_id, p_filter, p_transform_fn)
     RETURNING id INTO v_sub_id;
 
     RETURN v_sub_id;
@@ -1549,6 +1748,145 @@ $$;
 -- PUB/SUB: PUBLISH (FAN-OUT)
 -- ============================================================================
 
+-- ============================================================================
+-- PAYLOAD SCHEMA VALIDATION
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION ulak.validate_payload_schema(
+    p_payload jsonb,
+    p_schema jsonb
+) RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE
+AS $$
+DECLARE
+    v_type text;
+    v_required jsonb;
+    v_properties jsonb;
+    v_key text;
+    v_prop_schema jsonb;
+    v_prop_value jsonb;
+    v_prop_type text;
+BEGIN
+    IF p_schema IS NULL THEN
+        RETURN true;
+    END IF;
+
+    -- Check top-level type
+    v_type := p_schema->>'type';
+    IF v_type IS NOT NULL THEN
+        IF v_type = 'object' AND jsonb_typeof(p_payload) != 'object' THEN
+            RAISE EXCEPTION 'Schema validation failed: expected object, got %', jsonb_typeof(p_payload);
+        ELSIF v_type = 'array' AND jsonb_typeof(p_payload) != 'array' THEN
+            RAISE EXCEPTION 'Schema validation failed: expected array, got %', jsonb_typeof(p_payload);
+        ELSIF v_type = 'string' AND jsonb_typeof(p_payload) != 'string' THEN
+            RAISE EXCEPTION 'Schema validation failed: expected string, got %', jsonb_typeof(p_payload);
+        ELSIF v_type = 'number' AND jsonb_typeof(p_payload) != 'number' THEN
+            RAISE EXCEPTION 'Schema validation failed: expected number, got %', jsonb_typeof(p_payload);
+        ELSIF v_type = 'boolean' AND jsonb_typeof(p_payload) != 'boolean' THEN
+            RAISE EXCEPTION 'Schema validation failed: expected boolean, got %', jsonb_typeof(p_payload);
+        END IF;
+    END IF;
+
+    -- Check required fields
+    v_required := p_schema->'required';
+    IF v_required IS NOT NULL AND jsonb_typeof(v_required) = 'array' THEN
+        FOR v_key IN SELECT jsonb_array_elements_text(v_required) LOOP
+            IF NOT p_payload ? v_key THEN
+                RAISE EXCEPTION 'Schema validation failed: required field ''%'' is missing', v_key;
+            END IF;
+        END LOOP;
+    END IF;
+
+    -- Check property types
+    v_properties := p_schema->'properties';
+    IF v_properties IS NOT NULL AND jsonb_typeof(v_properties) = 'object' THEN
+        FOR v_key IN SELECT jsonb_object_keys(v_properties) LOOP
+            IF p_payload ? v_key THEN
+                v_prop_schema := v_properties->v_key;
+                v_prop_value := p_payload->v_key;
+                v_prop_type := v_prop_schema->>'type';
+
+                IF v_prop_type IS NOT NULL AND v_prop_value IS NOT NULL THEN
+                    IF v_prop_type = 'string' AND jsonb_typeof(v_prop_value) != 'string' THEN
+                        RAISE EXCEPTION 'Schema validation failed: field ''%'' expected string, got %', v_key, jsonb_typeof(v_prop_value);
+                    ELSIF v_prop_type = 'number' AND jsonb_typeof(v_prop_value) != 'number' THEN
+                        RAISE EXCEPTION 'Schema validation failed: field ''%'' expected number, got %', v_key, jsonb_typeof(v_prop_value);
+                    ELSIF v_prop_type = 'boolean' AND jsonb_typeof(v_prop_value) != 'boolean' THEN
+                        RAISE EXCEPTION 'Schema validation failed: field ''%'' expected boolean, got %', v_key, jsonb_typeof(v_prop_value);
+                    ELSIF v_prop_type = 'object' AND jsonb_typeof(v_prop_value) != 'object' THEN
+                        RAISE EXCEPTION 'Schema validation failed: field ''%'' expected object, got %', v_key, jsonb_typeof(v_prop_value);
+                    ELSIF v_prop_type = 'array' AND jsonb_typeof(v_prop_value) != 'array' THEN
+                        RAISE EXCEPTION 'Schema validation failed: field ''%'' expected array, got %', v_key, jsonb_typeof(v_prop_value);
+                    END IF;
+                END IF;
+            END IF;
+        END LOOP;
+    END IF;
+
+    RETURN true;
+END;
+$$;
+
+COMMENT ON FUNCTION ulak.validate_payload_schema(jsonb, jsonb) IS
+'Validate a JSONB payload against a JSON Schema subset.
+Supports: type (object/array/string/number/boolean), required fields, property type checks.';
+
+-- ============================================================================
+-- PAYLOAD TRANSFORMATION
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION ulak._apply_transform(
+    p_transform_fn text,
+    p_payload jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, ulak
+AS $$
+DECLARE
+    v_result jsonb;
+BEGIN
+    IF p_transform_fn IS NULL THEN
+        RETURN p_payload;
+    END IF;
+
+    -- Validate function name: reject multiple dots (unsupported)
+    IF p_transform_fn LIKE '%.%.%' THEN
+        RAISE EXCEPTION 'Invalid transform function name ''%'': only schema.function format is supported', p_transform_fn;
+    END IF;
+
+    -- Split schema.function and quote each part for SQL injection safety
+    IF p_transform_fn LIKE '%.%' THEN
+        EXECUTE format('SELECT %I.%I($1)',
+            split_part(p_transform_fn, '.', 1),
+            split_part(p_transform_fn, '.', 2))
+        INTO v_result USING p_payload;
+    ELSE
+        EXECUTE format('SELECT %I($1)', p_transform_fn)
+        INTO v_result USING p_payload;
+    END IF;
+
+    IF v_result IS NULL THEN
+        RAISE EXCEPTION 'Transform function ''%'' returned NULL', p_transform_fn;
+    END IF;
+
+    RETURN v_result;
+EXCEPTION
+    WHEN undefined_function THEN
+        RAISE EXCEPTION 'Transform function ''%'' does not exist', p_transform_fn;
+    WHEN others THEN
+        RAISE EXCEPTION 'Transform function ''%'' failed: %', p_transform_fn, SQLERRM;
+END;
+$$;
+
+COMMENT ON FUNCTION ulak._apply_transform(text, jsonb) IS
+'Internal: apply a user-defined transform function to a payload.
+The function must accept (jsonb) and return jsonb.';
+
+-- ============================================================================
+-- PUB/SUB PUBLISH
+-- ============================================================================
+
 CREATE OR REPLACE FUNCTION ulak.publish(
     p_event_type text,
     p_payload jsonb
@@ -1559,12 +1897,19 @@ SET search_path = pg_catalog, ulak
 AS $$
 DECLARE
     v_event_type_id bigint;
+    v_event_schema jsonb;
     v_count integer;
     v_projected_count bigint;
 BEGIN
-    SELECT id INTO v_event_type_id FROM ulak.event_types WHERE name = p_event_type;
+    SELECT id, schema INTO v_event_type_id, v_event_schema
+    FROM ulak.event_types WHERE name = p_event_type;
     IF v_event_type_id IS NULL THEN
         RAISE EXCEPTION 'Event type ''%'' does not exist', p_event_type;
+    END IF;
+
+    -- Validate payload against event type schema (if defined)
+    IF v_event_schema IS NOT NULL THEN
+        PERFORM ulak.validate_payload_schema(p_payload, v_event_schema);
     END IF;
 
     SELECT count(*) INTO v_projected_count
@@ -1582,9 +1927,15 @@ BEGIN
     PERFORM set_config('ulak.suppress_notify', 'on', true);
 
     -- Fan-out: INSERT...SELECT from active subscriptions for enabled endpoints
+    -- Apply per-subscription transform functions when configured
     WITH inserted AS (
         INSERT INTO ulak.queue (endpoint_id, payload, status, next_retry_at, created_at, updated_at)
-        SELECT s.endpoint_id, p_payload, 'pending', NOW(), NOW(), NOW()
+        SELECT s.endpoint_id,
+               CASE WHEN s.transform_fn IS NOT NULL
+                    THEN ulak._apply_transform(s.transform_fn, p_payload)
+                    ELSE p_payload
+               END,
+               'pending', NOW(), NOW(), NOW()
         FROM ulak.subscriptions s
         JOIN ulak.endpoints e ON e.id = s.endpoint_id
         WHERE s.event_type_id = v_event_type_id
@@ -1807,9 +2158,11 @@ BEGIN
         BEGIN
             v_part_date := to_date(substring(v_partition.relname from 'archive_(\d{4}_\d{2})'), 'YYYY_MM');
             IF v_part_date < v_cutoff THEN
+                -- Two-phase removal (pg_partman pattern): detach first, then drop
+                EXECUTE format('ALTER TABLE ulak.archive DETACH PARTITION ulak.%I', v_partition.relname);
                 EXECUTE format('DROP TABLE IF EXISTS ulak.%I', v_partition.relname);
                 v_dropped := v_dropped + 1;
-                RAISE LOG '[ulak] Dropped old archive partition: %', v_partition.relname;
+                RAISE LOG '[ulak] Detached and dropped old archive partition: %', v_partition.relname;
             END IF;
         EXCEPTION WHEN others THEN
             -- Skip partitions with unparseable names
@@ -1824,6 +2177,47 @@ $$;
 COMMENT ON FUNCTION ulak.cleanup_old_archive_partitions(integer) IS
 'Drop archive partitions older than the specified retention period.
 Default retention is 6 months. Returns number of partitions dropped.';
+
+-- ============================================================================
+-- INDEX MAINTENANCE
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION ulak.reindex_queue()
+RETURNS integer
+LANGUAGE plpgsql VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, ulak
+AS $$
+DECLARE
+    v_index record;
+    v_count integer := 0;
+BEGIN
+    FOR v_index IN
+        SELECT c.relname AS indexname
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        JOIN pg_class t ON t.oid = i.indrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        WHERE n.nspname = 'ulak'
+          AND t.relname IN ('queue', 'endpoints', 'dlq')
+          AND i.indisvalid = true
+    LOOP
+        BEGIN
+            EXECUTE format('REINDEX INDEX ulak.%I', v_index.indexname);
+            v_count := v_count + 1;
+        EXCEPTION WHEN others THEN
+            RAISE WARNING '[ulak] Failed to reindex %: %', v_index.indexname, SQLERRM;
+        END;
+    END LOOP;
+
+    RETURN v_count;
+END;
+$$;
+
+COMMENT ON FUNCTION ulak.reindex_queue() IS
+'Rebuild all ulak queue/endpoint/DLQ indexes using REINDEX INDEX.
+Reduces index bloat from frequent status UPDATEs. Schedule via pg_cron.
+For non-blocking reindex, run REINDEX INDEX CONCURRENTLY manually outside a transaction.';
 
 -- ============================================================================
 -- MESSAGE REPLAY (Archive → Queue)
@@ -2120,6 +2514,7 @@ GRANT EXECUTE ON FUNCTION ulak.alter_endpoint(text, jsonb) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.validate_endpoint_config(text, jsonb) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.enable_endpoint(text) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.disable_endpoint(text) TO ulak_admin;
+GRANT EXECUTE ON FUNCTION ulak.purge_endpoint(text) TO ulak_admin;
 
 -- Admin functions: circuit breaker and maintenance
 GRANT EXECUTE ON FUNCTION ulak.update_circuit_breaker(bigint, boolean) TO ulak_admin;
@@ -2134,6 +2529,10 @@ GRANT EXECUTE ON FUNCTION ulak._check_backpressure(bigint) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.archive_single_to_dlq(bigint) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.archive_completed_messages(integer, integer) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.cleanup_old_archive_partitions(integer) TO ulak_admin;
+GRANT EXECUTE ON FUNCTION ulak.check_archive_default() TO ulak_admin;
+GRANT EXECUTE ON FUNCTION ulak.reindex_queue() TO ulak_admin;
+GRANT EXECUTE ON FUNCTION ulak.validate_payload_schema(jsonb, jsonb) TO ulak_admin;
+GRANT EXECUTE ON FUNCTION ulak._apply_transform(text, jsonb) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.replay_message(bigint) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.replay_range(bigint, timestamptz, timestamptz, text) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.redrive_message(bigint) TO ulak_admin;
@@ -2144,7 +2543,7 @@ GRANT EXECUTE ON FUNCTION ulak.dlq_summary() TO ulak_admin;
 -- Admin functions: pub/sub management
 GRANT EXECUTE ON FUNCTION ulak.create_event_type(text, text, jsonb) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.drop_event_type(text) TO ulak_admin;
-GRANT EXECUTE ON FUNCTION ulak.subscribe(text, text, jsonb) TO ulak_admin;
+GRANT EXECUTE ON FUNCTION ulak.subscribe(text, text, jsonb, text) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.unsubscribe(bigint) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.publish(text, jsonb) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.publish_batch(jsonb) TO ulak_admin;
@@ -2152,10 +2551,12 @@ GRANT EXECUTE ON FUNCTION ulak.publish_batch(jsonb) TO ulak_admin;
 -- Admin functions: monitoring
 GRANT EXECUTE ON FUNCTION ulak.get_worker_status() TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.health_check() TO ulak_admin;
+GRANT EXECUTE ON FUNCTION ulak.enable_fast_mode() TO ulak_admin;
+GRANT EXECUTE ON FUNCTION ulak.enable_fast_mode() TO ulak_application;
 
 -- Application functions
 GRANT EXECUTE ON FUNCTION ulak.send(text, jsonb) TO ulak_application;
-GRANT EXECUTE ON FUNCTION ulak.send_with_options(text, jsonb, smallint, timestamptz, text, uuid, timestamptz, text) TO ulak_application;
+GRANT EXECUTE ON FUNCTION ulak.send_with_options(text, jsonb, smallint, timestamptz, text, uuid, timestamptz, text, text, integer) TO ulak_application;
 GRANT EXECUTE ON FUNCTION ulak.send_batch(text, jsonb[]) TO ulak_application;
 GRANT EXECUTE ON FUNCTION ulak.send_batch_with_priority(text, jsonb[], smallint) TO ulak_application;
 GRANT EXECUTE ON FUNCTION ulak.publish(text, jsonb) TO ulak_application;
@@ -2173,5 +2574,8 @@ GRANT EXECUTE ON FUNCTION ulak.metrics() TO ulak_monitor;
 -- Metrics accessible to all roles
 GRANT EXECUTE ON FUNCTION ulak._shmem_metrics() TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.metrics() TO ulak_admin;
+GRANT EXECUTE ON FUNCTION ulak.queue_health() TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak._shmem_metrics() TO ulak_application;
 GRANT EXECUTE ON FUNCTION ulak.metrics() TO ulak_application;
+GRANT EXECUTE ON FUNCTION ulak.queue_health() TO ulak_application;
+GRANT EXECUTE ON FUNCTION ulak.queue_health() TO ulak_monitor;

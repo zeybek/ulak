@@ -17,6 +17,7 @@ ORDER BY ordinal_position;
  retry_policy          | jsonb                    | YES
  enabled               | boolean                  | NO
  description           | text                     | YES
+ concurrency_limit     | integer                  | YES
  circuit_state         | text                     | NO
  circuit_failure_count | integer                  | NO
  circuit_opened_at     | timestamp with time zone | YES
@@ -25,7 +26,7 @@ ORDER BY ordinal_position;
  last_failure_at       | timestamp with time zone | YES
  created_at            | timestamp with time zone | YES
  updated_at            | timestamp with time zone | YES
-(15 rows)
+(16 rows)
 
 -- Verify queue table exists with expected columns
 SELECT column_name, data_type, is_nullable
@@ -103,13 +104,15 @@ FROM pg_proc p
 JOIN pg_namespace n ON p.pronamespace = n.oid
 WHERE n.nspname = 'ulak'
 ORDER BY p.proname;
-            proname             |                                                                                                                                                                              args                                                                                                                                                                               
---------------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+            proname             |                                                                                                                                                                                                                            args                                                                                                                                                                                                                             
+--------------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ _apply_transform               | p_transform_fn text, p_payload jsonb
  _check_backpressure            | p_projected_additional bigint DEFAULT 0
  _shmem_metrics                 | 
  alter_endpoint                 | endpoint_name text, new_config jsonb
  archive_completed_messages     | p_older_than_seconds integer DEFAULT 3600, p_batch_size integer DEFAULT 1000
  archive_single_to_dlq          | p_message_id bigint
+ check_archive_default          | 
  cleanup_dlq                    | 
  cleanup_event_log              | 
  cleanup_old_archive_partitions | p_retention_months integer DEFAULT 6
@@ -127,26 +130,31 @@ ORDER BY p.proname;
  maintain_archive_partitions    | p_months_ahead integer DEFAULT 3
  mark_expired_messages          | 
  metrics                        | 
+ notify_config_change           | 
  notify_new_message             | 
  prevent_payload_modification   | 
  publish                        | p_event_type text, p_payload jsonb
  publish_batch                  | p_events jsonb
+ purge_endpoint                 | p_endpoint_name text
+ queue_health                   | 
  redrive_all                    | 
  redrive_endpoint               | p_endpoint_name text
  redrive_message                | p_dlq_id bigint
+ reindex_queue                  | 
  replay_message                 | p_archive_message_id bigint
  replay_range                   | p_endpoint_id bigint, p_from_ts timestamp with time zone, p_to_ts timestamp with time zone, p_status text DEFAULT NULL::text
  reset_circuit_breaker          | p_endpoint_name text
  send                           | endpoint_name text, payload jsonb
  send_batch                     | p_endpoint_name text, p_payloads jsonb[]
  send_batch_with_priority       | p_endpoint_name text, p_payloads jsonb[], p_priority smallint DEFAULT 0
- send_with_options              | p_endpoint_name text, p_payload jsonb, p_priority smallint DEFAULT 0, p_scheduled_at timestamp with time zone DEFAULT NULL::timestamp with time zone, p_idempotency_key text DEFAULT NULL::text, p_correlation_id uuid DEFAULT NULL::uuid, p_expires_at timestamp with time zone DEFAULT NULL::timestamp with time zone, p_ordering_key text DEFAULT NULL::text
- subscribe                      | p_event_type text, p_endpoint_name text, p_filter jsonb DEFAULT NULL::jsonb
+ send_with_options              | p_endpoint_name text, p_payload jsonb, p_priority smallint DEFAULT 0, p_scheduled_at timestamp with time zone DEFAULT NULL::timestamp with time zone, p_idempotency_key text DEFAULT NULL::text, p_correlation_id uuid DEFAULT NULL::uuid, p_expires_at timestamp with time zone DEFAULT NULL::timestamp with time zone, p_ordering_key text DEFAULT NULL::text, p_on_conflict text DEFAULT 'raise'::text, p_debounce_seconds integer DEFAULT NULL::integer
+ subscribe                      | p_event_type text, p_endpoint_name text, p_filter jsonb DEFAULT NULL::jsonb, p_transform_fn text DEFAULT NULL::text
  unsubscribe                    | p_subscription_id bigint
  update_circuit_breaker         | p_endpoint_id bigint, p_success boolean
  update_updated_at              | 
  validate_endpoint_config       | protocol text, config jsonb
-(41 rows)
+ validate_payload_schema        | p_payload jsonb, p_schema jsonb
+(48 rows)
 
 -- ============================================================================
 -- TRIGGERS
@@ -157,10 +165,11 @@ FROM pg_trigger
 WHERE tgrelid = 'ulak.endpoints'::regclass
   AND NOT tgisinternal
 ORDER BY tgname;
-           tgname            
------------------------------
+            tgname             
+-------------------------------
+ notify_endpoint_config_change
  update_endpoints_updated_at
-(1 row)
+(2 rows)
 
 -- Verify triggers on queue table
 SELECT tgname

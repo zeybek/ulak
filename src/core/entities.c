@@ -38,8 +38,7 @@ Endpoint *endpoint_create(const char *name, ProtocolType protocol, Jsonb *config
 
     /* Initialize endpoint */
     endpoint->id = 0; /* Will be set by database */
-    strncpy(endpoint->name, name, MAX_ENDPOINT_NAME_LENGTH - 1);
-    endpoint->name[MAX_ENDPOINT_NAME_LENGTH - 1] = '\0';
+    strlcpy(endpoint->name, name, MAX_ENDPOINT_NAME_LENGTH);
     endpoint->protocol = protocol;
     endpoint->config = config;
     endpoint->retry_policy = retry_policy;

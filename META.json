@@ -11,7 +11,7 @@
   "provides": {
     "ulak": {
       "abstract": "Transactional Outbox Pattern for PostgreSQL",
-      "file": "sql/ulak--0.0.0.sql",
+      "file": "sql/ulak--0.0.2.sql",
       "docfile": "README.md",
       "version": "0.0.2"
     }

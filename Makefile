@@ -166,7 +166,7 @@ sql/$(EXTENSION)--$(EXTVERSION).sql: sql/$(EXTENSION).sql version.txt
 
 # Only clean generated install files, NOT future upgrade scripts (--X.Y.Z--A.B.C.sql)
 # Also clean protocol dispatcher object files (always, regardless of build flags)
-EXTRA_CLEAN = sql/$(EXTENSION)--[0-9].[0-9].[0-9].sql
+EXTRA_CLEAN = sql/$(EXTENSION)--[0-9]*.[0-9]*.[0-9]*.sql
 EXTRA_CLEAN += src/dispatchers/http/http_security.o src/dispatchers/http/http_security.bc
 EXTRA_CLEAN += src/dispatchers/http/http_request.o src/dispatchers/http/http_request.bc
 EXTRA_CLEAN += src/dispatchers/http/http_sync.o src/dispatchers/http/http_sync.bc
@@ -202,7 +202,11 @@ REGRESS = 00_setup 01_schema 02_endpoints_crud 03_endpoints_validation \
           15_production_hardening 16_message_lifecycle 17_cloudevents \
           18_advanced_operations 19_http_proxy 20_kafka_config 21_redis_config \
           22_mqtt_config 23_amqp_config 24_nats_config \
-          25_metrics 99_cleanup
+          25_metrics \
+          26_concurrency_limit 27_send_options_v2 28_purge_endpoint \
+          29_queue_health 30_schema_validation 31_transform_hooks \
+          32_notify_config 33_check_archive_default \
+          99_cleanup
 
 # Test options: use tests/regress/ subdirectory for input/output, dedicated test database
 REGRESS_OPTS = --inputdir=tests/regress --outputdir=tests/regress --dbname=ulak_test
@@ -210,7 +214,8 @@ REGRESS_OPTS = --inputdir=tests/regress --outputdir=tests/regress --dbname=ulak_
 # Isolation tests for concurrency scenarios (FOR UPDATE SKIP LOCKED, circuit breaker, ordering)
 ISOLATION = skip_locked modulo_partition ordering_key circuit_breaker batch_mark_processing \
             circuit_breaker_threshold circuit_breaker_recovery ordering_key_completion \
-            retry_visibility priority_contention idempotency_conflict dlq_concurrent_redrive
+            retry_visibility priority_contention idempotency_conflict dlq_concurrent_redrive \
+            concurrency_limit debounce_conflict
 ISOLATION_OPTS = --inputdir=tests/isolation --outputdir=tests/isolation --dbname=ulak_test
 
 # TAP tests for worker lifecycle scenarios (requires IPC::Run Perl module)
@@ -388,6 +393,7 @@ dist: version-check sql/$(EXTENSION)--$(EXTVERSION).sql
 	@mkdir -p $(DIST_DIR)
 	@rsync -a \
 		--exclude='.git/' \
+		--exclude='.github/' \
 		--exclude='dist/' \
 		--exclude='.DS_Store' \
 		--exclude='docs/' \
@@ -398,7 +404,6 @@ dist: version-check sql/$(EXTENSION)--$(EXTVERSION).sql
 		--exclude='*.so' \
 		--exclude='*.o' \
 		./ $(DIST_DIR)/$(DIST_BASENAME)/
-	@rm -rf $(DIST_DIR)/$(DIST_BASENAME)/.github
 	@rm -rf $(DIST_DIR)/$(DIST_BASENAME)/docs
 	@rm -f $(DIST_DIR)/$(DIST_BASENAME)/Dockerfile
 	@rm -f $(DIST_DIR)/$(DIST_BASENAME)/Dockerfile.publish
