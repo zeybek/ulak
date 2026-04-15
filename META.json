@@ -7,7 +7,7 @@
     "Ahmet Zeybek <me@zeybek.dev>"
   ],
   "license": "apache_2_0",
-  "release_status": "testing",
+  "release_status": "stable",
   "provides": {
     "ulak": {
       "abstract": "Transactional Outbox Pattern for PostgreSQL",
