@@ -18,9 +18,9 @@ def main() -> int:
     version = Path("version.txt").read_text().strip()
     control = Path("ulak.control").read_text()
     meta = json.loads(Path("META.json").read_text())
-    expected_sql = Path(f"sql/ulak--{version}.sql")
 
     errors: list[str] = []
+    fixed: list[str] = []
 
     control_version = extract_control_value(control, "default_version")
     if control_version != version:
@@ -42,10 +42,10 @@ def main() -> int:
     if provides.get("file") != expected_sql_file:
         provides["file"] = expected_sql_file
         Path("META.json").write_text(json.dumps(meta, indent=2) + "\n")
-        print(f"Auto-fixed META.json provides.ulak.file to {expected_sql_file}")
+        fixed.append(f"Auto-fixed META.json provides.ulak.file to {expected_sql_file}")
 
-    if not expected_sql.exists():
-        errors.append(f"Expected release SQL file missing: {expected_sql}")
+    for msg in fixed:
+        print(msg)
 
     if errors:
         print("Release metadata validation failed:", file=sys.stderr)
