@@ -4,7 +4,7 @@
 [![PostgreSQL 14-18](https://img.shields.io/badge/PostgreSQL-14--18-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE.md)
 <!-- x-release-please-start-version -->
-[![Version](https://img.shields.io/badge/version-0.0.1)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.0.2)](CHANGELOG.md)
 <!-- x-release-please-end -->
 
 **Transactional Outbox Pattern for PostgreSQL** — messages committed atomically with your business transactions, delivered reliably via background workers.
