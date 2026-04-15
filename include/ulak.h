@@ -46,7 +46,7 @@
 #define ulak_pqsignal(signo, handler) pqsignal(signo, handler)
 
 /** @brief Extension version string -- must match version.txt. */
-#define ULAK_VERSION "0.0.0" // x-release-please-version
+#define ULAK_VERSION "0.0.1" // x-release-please-version
 
 /*
  * GUC variable declarations are authoritative in config/guc.h.

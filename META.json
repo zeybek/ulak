@@ -2,7 +2,7 @@
   "name": "ulak",
   "abstract": "Transactional Outbox extension for PostgreSQL with reliable asynchronous delivery",
   "description": "ulak is a PostgreSQL extension implementing the Transactional Outbox pattern inside the database. Messages are committed atomically with business transactions and delivered asynchronously by background workers to HTTP, Kafka, MQTT, Redis Streams, AMQP, and NATS endpoints.",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "maintainer": [
     "Ahmet Zeybek <me@zeybek.dev>"
   ],
@@ -13,7 +13,7 @@
       "abstract": "Transactional Outbox Pattern for PostgreSQL",
       "file": "sql/ulak--0.0.0.sql",
       "docfile": "README.md",
-      "version": "0.0.0"
+      "version": "0.0.1"
     }
   },
   "prereqs": {
