@@ -41,7 +41,7 @@ typedef struct DispatchResult {
     char *http_content_type;      /**< Response Content-Type -- palloc'd */
     int32 retry_after_seconds;    /**< Retry-After override from server, 0 = not set */
     bool should_disable_endpoint; /**< 410 Gone: signal worker to disable endpoint */
-    bool is_throttle;             /**< 429 Too Many Requests: snooze without retry count increment */
+    bool is_throttle; /**< 429 Too Many Requests: snooze without retry count increment */
     /** @} */
 
     /** @name Kafka-specific fields

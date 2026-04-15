@@ -493,10 +493,10 @@ void config_init_guc_variables(void) {
                              NULL);
 
     /* Archive Partition Configuration */
-    DefineCustomIntVariable("ulak.archive_premake_months", "Months of archive partitions to pre-create",
-                            "Number of monthly partitions to create ahead of current month",
-                            &ulak_archive_premake_months, 3, 1, 24, PGC_SIGHUP, GUC_NOT_IN_SAMPLE,
-                            NULL, NULL, NULL);
+    DefineCustomIntVariable(
+        "ulak.archive_premake_months", "Months of archive partitions to pre-create",
+        "Number of monthly partitions to create ahead of current month",
+        &ulak_archive_premake_months, 3, 1, 24, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
     ulak_log("info", "GUC variables initialized");
 }

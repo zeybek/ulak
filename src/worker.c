@@ -131,8 +131,8 @@ static void process_endpoint_batch(MessageBatchInfo *messages, int count, const 
 static void ulak_worker_loop(void);
 static void ulak_worker_init_libs(void);
 static void ulak_worker_cleanup_libs(void);
-static void run_maintenance_task(const char *query, const char *task_name, int nargs,
-                                 Oid *argtypes, Datum *values);
+static void run_maintenance_task(const char *query, const char *task_name, int nargs, Oid *argtypes,
+                                 Datum *values);
 static void mark_expired_messages(void);
 static void recover_stale_processing_messages(void);
 static void archive_completed_messages(void);
@@ -254,9 +254,8 @@ PGDLLEXPORT void ulak_worker_main(Datum main_arg) {
 
     /* Validate shared memory integrity before touching it */
     if (!ulak_shmem_validate()) {
-        elog(FATAL,
-             "[ulak] Shared memory validation failed. "
-             "Restart PostgreSQL after upgrading the ulak extension.");
+        elog(FATAL, "[ulak] Shared memory validation failed. "
+                    "Restart PostgreSQL after upgrading the ulak extension.");
     }
 
     /* Initialize external libraries */
@@ -276,8 +275,8 @@ PGDLLEXPORT void ulak_worker_main(Datum main_arg) {
     /* Report worker identity in pg_stat_activity for monitoring */
     {
         char appname[NAMEDATALEN];
-        snprintf(appname, sizeof(appname), "ulak worker %d/%d [%s]",
-                 worker_id + 1, total_workers, worker_dbname);
+        snprintf(appname, sizeof(appname), "ulak worker %d/%d [%s]", worker_id + 1, total_workers,
+                 worker_dbname);
         pgstat_report_appname(appname);
     }
 
@@ -940,8 +939,7 @@ static int64 process_pending_messages_batch(void) {
                                                                     VARSIZE(response_jsonb));
                                 response_ids[response_count] =
                                     Int64GetDatum(all_messages[i].message_id);
-                                response_texts[response_count] =
-                                    CStringGetTextDatum(response_str);
+                                response_texts[response_count] = CStringGetTextDatum(response_str);
                                 response_count++;
                             } else {
                                 success_ids[success_count++] =
@@ -973,8 +971,8 @@ static int64 process_pending_messages_batch(void) {
 
                         /* Snooze path: 429 throttle → revert to pending without
                          * incrementing retry_count (inspired by River's snooze) */
-                        if (all_messages[i].result != NULL &&
-                            all_messages[i].result->is_throttle && delay_seconds > 0) {
+                        if (all_messages[i].result != NULL && all_messages[i].result->is_throttle &&
+                            delay_seconds > 0) {
                             char snooze_delay_str[32];
                             snprintf(snooze_delay_str, sizeof(snooze_delay_str), "%d",
                                      delay_seconds);
@@ -983,8 +981,7 @@ static int64 process_pending_messages_batch(void) {
                             /* Keep same retry count (no increment) for snooze */
                             retry_fail_retries[retry_fail_count] =
                                 Int32GetDatum(all_messages[i].retry_count);
-                            retry_fail_errors[retry_fail_count] =
-                                CStringGetTextDatum(error_str);
+                            retry_fail_errors[retry_fail_count] = CStringGetTextDatum(error_str);
                             retry_fail_delays[retry_fail_count] =
                                 CStringGetTextDatum(snooze_delay_str);
                             retry_fail_count++;
@@ -1881,8 +1878,8 @@ static void ulak_worker_cleanup_libs(void) {
  * transaction.
  */
 static void mark_expired_messages(void) {
-    run_maintenance_task("SELECT ulak.mark_expired_messages()",
-                         "mark_expired_messages", 0, NULL, NULL);
+    run_maintenance_task("SELECT ulak.mark_expired_messages()", "mark_expired_messages", 0, NULL,
+                         NULL);
 }
 
 /**
@@ -1919,8 +1916,8 @@ static void recover_stale_processing_messages(void) {
  * configured retention period. Prevents queue table bloat in production.
  */
 static void archive_completed_messages(void) {
-    run_maintenance_task("SELECT ulak.archive_completed_messages()",
-                         "archive_completed_messages", 0, NULL, NULL);
+    run_maintenance_task("SELECT ulak.archive_completed_messages()", "archive_completed_messages",
+                         0, NULL, NULL);
 }
 
 /**
@@ -1936,8 +1933,8 @@ static void archive_completed_messages(void) {
  * @param argtypes Array of argument OIDs.
  * @param values Array of argument Datums.
  */
-static void run_maintenance_task(const char *query, const char *task_name, int nargs,
-                                 Oid *argtypes, Datum *values) {
+static void run_maintenance_task(const char *query, const char *task_name, int nargs, Oid *argtypes,
+                                 Datum *values) {
     volatile bool success = false;
 
     PG_TRY();
@@ -2328,9 +2325,8 @@ PGDLLEXPORT void ulak_database_worker_main(Datum main_arg) {
 
     /* Validate shared memory integrity before touching it */
     if (!ulak_shmem_validate()) {
-        elog(FATAL,
-             "[ulak] Shared memory validation failed. "
-             "Restart PostgreSQL after upgrading the ulak extension.");
+        elog(FATAL, "[ulak] Shared memory validation failed. "
+                    "Restart PostgreSQL after upgrading the ulak extension.");
     }
 
     /* Initialize external libraries */
@@ -2387,8 +2383,8 @@ PGDLLEXPORT void ulak_database_worker_main(Datum main_arg) {
     /* Report worker identity in pg_stat_activity for monitoring */
     {
         char appname[NAMEDATALEN];
-        snprintf(appname, sizeof(appname), "ulak db-worker %d/%d [%s]",
-                 worker_id + 1, total_workers, worker_dbname);
+        snprintf(appname, sizeof(appname), "ulak db-worker %d/%d [%s]", worker_id + 1,
+                 total_workers, worker_dbname);
         pgstat_report_appname(appname);
     }
 

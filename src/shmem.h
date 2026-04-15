@@ -32,8 +32,8 @@
 #define RL_SHMEM_MAX_ENDPOINTS 256
 
 /* Shared memory integrity constants */
-#define ULAK_SHMEM_MAGIC 0x554C414B   /* "ULAK" in ASCII */
-#define ULAK_SHMEM_VERSION 2          /* Bumped: added worker_latches[] to UlakDatabaseEntry */
+#define ULAK_SHMEM_MAGIC 0x554C414B /* "ULAK" in ASCII */
+#define ULAK_SHMEM_VERSION 2        /* Bumped: added worker_latches[] to UlakDatabaseEntry */
 
 /**
  * @brief Shared memory token bucket for per-endpoint rate limiting.
@@ -66,7 +66,7 @@ typedef struct UlakDatabaseEntry {
     uint32 generation[ULAK_MAX_WORKERS]; /* Generation counter per slot (ABA protection) */
     TimestampTz registered_at;           /* When database was registered */
     TimestampTz worker_started_at[ULAK_MAX_WORKERS]; /* When each worker started */
-    Latch *worker_latches[ULAK_MAX_WORKERS]; /* Latch pointers for SetLatch wake */
+    Latch *worker_latches[ULAK_MAX_WORKERS];         /* Latch pointers for SetLatch wake */
 
     /* Worker metrics and error tracking (protected by metrics_mutex) */
     slock_t metrics_mutex; /* Spinlock for hot counter updates */

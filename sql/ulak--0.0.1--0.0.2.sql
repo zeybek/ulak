@@ -1,3 +1,0 @@
--- ulak extension upgrade script: 0.0.1 -> 0.0.2
--- No SQL schema changes between these versions.
--- Changes were limited to CI/CD, packaging, and documentation.

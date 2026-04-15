@@ -877,8 +877,7 @@ bool ulak_shmem_validate(void) {
         return false;
 
     if (ulak_shmem->magic != ULAK_SHMEM_MAGIC) {
-        elog(WARNING,
-             "[ulak] Shared memory magic mismatch: expected 0x%08X, found 0x%08X",
+        elog(WARNING, "[ulak] Shared memory magic mismatch: expected 0x%08X, found 0x%08X",
              ULAK_SHMEM_MAGIC, ulak_shmem->magic);
         return false;
     }
