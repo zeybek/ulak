@@ -12,7 +12,7 @@ SELECT pg_reload_conf();
 
 -- Verify extension is installed
 SELECT extname, extversion IS NOT NULL AS has_version FROM pg_extension WHERE extname = 'ulak';
- extname | has_version
+ extname | has_version 
 ---------+-------------
  ulak    | t
 (1 row)
