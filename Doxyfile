@@ -5,7 +5,7 @@
 # Project
 #---------------------------------------------------------------------------
 PROJECT_NAME           = "ulak"
-PROJECT_NUMBER         = 0.0.1 # x-release-please-version
+PROJECT_NUMBER         = 0.0.2 # x-release-please-version
 PROJECT_BRIEF          = "PostgreSQL Transactional Outbox Extension"
 PROJECT_LOGO           =
 

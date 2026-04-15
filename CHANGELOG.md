@@ -5,6 +5,13 @@ All notable changes to ulak will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.2](https://github.com/zeybek/ulak/compare/v0.0.1...v0.0.2) (2026-04-15)
+
+
+### Bug Fixes
+
+* add manual trigger to Docker publish workflow ([dfa5fa8](https://github.com/zeybek/ulak/commit/dfa5fa824f6e4ecd7951a47ac4d1946980508dd0))
+
 ## 0.0.1 (2026-04-15)
 
 
