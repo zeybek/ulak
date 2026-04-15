@@ -1,0 +1,48 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "initial-version": "0.0.1",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": false,
+      "extra-files": [
+        "version.txt",
+        {
+          "type": "generic",
+          "path": "ulak.control",
+          "glob": false
+        },
+        {
+          "type": "json",
+          "path": "META.json",
+          "glob": false,
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "META.json",
+          "glob": false,
+          "jsonpath": "$.provides.ulak.version"
+        },
+        {
+          "type": "generic",
+          "path": "include/ulak.h",
+          "glob": false
+        },
+        {
+          "type": "generic",
+          "path": "Doxyfile",
+          "glob": false
+        },
+        {
+          "type": "generic",
+          "path": "README.md",
+          "glob": false
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,44 @@
+Parsed test spec with 2 sessions
+
+starting permutation: w1_mark_processing w2_fetch_with_ordering w1_commit w2_commit
+step w1_mark_processing: 
+    UPDATE ulak.queue
+    SET status = 'processing'
+    WHERE id = (
+        SELECT id FROM ulak.queue
+        WHERE ordering_key = 'order-A' AND status = 'pending'
+        ORDER BY id LIMIT 1
+    )
+    RETURNING payload::text, ordering_key;
+
+payload      |ordering_key
+-------------+------------
+{"key": "A1"}|order-A     
+(1 row)
+
+step w2_fetch_with_ordering: 
+    WITH blocked_keys AS (
+        SELECT DISTINCT ordering_key FROM ulak.queue
+        WHERE ordering_key IS NOT NULL AND status = 'processing'
+    )
+    SELECT payload::text, ordering_key
+    FROM ulak.queue q
+    WHERE q.status = 'pending'
+      AND (q.ordering_key IS NULL
+           OR (q.ordering_key NOT IN (SELECT ordering_key FROM blocked_keys)
+               AND NOT EXISTS (
+                   SELECT 1 FROM ulak.queue q2
+                   WHERE q2.ordering_key = q.ordering_key
+                     AND q2.status = 'pending'
+                     AND q2.id < q.id)))
+    ORDER BY q.id
+    FOR UPDATE SKIP LOCKED;
+
+payload        |ordering_key
+---------------+------------
+{"key": "B1"}  |order-B     
+{"key": "free"}|            
+(2 rows)
+
+step w1_commit: COMMIT;
+step w2_commit: COMMIT;

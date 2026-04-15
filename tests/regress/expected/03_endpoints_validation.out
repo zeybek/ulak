@@ -1,0 +1,116 @@
+-- 03_endpoints_validation.sql: Validation — invalid protocol, validate_endpoint_config
+-- pg_regress test for ulak
+-- ============================================================================
+-- INVALID PROTOCOL
+-- ============================================================================
+-- Attempt to insert an endpoint with invalid protocol directly (should fail CHECK constraint)
+-- Wrap in DO block to avoid non-deterministic DETAIL in output
+DO $$
+BEGIN
+    INSERT INTO ulak.endpoints (name, protocol, config)
+    VALUES ('bad_proto', 'ftp', '{"host":"localhost"}'::jsonb);
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'CHECK constraint violation: %', SQLERRM;
+END
+$$;
+NOTICE:  CHECK constraint violation: new row for relation "endpoints" violates check constraint "endpoints_protocol_check"
+-- ============================================================================
+-- DUPLICATE NAME
+-- ============================================================================
+-- Create a valid endpoint
+SELECT ulak.create_endpoint(
+    'validation_test',
+    'http',
+    '{"url": "http://example.com/hook", "method": "POST"}'::jsonb
+) IS NOT NULL AS created;
+INFO:  [ulak] Created endpoint with ID 5
+ created 
+---------
+ t
+(1 row)
+
+-- Attempt to create endpoint with same name (should fail unique constraint)
+DO $$
+BEGIN
+    INSERT INTO ulak.endpoints (name, protocol, config)
+    VALUES ('validation_test', 'http', '{"url": "http://other.com"}'::jsonb);
+EXCEPTION WHEN unique_violation THEN
+    RAISE NOTICE 'UNIQUE constraint violation: %', SQLERRM;
+END
+$$;
+NOTICE:  UNIQUE constraint violation: duplicate key value violates unique constraint "endpoints_name_key"
+-- ============================================================================
+-- VALIDATE ENDPOINT CONFIG
+-- ============================================================================
+-- Valid HTTP config
+SELECT ulak.validate_endpoint_config(
+    'http',
+    '{"url": "http://example.com", "method": "POST"}'::jsonb
+) AS valid_http;
+ valid_http 
+------------
+ t
+(1 row)
+
+-- validate_endpoint_config is STRICT — NULL args return NULL (no error)
+SELECT ulak.validate_endpoint_config(NULL, NULL) IS NULL AS null_returns_null;
+ null_returns_null 
+-------------------
+ t
+(1 row)
+
+-- ============================================================================
+-- AUTO_DISABLE_ON_GONE CONFIG VALIDATION
+-- ============================================================================
+-- Valid: auto_disable_on_gone as boolean true
+SELECT ulak.validate_endpoint_config(
+    'http',
+    '{"url": "http://example.com", "auto_disable_on_gone": true}'::jsonb
+) AS valid_auto_disable;
+ valid_auto_disable 
+--------------------
+ t
+(1 row)
+
+-- Valid: auto_disable_on_gone as boolean false
+SELECT ulak.validate_endpoint_config(
+    'http',
+    '{"url": "http://example.com", "auto_disable_on_gone": false}'::jsonb
+) AS valid_auto_disable_false;
+ valid_auto_disable_false 
+--------------------------
+ t
+(1 row)
+
+-- Invalid: auto_disable_on_gone as string (must be boolean)
+SELECT ulak.validate_endpoint_config(
+    'http',
+    '{"url": "http://example.com", "auto_disable_on_gone": "yes"}'::jsonb
+) AS invalid_auto_disable_string;
+WARNING:  [ulak] ERROR: HTTP config auto_disable_on_gone must be a boolean
+ invalid_auto_disable_string 
+-----------------------------
+ f
+(1 row)
+
+-- ============================================================================
+-- ENABLE/DISABLE NONEXISTENT ENDPOINT
+-- ============================================================================
+-- enable_endpoint on nonexistent name should raise error
+SELECT ulak.enable_endpoint('does_not_exist');
+ERROR:  Endpoint 'does_not_exist' does not exist
+CONTEXT:  PL/pgSQL function ulak.enable_endpoint(text) line 10 at RAISE
+-- disable_endpoint on nonexistent name should raise error
+SELECT ulak.disable_endpoint('does_not_exist');
+ERROR:  Endpoint 'does_not_exist' does not exist
+CONTEXT:  PL/pgSQL function ulak.disable_endpoint(text) line 10 at RAISE
+-- ============================================================================
+-- CLEANUP
+-- ============================================================================
+SELECT ulak.drop_endpoint('validation_test');
+INFO:  [ulak] Dropped endpoint 'validation_test'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+

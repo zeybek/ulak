@@ -1,0 +1,118 @@
+-- 04_queue_operations.sql: Queue operations — send() inserts, status defaults, queue state
+-- pg_regress test for ulak
+-- ============================================================================
+-- SEND MESSAGE
+-- ============================================================================
+-- send() should insert a message into the queue
+SELECT ulak.send('test_http_endpoint', '{"event": "user.created", "id": 1}'::jsonb);
+ send 
+------
+ t
+(1 row)
+
+-- Verify message was enqueued with correct defaults
+SELECT
+    endpoint_id IS NOT NULL AS has_endpoint_id,
+    payload::text AS payload,
+    status,
+    retry_count,
+    priority
+FROM ulak.queue
+WHERE payload @> '{"event": "user.created"}'::jsonb
+LIMIT 1;
+ has_endpoint_id |              payload               | status  | retry_count | priority 
+-----------------+------------------------------------+---------+-------------+----------
+ t               | {"id": 1, "event": "user.created"} | pending |           0 |        0
+(1 row)
+
+-- ============================================================================
+-- SEND MULTIPLE MESSAGES
+-- ============================================================================
+-- Send a second message
+SELECT ulak.send('test_http_endpoint', '{"event": "user.updated", "id": 2}'::jsonb);
+ send 
+------
+ t
+(1 row)
+
+-- Verify queue count
+SELECT count(*) AS queue_count
+FROM ulak.queue
+WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'test_http_endpoint');
+ queue_count 
+-------------
+           2
+(1 row)
+
+-- ============================================================================
+-- SEND WITH NULL ARGS (STRICT function returns NULL)
+-- ============================================================================
+-- send() is STRICT: NULL args return NULL, no error, no queue insert
+SELECT ulak.send(NULL, '{"test": true}'::jsonb) IS NULL AS null_endpoint_returns_null;
+ null_endpoint_returns_null 
+----------------------------
+ t
+(1 row)
+
+SELECT ulak.send('test_http_endpoint', NULL) IS NULL AS null_payload_returns_null;
+ null_payload_returns_null 
+---------------------------
+ t
+(1 row)
+
+-- ============================================================================
+-- DISABLED ENDPOINT REJECTION
+-- ============================================================================
+SELECT ulak.disable_endpoint('test_http_endpoint');
+ disable_endpoint 
+------------------
+ t
+(1 row)
+
+DO $$
+BEGIN
+    PERFORM ulak.send('test_http_endpoint', '{"event": "disabled"}'::jsonb);
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'send disabled endpoint: rejected';
+END $$;
+NOTICE:  send disabled endpoint: rejected
+SELECT count(*) AS disabled_send_queue_count
+FROM ulak.queue
+WHERE payload @> '{"event": "disabled"}'::jsonb;
+ disabled_send_queue_count 
+---------------------------
+                         0
+(1 row)
+
+SELECT ulak.enable_endpoint('test_http_endpoint');
+ enable_endpoint 
+-----------------
+ t
+(1 row)
+
+-- ============================================================================
+-- QUEUE STATE VERIFICATION
+-- ============================================================================
+-- All messages should default to 'pending' status
+SELECT DISTINCT status FROM ulak.queue;
+ status  
+---------
+ pending
+(1 row)
+
+-- All messages should have retry_count = 0
+SELECT count(*) = count(*) FILTER (WHERE retry_count = 0) AS all_zero_retries
+FROM ulak.queue;
+ all_zero_retries 
+------------------
+ t
+(1 row)
+
+-- All messages should have next_retry_at set
+SELECT count(*) = count(*) FILTER (WHERE next_retry_at IS NOT NULL) AS all_have_retry_at
+FROM ulak.queue;
+ all_have_retry_at 
+-------------------
+ t
+(1 row)
+

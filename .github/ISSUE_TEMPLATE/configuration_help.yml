@@ -1,0 +1,46 @@
+name: Configuration Help
+description: Ask for help with setup, configuration, or operational behavior.
+title: "[Help]: "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form when behavior is unclear but you do not yet have a confirmed bug.
+  - type: input
+    id: pg_version
+    attributes:
+      label: PostgreSQL version
+      placeholder: "18"
+    validations:
+      required: true
+  - type: input
+    id: extension_version
+    attributes:
+      label: ulak version
+      placeholder: "0.0.1 or commit SHA"
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: Include GUCs, SQL config, and enabled protocols.
+      placeholder: |
+        shared_preload_libraries = 'ulak'
+        ulak.workers = 4
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: Describe the setup problem or operational uncertainty.
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you already tried
+      description: Include commands, docs read, and observed results.

@@ -1,0 +1,99 @@
+# Doxyfile - ulak API Documentation
+# Generate with: make docs
+
+#---------------------------------------------------------------------------
+# Project
+#---------------------------------------------------------------------------
+PROJECT_NAME           = "ulak"
+PROJECT_NUMBER         = 0.0.0 # x-release-please-version
+PROJECT_BRIEF          = "PostgreSQL Transactional Outbox Extension"
+PROJECT_LOGO           =
+
+#---------------------------------------------------------------------------
+# Input
+#---------------------------------------------------------------------------
+INPUT                  = include/ src/ sql/ README.md
+FILE_PATTERNS          = *.c *.h *.md *.sql
+RECURSIVE              = YES
+EXCLUDE                =
+EXCLUDE_PATTERNS       = */test/* */tests/* */t/* */.git/*
+USE_MDFILE_AS_MAINPAGE = README.md
+
+#---------------------------------------------------------------------------
+# Extraction
+#---------------------------------------------------------------------------
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = YES
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = YES
+EXTRACT_ANON_NSPACES   = NO
+
+#---------------------------------------------------------------------------
+# Build
+#---------------------------------------------------------------------------
+OPTIMIZE_OUTPUT_FOR_C  = YES
+TYPEDEF_HIDES_STRUCT   = YES
+SORT_MEMBER_DOCS       = YES
+SORT_BRIEF_DOCS        = YES
+
+#---------------------------------------------------------------------------
+# Preprocessing
+#---------------------------------------------------------------------------
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = "PGDLLEXPORT=" \
+                         "PG_FUNCTION_ARGS=FunctionCallInfo fcinfo" \
+                         "PG_MODULE_MAGIC=" \
+                         "PG_MODULE_MAGIC_EXT(...)=" \
+                         "Datum=uintptr_t" \
+                         "ENABLE_KAFKA" \
+                         "ENABLE_MQTT" \
+                         "ENABLE_REDIS" \
+                         "ENABLE_AMQP" \
+                         "ENABLE_NATS"
+
+#---------------------------------------------------------------------------
+# Warnings
+#---------------------------------------------------------------------------
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = NO
+
+#---------------------------------------------------------------------------
+# Output
+#---------------------------------------------------------------------------
+OUTPUT_DIRECTORY       = docs
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+HTML_COLORSTYLE        = LIGHT
+# HTML_TIMESTAMP removed (obsolete in Doxygen 1.9.8+)
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+FULL_SIDEBAR           = NO
+GENERATE_LATEX         = NO
+GENERATE_MAN           = NO
+GENERATE_XML           = NO
+
+#---------------------------------------------------------------------------
+# Diagrams
+#---------------------------------------------------------------------------
+# Set HAVE_DOT = YES if Graphviz is installed for call/include graphs
+HAVE_DOT               = NO
+COLLABORATION_GRAPH    = NO
+INCLUDE_GRAPH          = YES
+INCLUDED_BY_GRAPH      = YES
+CALL_GRAPH             = NO
+CALLER_GRAPH           = NO
+
+#---------------------------------------------------------------------------
+# Source browsing
+#---------------------------------------------------------------------------
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+STRIP_CODE_COMMENTS    = YES
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+VERBATIM_HEADERS       = YES

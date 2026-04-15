@@ -1,0 +1,47 @@
+name: Feature Request
+description: Propose a new capability or meaningful improvement.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for new features, protocol support improvements, developer tooling, or operational enhancements.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What problem are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the desired behavior or API.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe workarounds or other options you evaluated.
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact area
+      options:
+        - Core ulak behavior
+        - Worker/runtime behavior
+        - Protocol dispatchers
+        - Security/authentication
+        - Testing/tooling
+        - Documentation/operations
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Include examples, links, prior art, or compatibility constraints.

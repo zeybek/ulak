@@ -1,0 +1,46 @@
+-- 00_setup.sql: Extension creation and test fixture setup
+-- pg_regress test for ulak
+
+-- Create the extension at the default version
+CREATE EXTENSION ulak;
+
+-- Allow internal URLs for testing (SSRF protection blocks localhost by default)
+ALTER SYSTEM SET ulak.http_allow_internal_urls = true;
+SELECT pg_reload_conf();
+
+-- Verify extension is installed
+SELECT extname, extversion IS NOT NULL AS has_version FROM pg_extension WHERE extname = 'ulak';
+
+-- Verify schema exists
+SELECT nspname FROM pg_namespace WHERE nspname = 'ulak';
+
+-- Create test roles for RBAC testing (grant them to current user so SET ROLE works)
+-- Use exception handling to suppress "already a member" NOTICE (non-deterministic)
+DO $$
+BEGIN
+    BEGIN
+        EXECUTE format('GRANT ulak_admin TO %I', current_user);
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END;
+    BEGIN
+        EXECUTE format('GRANT ulak_application TO %I', current_user);
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END;
+    BEGIN
+        EXECUTE format('GRANT ulak_monitor TO %I', current_user);
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END;
+END
+$$;
+
+-- Create a test endpoint for use by subsequent test files
+SELECT ulak.create_endpoint(
+    'test_http_endpoint',
+    'http',
+    '{"url": "http://localhost:9999/webhook", "method": "POST"}'::jsonb
+);
+
+-- Verify endpoint was created
+SELECT EXISTS(
+    SELECT 1 FROM ulak.endpoints WHERE name = 'test_http_endpoint'
+) AS endpoint_exists;

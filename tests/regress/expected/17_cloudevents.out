@@ -1,0 +1,193 @@
+-- 17_cloudevents.sql: CloudEvents endpoint configuration validation
+-- ============================================================================
+-- BINARY MODE
+-- ============================================================================
+SELECT ulak.create_endpoint('ce_binary', 'http', '{
+    "url": "http://localhost:9999/ce-bin",
+    "cloudevents": true,
+    "cloudevents_mode": "binary"
+}'::jsonb) IS NOT NULL AS binary_ok;
+INFO:  [ulak] Created endpoint with ID 37
+ binary_ok 
+-----------
+ t
+(1 row)
+
+SELECT config->>'cloudevents' AS ce, config->>'cloudevents_mode' AS mode
+FROM ulak.endpoints WHERE name = 'ce_binary';
+  ce  |  mode  
+------+--------
+ true | binary
+(1 row)
+
+-- ============================================================================
+-- STRUCTURED MODE
+-- ============================================================================
+SELECT ulak.create_endpoint('ce_structured', 'http', '{
+    "url": "http://localhost:9999/ce-struct",
+    "cloudevents": true,
+    "cloudevents_mode": "structured"
+}'::jsonb) IS NOT NULL AS structured_ok;
+INFO:  [ulak] Created endpoint with ID 38
+ structured_ok 
+---------------
+ t
+(1 row)
+
+-- ============================================================================
+-- CUSTOM TYPE
+-- ============================================================================
+SELECT ulak.create_endpoint('ce_typed', 'http', '{
+    "url": "http://localhost:9999/ce-typed",
+    "cloudevents": true,
+    "cloudevents_mode": "binary",
+    "cloudevents_type": "com.myapp.order.created"
+}'::jsonb) IS NOT NULL AS typed_ok;
+INFO:  [ulak] Created endpoint with ID 39
+ typed_ok 
+----------
+ t
+(1 row)
+
+SELECT config->>'cloudevents_type' AS ce_type
+FROM ulak.endpoints WHERE name = 'ce_typed';
+         ce_type         
+-------------------------
+ com.myapp.order.created
+(1 row)
+
+-- ============================================================================
+-- CLOUDEVENTS DISABLED
+-- ============================================================================
+SELECT ulak.create_endpoint('ce_disabled', 'http', '{
+    "url": "http://localhost:9999/ce-off",
+    "cloudevents": false
+}'::jsonb) IS NOT NULL AS disabled_ok;
+INFO:  [ulak] Created endpoint with ID 40
+ disabled_ok 
+-------------
+ t
+(1 row)
+
+-- ============================================================================
+-- COMBINED: CE + SIGNING
+-- ============================================================================
+SELECT ulak.create_endpoint('ce_sign', 'http', '{
+    "url": "http://localhost:9999/ce-sign",
+    "cloudevents": true,
+    "cloudevents_mode": "structured",
+    "signing_secret": "whsec_test"
+}'::jsonb) IS NOT NULL AS ce_signing_ok;
+INFO:  [ulak] Created endpoint with ID 41
+ ce_signing_ok 
+---------------
+ t
+(1 row)
+
+-- ============================================================================
+-- COMBINED: CE + AUTH
+-- ============================================================================
+SELECT ulak.create_endpoint('ce_auth', 'http', '{
+    "url": "http://localhost:9999/ce-auth",
+    "cloudevents": true,
+    "cloudevents_mode": "binary",
+    "auth": {"type": "bearer", "token": "ce-token-123"}
+}'::jsonb) IS NOT NULL AS ce_auth_ok;
+INFO:  [ulak] Created endpoint with ID 42
+ ce_auth_ok 
+------------
+ t
+(1 row)
+
+-- ============================================================================
+-- COMBINED: CE + SIGNING + AUTH (all three)
+-- ============================================================================
+SELECT ulak.create_endpoint('ce_all', 'http', '{
+    "url": "http://localhost:9999/ce-all",
+    "cloudevents": true,
+    "cloudevents_mode": "binary",
+    "cloudevents_type": "com.myapp.event",
+    "signing_secret": "whsec_all",
+    "auth": {"type": "basic", "username": "user", "password": "pass"}
+}'::jsonb) IS NOT NULL AS ce_all_ok;
+INFO:  [ulak] Created endpoint with ID 43
+ ce_all_ok 
+-----------
+ t
+(1 row)
+
+-- ============================================================================
+-- VALIDATE
+-- ============================================================================
+SELECT ulak.validate_endpoint_config('http', '{
+    "url": "http://localhost:9999/v",
+    "cloudevents": true,
+    "cloudevents_mode": "binary"
+}'::jsonb) AS validate_binary;
+ validate_binary 
+-----------------
+ t
+(1 row)
+
+SELECT ulak.validate_endpoint_config('http', '{
+    "url": "http://localhost:9999/v",
+    "cloudevents": true,
+    "cloudevents_mode": "structured"
+}'::jsonb) AS validate_structured;
+ validate_structured 
+---------------------
+ t
+(1 row)
+
+-- ============================================================================
+-- CLEANUP
+-- ============================================================================
+SELECT ulak.drop_endpoint('ce_binary');
+INFO:  [ulak] Dropped endpoint 'ce_binary'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT ulak.drop_endpoint('ce_structured');
+INFO:  [ulak] Dropped endpoint 'ce_structured'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT ulak.drop_endpoint('ce_typed');
+INFO:  [ulak] Dropped endpoint 'ce_typed'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT ulak.drop_endpoint('ce_disabled');
+INFO:  [ulak] Dropped endpoint 'ce_disabled'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT ulak.drop_endpoint('ce_sign');
+INFO:  [ulak] Dropped endpoint 'ce_sign'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT ulak.drop_endpoint('ce_auth');
+INFO:  [ulak] Dropped endpoint 'ce_auth'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT ulak.drop_endpoint('ce_all');
+INFO:  [ulak] Dropped endpoint 'ce_all'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+

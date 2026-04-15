@@ -1,0 +1,22 @@
+CompileFlags:
+  Add:
+    - "-I/usr/include/postgresql/18/server"
+    - "-I/usr/include/postgresql/internal"
+    - "-D_GNU_SOURCE"
+    - "-DENABLE_KAFKA=1"
+    - "-DENABLE_MQTT=1"
+    - "-DENABLE_REDIS=1"
+    - "-DENABLE_AMQP=1"
+  Remove:
+    - "-W*"
+
+Diagnostics:
+  UnusedIncludes: None
+  ClangTidy:
+    Remove:
+      - bugprone-reserved-identifier
+      - cert-dcl37-c
+      - cert-dcl51-cpp
+
+Index:
+  Background: Build

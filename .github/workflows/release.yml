@@ -1,0 +1,84 @@
+name: Release Package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Build Release Archive
+    runs-on: ubuntu-latest
+    outputs:
+      archive: ${{ steps.archive.outputs.path }}
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches version.txt
+        run: |
+          VERSION="$(cat version.txt)"
+          if [ "$VERSION" != "${{ steps.version.outputs.value }}" ]; then
+            echo "Tag version (${{ steps.version.outputs.value }}) does not match version.txt ($VERSION)" >&2
+            exit 1
+          fi
+
+      - name: Build and validate release archive
+        run: make release-check
+
+      - name: Set archive path
+        id: archive
+        run: echo "path=dist/ulak-${{ steps.version.outputs.value }}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgxn-release-archive
+          path: ${{ steps.archive.outputs.path }}
+
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.archive.outputs.path }}
+          generate_release_notes: true
+
+  pgxn-publish:
+    name: Publish to PGXN
+    needs: package
+    runs-on: ubuntu-latest
+    container: pgxn/pgxn-tools
+    env:
+      PGXN_USERNAME: ${{ secrets.PGXN_USERNAME }}
+      PGXN_PASSWORD: ${{ secrets.PGXN_PASSWORD }}
+    steps:
+      - name: Check credentials
+        run: |
+          if [ -z "$PGXN_USERNAME" ] || [ -z "$PGXN_PASSWORD" ]; then
+            echo "::warning::PGXN credentials not configured, skipping publish"
+            exit 0
+          fi
+
+      - name: Check out the repo
+        if: env.PGXN_USERNAME != ''
+        uses: actions/checkout@v4
+
+      - name: Download release archive
+        if: env.PGXN_USERNAME != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: pgxn-release-archive
+          path: dist
+
+      - name: Publish archive on PGXN
+        if: env.PGXN_USERNAME != ''
+        run: pgxn-release "dist/ulak-${{ needs.package.outputs.version }}.zip"

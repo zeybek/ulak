@@ -1,0 +1,20 @@
+// cppcheck suppression list for ulak PostgreSQL extension
+//
+// PostgreSQL extensions use macros and system headers that cppcheck
+// cannot resolve without the full PG server header tree.
+
+// PostgreSQL system headers (postgres.h, fmgr.h, etc.) are not available
+// to cppcheck outside of a PG build environment.
+missingIncludeSystem
+
+// PG_MODULE_MAGIC macro expands to an exported function that cppcheck
+// sees as unused. It is required for every PostgreSQL extension.
+unusedFunction:src/ulak.c
+
+// PG18+ PG_MODULE_MAGIC_EXT uses designated initializer syntax inside a macro
+// expansion that cppcheck cannot parse correctly.
+syntaxError:src/ulak.c
+
+// PG_FUNCTION_INFO_V1 macro creates extern Pg_finfo_* functions that
+// appear unused to cppcheck but are resolved by the PG extension loader.
+unusedFunction

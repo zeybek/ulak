@@ -1,0 +1,77 @@
+Parsed test spec with 2 sessions
+
+starting permutation: w0_fetch w1_fetch w0_commit w1_commit
+step w0_fetch: 
+    SELECT (q.id % 2) AS partition, payload::text
+    FROM ulak.queue q
+    WHERE q.status = 'pending'
+      AND (q.id % 2) = 0
+    ORDER BY q.id
+    LIMIT 4
+    FOR UPDATE SKIP LOCKED;
+
+partition|payload   
+---------+----------
+        0|{"seq": 2}
+        0|{"seq": 4}
+        0|{"seq": 6}
+        0|{"seq": 8}
+(4 rows)
+
+step w1_fetch: 
+    SELECT (q.id % 2) AS partition, payload::text
+    FROM ulak.queue q
+    WHERE q.status = 'pending'
+      AND (q.id % 2) = 1
+    ORDER BY q.id
+    LIMIT 4
+    FOR UPDATE SKIP LOCKED;
+
+partition|payload   
+---------+----------
+        1|{"seq": 1}
+        1|{"seq": 3}
+        1|{"seq": 5}
+        1|{"seq": 7}
+(4 rows)
+
+step w0_commit: COMMIT;
+step w1_commit: COMMIT;
+
+starting permutation: w1_fetch w0_fetch w1_commit w0_commit
+step w1_fetch: 
+    SELECT (q.id % 2) AS partition, payload::text
+    FROM ulak.queue q
+    WHERE q.status = 'pending'
+      AND (q.id % 2) = 1
+    ORDER BY q.id
+    LIMIT 4
+    FOR UPDATE SKIP LOCKED;
+
+partition|payload   
+---------+----------
+        1|{"seq": 1}
+        1|{"seq": 3}
+        1|{"seq": 5}
+        1|{"seq": 7}
+(4 rows)
+
+step w0_fetch: 
+    SELECT (q.id % 2) AS partition, payload::text
+    FROM ulak.queue q
+    WHERE q.status = 'pending'
+      AND (q.id % 2) = 0
+    ORDER BY q.id
+    LIMIT 4
+    FOR UPDATE SKIP LOCKED;
+
+partition|payload   
+---------+----------
+        0|{"seq": 2}
+        0|{"seq": 4}
+        0|{"seq": 6}
+        0|{"seq": 8}
+(4 rows)
+
+step w1_commit: COMMIT;
+step w0_commit: COMMIT;

@@ -1,0 +1,62 @@
+{
+  "name": "ulak",
+  "abstract": "Transactional Outbox extension for PostgreSQL with reliable asynchronous delivery",
+  "description": "ulak is a PostgreSQL extension implementing the Transactional Outbox pattern inside the database. Messages are committed atomically with business transactions and delivered asynchronously by background workers to HTTP, Kafka, MQTT, Redis Streams, AMQP, and NATS endpoints.",
+  "version": "0.0.0",
+  "maintainer": [
+    "Ahmet Zeybek <me@zeybek.dev>"
+  ],
+  "license": "Apache-2.0",
+  "release_status": "testing",
+  "provides": {
+    "ulak": {
+      "abstract": "Transactional Outbox Pattern for PostgreSQL",
+      "file": "sql/ulak--0.0.0.sql",
+      "docfile": "README.md",
+      "version": "0.0.0"
+    }
+  },
+  "prereqs": {
+    "runtime": {
+      "requires": {
+        "PostgreSQL": "14.0.0"
+      }
+    }
+  },
+  "resources": {
+    "homepage": "https://github.com/zeybek/ulak",
+    "bugtracker": {
+      "web": "https://github.com/zeybek/ulak/issues"
+    },
+    "repository": {
+      "url": "https://github.com/zeybek/ulak.git",
+      "web": "https://github.com/zeybek/ulak",
+      "type": "git"
+    }
+  },
+  "no_index": {
+    "directory": [
+      ".github"
+    ]
+  },
+  "generated_by": "hand",
+  "meta-spec": {
+    "version": "1.0.0",
+    "url": "https://pgxn.org/meta/spec.txt"
+  },
+  "tags": [
+    "ulak",
+    "transactional outbox",
+    "message queue",
+    "event driven",
+    "background worker",
+    "http",
+    "kafka",
+    "mqtt",
+    "redis",
+    "amqp",
+    "circuit breaker",
+    "dead letter queue",
+    "pub/sub"
+  ]
+}

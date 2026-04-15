@@ -1,0 +1,26 @@
+.github/ export-ignore
+.claude/ export-ignore
+.DS_Store export-ignore
+.clang-format export-ignore
+.clang-tidy export-ignore
+.clangd export-ignore
+.cppcheck-suppressions export-ignore
+.editorconfig export-ignore
+.gitignore export-ignore
+.mcp.json export-ignore
+
+Doxyfile export-ignore
+Dockerfile export-ignore
+Dockerfile.publish export-ignore
+compile_commands.json export-ignore
+docker-compose.yml export-ignore
+lefthook.yml export-ignore
+ulak.so export-ignore
+regression.diffs export-ignore
+regression.out export-ignore
+
+docs/.DS_Store export-ignore
+docs/ export-ignore
+results/ export-ignore
+tmp_check/ export-ignore
+tmp_check_iso/ export-ignore

@@ -1,0 +1,32 @@
+Parsed test spec with 2 sessions
+
+starting permutation: w1_fetch w2_fetch w1_commit w2_commit
+step w1_fetch: 
+    SELECT payload::text
+    FROM ulak.queue
+    WHERE status = 'pending'
+      AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+    ORDER BY id
+    FOR UPDATE SKIP LOCKED;
+
+payload        
+---------------
+{"vis": "now"} 
+{"vis": "null"}
+{"vis": "past"}
+(3 rows)
+
+step w2_fetch: 
+    SELECT payload::text
+    FROM ulak.queue
+    WHERE status = 'pending'
+      AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+    ORDER BY id
+    FOR UPDATE SKIP LOCKED;
+
+payload
+-------
+(0 rows)
+
+step w1_commit: COMMIT;
+step w2_commit: COMMIT;

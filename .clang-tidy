@@ -1,0 +1,52 @@
+# clang-tidy configuration for ulak PostgreSQL extension
+#
+# Run: make tidy
+# Requires: compile_commands.json (generate with: bear -- make)
+
+---
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  misc-redundant-expression,
+  performance-*,
+  portability-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  -bugprone-assignment-in-if-condition,
+  -bugprone-narrowing-conversions,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -cert-dcl37-c,
+  -cert-dcl51-cpp,
+  -cert-err33-c,
+  -cert-err34-c,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -clang-analyzer-deadcode.DeadStores,
+  -performance-no-int-to-ptr
+
+# ── PostgreSQL-specific suppressions ──
+# bugprone-easily-swappable-parameters: PG function signatures have many same-type params
+# bugprone-reserved-identifier: PG macros use reserved identifiers (_PG_init, etc.)
+# bugprone-narrowing-conversions: PG uses int for string lengths, strlen() returns size_t
+# bugprone-multi-level-implicit-pointer-conversion: palloc returns void*, cast to char** is standard PG
+# bugprone-implicit-widening-of-multiplication-result: int*1000 → tv_usec(long) is safe within range
+# cert-dcl37-c / cert-dcl51-cpp: PG headers use reserved identifiers extensively
+# cert-err33-c: PG snprintf/strlcpy return values intentionally unchecked in formatting code
+# cert-err34-c: sscanf for int/float parsing is standard PG config pattern
+# insecureAPI.DeprecatedOrUnsafeBufferHandling: PG uses memcpy/sprintf intentionally
+# deadcode.DeadStores: PG macros generate dead stores (PG_TRY/PG_CATCH, etc.)
+# performance-no-int-to-ptr: Datum ↔ pointer casts are fundamental to PG's type system
+
+WarningsAsErrors: >
+  bugprone-use-after-move,
+  bugprone-null-dereference,
+  clang-analyzer-core.*,
+  clang-analyzer-unix.Malloc
+
+FormatStyle: file
+
+CheckOptions:
+  - key: bugprone-sizeof-expression.WarnOnSizeOfPointerToAggregate
+    value: true

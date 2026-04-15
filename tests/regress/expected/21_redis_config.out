@@ -1,0 +1,261 @@
+-- 21_redis_config.sql: Redis Streams endpoint configuration validation
+-- pg_regress test for ulak
+-- NOTE: Only runs when built with ENABLE_REDIS=1
+-- ============================================================================
+-- VALID REDIS CONFIGS
+-- ============================================================================
+-- Minimal valid Redis config (host + stream_key required)
+SELECT ulak.create_endpoint(
+    'redis_minimal',
+    'redis',
+    '{"host": "localhost", "stream_key": "test-stream"}'::jsonb
+) IS NOT NULL AS minimal_created;
+INFO:  [ulak] Created endpoint with ID 54
+ minimal_created 
+-----------------
+ t
+(1 row)
+
+-- Redis config with all optional fields
+SELECT ulak.create_endpoint(
+    'redis_full',
+    'redis',
+    '{"host": "redis", "port": 6380, "db": 2, "stream_key": "events", "password": "secret", "connect_timeout": 10, "command_timeout": 60, "maxlen": 10000, "maxlen_approximate": true, "nomkstream": false}'::jsonb
+) IS NOT NULL AS full_created;
+INFO:  [ulak] Created endpoint with ID 55
+ full_created 
+--------------
+ t
+(1 row)
+
+-- Redis config with TLS
+SELECT ulak.create_endpoint(
+    'redis_tls',
+    'redis',
+    '{"host": "redis-tls", "stream_key": "secure-stream", "tls": true, "tls_ca_cert": "/certs/ca.pem", "tls_cert": "/certs/client.pem", "tls_key": "/certs/client-key.pem"}'::jsonb
+) IS NOT NULL AS tls_created;
+INFO:  [ulak] Created endpoint with ID 56
+ tls_created 
+-------------
+ t
+(1 row)
+
+-- Verify configs stored correctly
+SELECT name, protocol, config->>'host' AS host, config->>'stream_key' AS stream_key
+FROM ulak.endpoints
+WHERE name LIKE 'redis_%'
+ORDER BY name;
+     name      | protocol |   host    |  stream_key   
+---------------+----------+-----------+---------------
+ redis_full    | redis    | redis     | events
+ redis_minimal | redis    | localhost | test-stream
+ redis_tls     | redis    | redis-tls | secure-stream
+(3 rows)
+
+-- ============================================================================
+-- VALIDATE_ENDPOINT_CONFIG FOR REDIS
+-- ============================================================================
+-- Valid minimal config
+SELECT ulak.validate_endpoint_config(
+    'redis',
+    '{"host": "localhost", "stream_key": "test"}'::jsonb
+) AS valid_minimal;
+ valid_minimal 
+---------------
+ t
+(1 row)
+
+-- Valid with port and db
+SELECT ulak.validate_endpoint_config(
+    'redis',
+    '{"host": "redis", "port": 6379, "db": 0, "stream_key": "events"}'::jsonb
+) AS valid_with_port;
+ valid_with_port 
+-----------------
+ t
+(1 row)
+
+-- ============================================================================
+-- INVALID REDIS CONFIGS
+-- ============================================================================
+-- Missing host
+SELECT ulak.validate_endpoint_config(
+    'redis',
+    '{"stream_key": "no-host"}'::jsonb
+) AS missing_host;
+WARNING:  [ulak] ERROR: Redis config: 'host' is required and must be non-empty string
+ missing_host 
+--------------
+ f
+(1 row)
+
+-- Missing stream_key
+SELECT ulak.validate_endpoint_config(
+    'redis',
+    '{"host": "localhost"}'::jsonb
+) AS missing_stream_key;
+WARNING:  [ulak] ERROR: Redis config: 'stream_key' is required and must be non-empty string
+ missing_stream_key 
+--------------------
+ f
+(1 row)
+
+-- Empty host
+SELECT ulak.validate_endpoint_config(
+    'redis',
+    '{"host": "", "stream_key": "test"}'::jsonb
+) AS empty_host;
+WARNING:  [ulak] ERROR: Redis config: 'host' is required and must be non-empty string
+ empty_host 
+------------
+ f
+(1 row)
+
+-- Empty stream_key
+SELECT ulak.validate_endpoint_config(
+    'redis',
+    '{"host": "localhost", "stream_key": ""}'::jsonb
+) AS empty_stream_key;
+WARNING:  [ulak] ERROR: Redis config: 'stream_key' is required and must be non-empty string
+ empty_stream_key 
+------------------
+ f
+(1 row)
+
+-- Invalid port (out of range)
+SELECT ulak.validate_endpoint_config(
+    'redis',
+    '{"host": "localhost", "stream_key": "test", "port": 99999}'::jsonb
+) AS invalid_port;
+WARNING:  [ulak] ERROR: Redis config: 'port' value 99999 out of range [1-65535]
+ invalid_port 
+--------------
+ f
+(1 row)
+
+-- Invalid db (out of range 0-15)
+SELECT ulak.validate_endpoint_config(
+    'redis',
+    '{"host": "localhost", "stream_key": "test", "db": 16}'::jsonb
+) AS invalid_db;
+WARNING:  [ulak] ERROR: Redis config: 'db' value 16 out of range [0-15]
+ invalid_db 
+------------
+ f
+(1 row)
+
+-- Unknown config key
+SELECT ulak.validate_endpoint_config(
+    'redis',
+    '{"host": "localhost", "stream_key": "test", "unknown_key": "value"}'::jsonb
+) AS unknown_key;
+WARNING:  [ulak] ERROR: Redis config contains unknown key 'unknown_key'. Allowed keys: host, port, db, password, username, stream_key, connect_timeout, command_timeout, maxlen, minid, tls, tls_ca_cert, tls_cert, tls_key, nomkstream, maxlen_approximate, consumer_group
+ unknown_key 
+-------------
+ f
+(1 row)
+
+-- ============================================================================
+-- REDIS ENDPOINT CRUD OPERATIONS
+-- ============================================================================
+-- Alter endpoint config
+SELECT ulak.alter_endpoint(
+    'redis_minimal',
+    '{"host": "new-redis", "stream_key": "new-stream", "port": 6380}'::jsonb
+) AS altered;
+INFO:  [ulak] Altered endpoint 'redis_minimal'
+ altered 
+---------
+ t
+(1 row)
+
+-- Verify alter took effect
+SELECT config->>'host' AS new_host, config->>'stream_key' AS new_stream
+FROM ulak.endpoints
+WHERE name = 'redis_minimal';
+ new_host  | new_stream 
+-----------+------------
+ new-redis | new-stream
+(1 row)
+
+-- Enable/disable
+SELECT ulak.disable_endpoint('redis_minimal') AS disabled;
+ disabled 
+----------
+ t
+(1 row)
+
+SELECT enabled FROM ulak.endpoints WHERE name = 'redis_minimal';
+ enabled 
+---------
+ f
+(1 row)
+
+SELECT ulak.enable_endpoint('redis_minimal') AS enabled;
+ enabled 
+---------
+ t
+(1 row)
+
+SELECT enabled FROM ulak.endpoints WHERE name = 'redis_minimal';
+ enabled 
+---------
+ t
+(1 row)
+
+-- ============================================================================
+-- REDIS MESSAGE SEND (queue insertion)
+-- ============================================================================
+SELECT ulak.send('redis_full', '{"event": "order.created", "order_id": 42}'::jsonb) AS sent;
+ sent 
+------
+ t
+(1 row)
+
+SELECT ulak.send_with_options(
+    'redis_full',
+    '{"event": "order.updated"}'::jsonb,
+    p_priority := 5::smallint,
+    p_ordering_key := 'order-42'
+) IS NOT NULL AS sent_with_options;
+ sent_with_options 
+-------------------
+ t
+(1 row)
+
+SELECT count(*) AS redis_queue_count
+FROM ulak.queue q
+JOIN ulak.endpoints e ON q.endpoint_id = e.id
+WHERE e.protocol = 'redis';
+ redis_queue_count 
+-------------------
+                 2
+(1 row)
+
+-- ============================================================================
+-- CLEANUP
+-- ============================================================================
+DELETE FROM ulak.queue WHERE endpoint_id IN (
+    SELECT id FROM ulak.endpoints WHERE name LIKE 'redis_%'
+);
+SELECT ulak.drop_endpoint('redis_minimal');
+INFO:  [ulak] Dropped endpoint 'redis_minimal'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT ulak.drop_endpoint('redis_full');
+INFO:  [ulak] Dropped endpoint 'redis_full'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT ulak.drop_endpoint('redis_tls');
+INFO:  [ulak] Dropped endpoint 'redis_tls'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+

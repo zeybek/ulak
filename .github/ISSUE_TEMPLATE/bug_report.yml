@@ -1,0 +1,69 @@
+name: Bug Report
+description: Report a defect with enough detail to reproduce and debug it.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for reproducible defects. Include PostgreSQL version, enabled protocol flags, and exact failure details.
+  - type: input
+    id: pg_version
+    attributes:
+      label: PostgreSQL version
+      description: Which PostgreSQL version is affected?
+      placeholder: "18"
+    validations:
+      required: true
+  - type: input
+    id: extension_version
+    attributes:
+      label: ulak version
+      description: Which extension version or commit are you using?
+      placeholder: "0.0.1 or commit SHA"
+    validations:
+      required: true
+  - type: input
+    id: build_flags
+    attributes:
+      label: Enabled protocol flags
+      description: Include build flags such as ENABLE_KAFKA=1 ENABLE_REDIS=1.
+      placeholder: "ENABLE_KAFKA=1 ENABLE_REDIS=1"
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, container image, compiler, lib versions, deployment details.
+      placeholder: "Ubuntu 24.04, pgxn/pgxn-tools, PostgreSQL 18, clang 18..."
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest reliable reproduction.
+      placeholder: |
+        1. Build with ...
+        2. Run ...
+        3. Execute SQL ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include exact error text, logs, stack traces, or failing SQL output.
+    validations:
+      required: true
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Links to failing CI runs, related issues, or notes about impact.

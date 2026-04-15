@@ -1,0 +1,81 @@
+Parsed test spec with 2 sessions
+
+starting permutation: w1_fetch_and_mark w2_fetch_pending w1_commit w2_commit
+step w1_fetch_and_mark: 
+    WITH fetched AS (
+        SELECT id FROM ulak.queue
+        WHERE status = 'pending'
+        ORDER BY id LIMIT 3
+        FOR UPDATE SKIP LOCKED
+    ),
+    updated AS (
+        UPDATE ulak.queue
+        SET status = 'processing', processing_started_at = NOW()
+        WHERE id IN (SELECT id FROM fetched)
+        RETURNING payload::text, status
+    )
+    SELECT * FROM updated ORDER BY payload;
+
+payload   |status    
+----------+----------
+{"seq": 1}|processing
+{"seq": 2}|processing
+{"seq": 3}|processing
+(3 rows)
+
+step w2_fetch_pending: 
+    SELECT payload::text, status
+    FROM ulak.queue
+    WHERE status = 'pending'
+    ORDER BY id
+    FOR UPDATE SKIP LOCKED;
+
+payload   |status 
+----------+-------
+{"seq": 4}|pending
+{"seq": 5}|pending
+{"seq": 6}|pending
+(3 rows)
+
+step w1_commit: COMMIT;
+step w2_commit: COMMIT;
+
+starting permutation: w1_fetch_and_mark w2_fetch_pending w2_commit w1_commit
+step w1_fetch_and_mark: 
+    WITH fetched AS (
+        SELECT id FROM ulak.queue
+        WHERE status = 'pending'
+        ORDER BY id LIMIT 3
+        FOR UPDATE SKIP LOCKED
+    ),
+    updated AS (
+        UPDATE ulak.queue
+        SET status = 'processing', processing_started_at = NOW()
+        WHERE id IN (SELECT id FROM fetched)
+        RETURNING payload::text, status
+    )
+    SELECT * FROM updated ORDER BY payload;
+
+payload   |status    
+----------+----------
+{"seq": 1}|processing
+{"seq": 2}|processing
+{"seq": 3}|processing
+(3 rows)
+
+step w2_fetch_pending: 
+    SELECT payload::text, status
+    FROM ulak.queue
+    WHERE status = 'pending'
+    ORDER BY id
+    FOR UPDATE SKIP LOCKED;
+
+payload   |status 
+----------+-------
+{"seq": 4}|pending
+{"seq": 5}|pending
+{"seq": 6}|pending
+(3 rows)
+
+step w2_commit: COMMIT;
+step w1_commit: COMMIT;

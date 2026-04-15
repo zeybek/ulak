@@ -1,0 +1,33 @@
+Parsed test spec with 2 sessions
+
+starting permutation: w1_fetch w2_fetch w1_commit w2_commit
+step w1_fetch: 
+    SELECT payload::text, priority
+    FROM ulak.queue
+    WHERE status = 'pending'
+    ORDER BY priority DESC, created_at ASC
+    LIMIT 2
+    FOR UPDATE SKIP LOCKED;
+
+payload               |priority
+----------------------+--------
+{"seq": 5, "prio": 10}|      10
+{"seq": 3, "prio": 5} |       5
+(2 rows)
+
+step w2_fetch: 
+    SELECT payload::text, priority
+    FROM ulak.queue
+    WHERE status = 'pending'
+    ORDER BY priority DESC, created_at ASC
+    LIMIT 2
+    FOR UPDATE SKIP LOCKED;
+
+payload              |priority
+---------------------+--------
+{"seq": 4, "prio": 5}|       5
+{"seq": 1, "prio": 0}|       0
+(2 rows)
+
+step w1_commit: COMMIT;
+step w2_commit: COMMIT;

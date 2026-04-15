@@ -1,0 +1,58 @@
+ARG PG_MAJOR=18
+
+# ── Stage 1: Build ──
+FROM postgres:${PG_MAJOR} AS builder
+
+ARG PG_MAJOR=18
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    postgresql-server-dev-${PG_MAJOR} \
+    libcurl4-openssl-dev \
+    librdkafka-dev \
+    libhiredis-dev \
+    libmosquitto-dev \
+    librabbitmq-dev \
+    libnats-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . /build
+WORKDIR /build
+
+RUN make clean \
+    && make ENABLE_KAFKA=1 ENABLE_MQTT=1 ENABLE_REDIS=1 ENABLE_AMQP=1 ENABLE_NATS=1 \
+    && make ENABLE_KAFKA=1 ENABLE_MQTT=1 ENABLE_REDIS=1 ENABLE_AMQP=1 ENABLE_NATS=1 install \
+    && cp sql/ulak.sql "sql/ulak--$(cat version.txt).sql"
+
+# ── Stage 2: Runtime ──
+FROM postgres:${PG_MAJOR}
+
+ARG PG_MAJOR=18
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libcurl4 \
+    librdkafka1 \
+    libmosquitto1 \
+    librabbitmq4 \
+    libssl3t64 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy compiled extension from builder
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/ulak.so \
+     /usr/lib/postgresql/${PG_MAJOR}/lib/
+COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/ulak.control \
+     /usr/share/postgresql/${PG_MAJOR}/extension/
+COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/ulak--*.sql \
+     /usr/share/postgresql/${PG_MAJOR}/extension/
+
+# libnats and libhiredis have no stable Debian package names — copy from builder
+COPY --from=builder /usr/lib/*/libnats.so* /usr/lib/
+COPY --from=builder /usr/lib/*/libhiredis.so* /usr/lib/
+
+# Auto-load extension via shared_preload_libraries
+RUN echo "shared_preload_libraries = 'ulak'" >> /usr/share/postgresql/postgresql.conf.sample
+
+LABEL org.opencontainers.image.source="https://github.com/zeybek/ulak"
+LABEL org.opencontainers.image.description="PostgreSQL with ulak - Transactional Outbox Pattern"
+LABEL org.opencontainers.image.licenses="Apache-2.0"

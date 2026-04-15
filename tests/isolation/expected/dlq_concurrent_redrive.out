@@ -1,0 +1,43 @@
+Parsed test spec with 3 sessions
+
+starting permutation: w1_redrive w2_redrive check_queue_count check_dlq_status
+step w1_redrive: 
+    SELECT (ulak.redrive_message(
+        (SELECT id FROM ulak.dlq WHERE endpoint_name = 'iso_dlq_ep' LIMIT 1)
+    ) IS NOT NULL) AS redrove;
+
+redrove
+-------
+t      
+(1 row)
+
+step w2_redrive: 
+    SELECT (ulak.redrive_message(
+        (SELECT id FROM ulak.dlq WHERE endpoint_name = 'iso_dlq_ep' LIMIT 1)
+    ) IS NOT NULL) AS redrove;
+
+redrove
+-------
+t      
+(1 row)
+
+step check_queue_count: 
+    SELECT count(*) AS queue_messages
+    FROM ulak.queue q
+    JOIN ulak.endpoints e ON q.endpoint_id = e.id
+    WHERE e.name = 'iso_dlq_ep';
+
+queue_messages
+--------------
+             2
+(1 row)
+
+step check_dlq_status: 
+    SELECT status, payload::text
+    FROM ulak.dlq WHERE endpoint_name = 'iso_dlq_ep';
+
+status  |payload        
+--------+---------------
+redriven|{"dlq": "test"}
+(1 row)
+

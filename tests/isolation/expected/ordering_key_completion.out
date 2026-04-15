@@ -1,0 +1,35 @@
+Parsed test spec with 2 sessions
+
+starting permutation: w1_complete w2_fetch w2_commit
+step w1_complete: 
+    UPDATE ulak.queue
+    SET status = 'completed', completed_at = NOW()
+    WHERE ordering_key = 'order-X'
+      AND status = 'processing';
+
+step w2_fetch: 
+    WITH blocked_keys AS (
+        SELECT DISTINCT ordering_key FROM ulak.queue
+        WHERE ordering_key IS NOT NULL AND status = 'processing'
+    )
+    SELECT payload::text, ordering_key
+    FROM ulak.queue q
+    WHERE q.status = 'pending'
+      AND (q.ordering_key IS NULL
+           OR (q.ordering_key NOT IN (SELECT ordering_key FROM blocked_keys)
+               AND NOT EXISTS (
+                   SELECT 1 FROM ulak.queue q2
+                   WHERE q2.ordering_key = q.ordering_key
+                     AND q2.status = 'pending'
+                     AND q2.id < q.id)))
+    ORDER BY q.id
+    FOR UPDATE SKIP LOCKED;
+
+payload        |ordering_key
+---------------+------------
+{"key": "X2"}  |order-X     
+{"key": "Y1"}  |order-Y     
+{"key": "free"}|            
+(3 rows)
+
+step w2_commit: COMMIT;

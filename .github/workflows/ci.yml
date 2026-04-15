@@ -1,0 +1,129 @@
+name: Main CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MAKE_FLAGS: "ENABLE_KAFKA=1 ENABLE_MQTT=1 ENABLE_REDIS=1 ENABLE_AMQP=1 ENABLE_NATS=1"
+  # Protocol libraries needed for full build
+  PROTOCOL_DEPS: >-
+    libcurl4-openssl-dev
+    librdkafka-dev
+    libhiredis-dev
+    libmosquitto-dev
+    librabbitmq-dev
+    libnats-dev
+    libssl-dev
+
+jobs:
+  # ── Regression + isolation tests across PG 14-18 ──
+  regress:
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [18, 17, 16, 15, 14]
+    name: PG ${{ matrix.pg }} — Regress
+    uses: ./.github/workflows/_reusable-regression.yml
+    with:
+      pg-version: ${{ matrix.pg }}
+      make-flags: ENABLE_KAFKA=1 ENABLE_MQTT=1 ENABLE_REDIS=1 ENABLE_AMQP=1 ENABLE_NATS=1
+      protocol-deps: >-
+        libcurl4-openssl-dev
+        librdkafka-dev
+        libhiredis-dev
+        libmosquitto-dev
+        librabbitmq-dev
+        libnats-dev
+        libssl-dev
+
+  # ── TAP lifecycle tests across PG 14-18 ──
+  tap:
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [18, 17, 16, 15, 14]
+    name: PG ${{ matrix.pg }} — TAP
+    uses: ./.github/workflows/_reusable-tap.yml
+    with:
+      pg-version: ${{ matrix.pg }}
+      make-flags: ENABLE_KAFKA=1 ENABLE_MQTT=1 ENABLE_REDIS=1 ENABLE_AMQP=1 ENABLE_NATS=1
+      protocol-deps: >-
+        libcurl4-openssl-dev
+        librdkafka-dev
+        libhiredis-dev
+        libmosquitto-dev
+        librabbitmq-dev
+        libnats-dev
+        libssl-dev
+
+  # ── Static analysis: cppcheck + clang-format ──
+  static-analysis:
+    name: Static Analysis
+    uses: ./.github/workflows/_reusable-static-analysis.yml
+
+  # ── clang-tidy: deep AST-based analysis ──
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -i -v 18
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 22
+          sudo apt-get update
+          sudo apt-get install -y \
+            postgresql-server-dev-18 \
+            ${{ env.PROTOCOL_DEPS }} \
+            clang-tidy-22 \
+            bear
+
+      - name: Show tool versions
+        run: |
+          clang-tidy-22 --version
+          bear --version
+
+      - name: Generate compile_commands.json
+        run: bear -- make ${{ env.MAKE_FLAGS }}
+
+      - name: Run clang-tidy
+        run: |
+          find src -name "*.c" | \
+            xargs clang-tidy-22 -p . \
+              --warnings-as-errors='clang-analyzer-core.*,bugprone-null-dereference' \
+              2>&1 | tee clang-tidy-output.txt
+          echo ""
+          WARNS=$(grep -c "warning:" clang-tidy-output.txt || echo 0)
+          echo "::notice::clang-tidy: $WARNS warning(s)"
+
+      - name: Upload clang-tidy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-report
+          path: clang-tidy-output.txt
+
+  # ── AddressSanitizer + UndefinedBehaviorSanitizer ──
+  sanitizers:
+    name: ASan + UBSan
+    uses: ./.github/workflows/_reusable-sanitizers.yml
+    with:
+      make-flags: ENABLE_KAFKA=1 ENABLE_MQTT=1 ENABLE_REDIS=1 ENABLE_AMQP=1 ENABLE_NATS=1
+      protocol-deps: >-
+        libcurl4-openssl-dev
+        librdkafka-dev
+        libhiredis-dev
+        libmosquitto-dev
+        librabbitmq-dev
+        libnats-dev
+        libssl-dev

@@ -1,0 +1,265 @@
+-- 11_event_types.sql: Event types and subscriptions CRUD
+-- pg_regress test for ulak pub/sub
+-- ============================================================================
+-- EVENT TYPE: CREATE
+-- ============================================================================
+-- Create with name only
+SELECT ulak.create_event_type('order.created') IS NOT NULL AS created;
+ created 
+---------
+ t
+(1 row)
+
+-- Create with description
+SELECT ulak.create_event_type('order.shipped', 'Order was shipped') IS NOT NULL AS created;
+ created 
+---------
+ t
+(1 row)
+
+-- Create with schema
+SELECT ulak.create_event_type('payment.completed', 'Payment done', '{"type": "object"}'::jsonb) IS NOT NULL AS created;
+ created 
+---------
+ t
+(1 row)
+
+-- Verify all exist
+SELECT name, description, schema IS NOT NULL AS has_schema
+FROM ulak.event_types ORDER BY name;
+       name        |    description    | has_schema 
+-------------------+-------------------+------------
+ order.created     |                   | f
+ order.shipped     | Order was shipped | f
+ payment.completed | Payment done      | t
+(3 rows)
+
+-- ============================================================================
+-- EVENT TYPE: DUPLICATE REJECTED
+-- ============================================================================
+DO $$ BEGIN
+    PERFORM ulak.create_event_type('order.created');
+EXCEPTION WHEN unique_violation THEN
+    RAISE NOTICE 'duplicate event type rejected';
+END $$;
+NOTICE:  duplicate event type rejected
+-- ============================================================================
+-- EVENT TYPE: DROP
+-- ============================================================================
+SELECT ulak.drop_event_type('payment.completed');
+ drop_event_type 
+-----------------
+ t
+(1 row)
+
+-- Verify dropped
+SELECT name FROM ulak.event_types ORDER BY name;
+     name      
+---------------
+ order.created
+ order.shipped
+(2 rows)
+
+-- Drop non-existent raises error
+DO $$ BEGIN
+    PERFORM ulak.drop_event_type('nonexistent.event');
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'drop nonexistent rejected';
+END $$;
+NOTICE:  drop nonexistent rejected
+-- ============================================================================
+-- SUBSCRIPTION: SETUP ENDPOINTS
+-- ============================================================================
+SELECT ulak.create_endpoint('sub_ep_a', 'http',
+    '{"url": "http://localhost:9999/a"}'::jsonb) IS NOT NULL AS ep_a;
+INFO:  [ulak] Created endpoint with ID 20
+ ep_a 
+------
+ t
+(1 row)
+
+SELECT ulak.create_endpoint('sub_ep_b', 'http',
+    '{"url": "http://localhost:9999/b"}'::jsonb) IS NOT NULL AS ep_b;
+INFO:  [ulak] Created endpoint with ID 21
+ ep_b 
+------
+ t
+(1 row)
+
+SELECT ulak.create_endpoint('sub_ep_c', 'http',
+    '{"url": "http://localhost:9999/c"}'::jsonb) IS NOT NULL AS ep_c;
+INFO:  [ulak] Created endpoint with ID 22
+ ep_c 
+------
+ t
+(1 row)
+
+-- ============================================================================
+-- SUBSCRIPTION: CREATE
+-- ============================================================================
+SELECT ulak.subscribe('order.created', 'sub_ep_a') IS NOT NULL AS sub_a;
+ sub_a 
+-------
+ t
+(1 row)
+
+SELECT ulak.subscribe('order.created', 'sub_ep_b') IS NOT NULL AS sub_b;
+ sub_b 
+-------
+ t
+(1 row)
+
+SELECT ulak.subscribe('order.shipped', 'sub_ep_c') IS NOT NULL AS sub_c;
+ sub_c 
+-------
+ t
+(1 row)
+
+-- Verify subscriptions
+SELECT et.name AS event_type, e.name AS endpoint, s.enabled
+FROM ulak.subscriptions s
+JOIN ulak.event_types et ON et.id = s.event_type_id
+JOIN ulak.endpoints e ON e.id = s.endpoint_id
+ORDER BY et.name, e.name;
+  event_type   | endpoint | enabled 
+---------------+----------+---------
+ order.created | sub_ep_a | t
+ order.created | sub_ep_b | t
+ order.shipped | sub_ep_c | t
+(3 rows)
+
+-- ============================================================================
+-- SUBSCRIPTION: DUPLICATE REJECTED
+-- ============================================================================
+DO $$ BEGIN
+    PERFORM ulak.subscribe('order.created', 'sub_ep_a');
+EXCEPTION WHEN unique_violation THEN
+    RAISE NOTICE 'duplicate subscription rejected';
+END $$;
+NOTICE:  duplicate subscription rejected
+-- ============================================================================
+-- SUBSCRIPTION: INVALID REFERENCES
+-- ============================================================================
+-- Non-existent event type
+DO $$ BEGIN
+    PERFORM ulak.subscribe('nonexistent.event', 'sub_ep_a');
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'subscribe to nonexistent event type rejected';
+END $$;
+NOTICE:  subscribe to nonexistent event type rejected
+-- Non-existent endpoint
+DO $$ BEGIN
+    PERFORM ulak.subscribe('order.created', 'nonexistent_ep');
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'subscribe to nonexistent endpoint rejected';
+END $$;
+NOTICE:  subscribe to nonexistent endpoint rejected
+-- ============================================================================
+-- SUBSCRIPTION: WITH FILTER
+-- ============================================================================
+SELECT ulak.subscribe('order.created', 'sub_ep_c', '{"vip": true}'::jsonb) IS NOT NULL AS filtered_sub;
+ filtered_sub 
+--------------
+ t
+(1 row)
+
+SELECT et.name AS event_type, e.name AS endpoint, s.filter IS NOT NULL AS has_filter
+FROM ulak.subscriptions s
+JOIN ulak.event_types et ON et.id = s.event_type_id
+JOIN ulak.endpoints e ON e.id = s.endpoint_id
+ORDER BY et.name, e.name;
+  event_type   | endpoint | has_filter 
+---------------+----------+------------
+ order.created | sub_ep_a | f
+ order.created | sub_ep_b | f
+ order.created | sub_ep_c | t
+ order.shipped | sub_ep_c | f
+(4 rows)
+
+-- ============================================================================
+-- UNSUBSCRIBE
+-- ============================================================================
+-- Get the filtered subscription ID
+CREATE TEMP TABLE unsub_test AS
+SELECT s.id FROM ulak.subscriptions s
+JOIN ulak.endpoints e ON e.id = s.endpoint_id
+JOIN ulak.event_types et ON et.id = s.event_type_id
+WHERE e.name = 'sub_ep_c' AND et.name = 'order.created';
+SELECT ulak.unsubscribe((SELECT id FROM unsub_test));
+ unsubscribe 
+-------------
+ t
+(1 row)
+
+DROP TABLE unsub_test;
+-- Non-existent subscription raises error
+DO $$ BEGIN
+    PERFORM ulak.unsubscribe(999999);
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'unsubscribe nonexistent rejected';
+END $$;
+NOTICE:  unsubscribe nonexistent rejected
+-- ============================================================================
+-- CASCADE DELETE: DROP EVENT TYPE REMOVES SUBSCRIPTIONS
+-- ============================================================================
+SELECT count(*) AS subs_before FROM ulak.subscriptions;
+ subs_before 
+-------------
+           3
+(1 row)
+
+SELECT ulak.drop_event_type('order.shipped');
+ drop_event_type 
+-----------------
+ t
+(1 row)
+
+SELECT count(*) AS subs_after FROM ulak.subscriptions;
+ subs_after 
+------------
+          2
+(1 row)
+
+-- ============================================================================
+-- CASCADE DELETE: DROP ENDPOINT REMOVES SUBSCRIPTIONS
+-- ============================================================================
+-- sub_ep_a has a subscription to order.created
+SELECT count(*) AS subs_before_ep_drop FROM ulak.subscriptions;
+ subs_before_ep_drop 
+---------------------
+                   2
+(1 row)
+
+SELECT ulak.drop_endpoint('sub_ep_a');
+INFO:  [ulak] Dropped endpoint 'sub_ep_a'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT count(*) AS subs_after_ep_drop FROM ulak.subscriptions;
+ subs_after_ep_drop 
+--------------------
+                  1
+(1 row)
+
+-- ============================================================================
+-- CLEANUP
+-- ============================================================================
+DELETE FROM ulak.queue;
+DELETE FROM ulak.subscriptions;
+DELETE FROM ulak.event_types;
+SELECT ulak.drop_endpoint('sub_ep_b');
+INFO:  [ulak] Dropped endpoint 'sub_ep_b'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT ulak.drop_endpoint('sub_ep_c');
+INFO:  [ulak] Dropped endpoint 'sub_ep_c'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+

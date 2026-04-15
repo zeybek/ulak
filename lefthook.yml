@@ -1,0 +1,29 @@
+pre-commit:
+  parallel: false
+  commands:
+    clang-format:
+      glob: "{src,include}/**/*.{c,h}"
+      run: >
+        bash -lc '
+          files=$(git diff --cached --name-only --diff-filter=ACMR | grep -E "^(src|include)/.*\.(c|h)$" || true)
+          if [ -z "$files" ]; then
+            exit 0
+          fi
+          printf "%s\n" "$files" | xargs clang-format -i
+          printf "%s\n" "$files" | xargs git add --
+        '
+    cppcheck:
+      glob: "src/**/*.c"
+      run: >
+        cppcheck --error-exitcode=1
+        --enable=warning,performance,portability
+        --suppress=preprocessorErrorDirective
+        --suppressions-list=.cppcheck-suppressions
+        --std=c99
+        -I include/
+        src/
+
+commit-msg:
+  commands:
+    conventional-commit:
+      run: scripts/hooks/check-commit-msg.sh {1}

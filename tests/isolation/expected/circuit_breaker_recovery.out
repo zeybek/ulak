@@ -1,0 +1,67 @@
+Parsed test spec with 3 sessions
+
+starting permutation: w1_success w2_fail check_state
+step w1_success: 
+    SELECT ulak.update_circuit_breaker(
+        (SELECT id FROM ulak.endpoints WHERE name = 'iso_cb_recover'),
+        true
+    );
+
+update_circuit_breaker
+----------------------
+                      
+(1 row)
+
+step w2_fail: 
+    SELECT ulak.update_circuit_breaker(
+        (SELECT id FROM ulak.endpoints WHERE name = 'iso_cb_recover'),
+        false
+    );
+
+update_circuit_breaker
+----------------------
+                      
+(1 row)
+
+step check_state: 
+    SELECT circuit_state, circuit_failure_count
+    FROM ulak.endpoints WHERE name = 'iso_cb_recover';
+
+circuit_state|circuit_failure_count
+-------------+---------------------
+closed       |                    1
+(1 row)
+
+
+starting permutation: w2_fail w1_success check_state
+step w2_fail: 
+    SELECT ulak.update_circuit_breaker(
+        (SELECT id FROM ulak.endpoints WHERE name = 'iso_cb_recover'),
+        false
+    );
+
+update_circuit_breaker
+----------------------
+                      
+(1 row)
+
+step w1_success: 
+    SELECT ulak.update_circuit_breaker(
+        (SELECT id FROM ulak.endpoints WHERE name = 'iso_cb_recover'),
+        true
+    );
+
+update_circuit_breaker
+----------------------
+                      
+(1 row)
+
+step check_state: 
+    SELECT circuit_state, circuit_failure_count
+    FROM ulak.endpoints WHERE name = 'iso_cb_recover';
+
+circuit_state|circuit_failure_count
+-------------+---------------------
+closed       |                    0
+(1 row)
+

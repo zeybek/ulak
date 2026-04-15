@@ -1,0 +1,111 @@
+name: Publish Docker Images
+
+on:
+  release:
+    types: [published]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        pg: [18, 17, 16, 15, 14]
+    name: PG ${{ matrix.pg }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from release tag
+        id: version
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Building version: ${VERSION}"
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # v1.2.3 tag → 1.2.3-pg18, pg18, latest (only for PG 18)
+            type=semver,pattern={{version}},suffix=-pg${{ matrix.pg }}
+            type=semver,pattern={{major}}.{{minor}},suffix=-pg${{ matrix.pg }}
+            type=raw,value=pg${{ matrix.pg }}
+            type=raw,value=latest,enable=${{ matrix.pg == 18 }}
+          labels: |
+            org.opencontainers.image.title=ulak
+            org.opencontainers.image.description=PostgreSQL ${{ matrix.pg }} with ulak extension
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.publish
+          build-args: PG_MAJOR=${{ matrix.pg }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=pg${{ matrix.pg }}
+          cache-to: type=gha,mode=max,scope=pg${{ matrix.pg }}
+
+  # ── Verify published images ──
+  verify:
+    needs: publish
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pg: [18, 17, 16, 15, 14]
+    name: Verify PG ${{ matrix.pg }}
+    steps:
+      - name: Pull and test image
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:pg${{ matrix.pg }}"
+          docker pull "$IMAGE"
+
+          # Start container
+          docker run -d --name test-pg \
+            -e POSTGRES_PASSWORD=test \
+            "$IMAGE"
+
+          # Wait for PG to start
+          for i in $(seq 1 30); do
+            if docker exec test-pg pg_isready -U postgres 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify extension is loadable
+          docker exec test-pg psql -U postgres -c "CREATE EXTENSION ulak;"
+          docker exec test-pg psql -U postgres -c "SELECT * FROM ulak.health_check();"
+
+          # Verify protocol support
+          docker exec test-pg psql -U postgres -c \
+            "SELECT ulak.validate_endpoint_config('http', '{\"url\": \"https://example.com/webhook\"}'::jsonb);"
+
+          echo "PG ${{ matrix.pg }} image verified successfully"
+          docker stop test-pg

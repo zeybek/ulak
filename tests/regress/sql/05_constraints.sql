@@ -1,0 +1,87 @@
+-- 05_constraints.sql: CHECK constraints — protocol enum, status enum
+-- pg_regress test for ulak
+
+-- ============================================================================
+-- PROTOCOL CHECK CONSTRAINT
+-- ============================================================================
+
+-- Valid protocols should succeed
+INSERT INTO ulak.endpoints (name, protocol, config) VALUES ('c_http', 'http', '{"url":"http://localhost"}'::jsonb);
+INSERT INTO ulak.endpoints (name, protocol, config) VALUES ('c_kafka', 'kafka', '{"broker":"localhost:9092", "topic":"test"}'::jsonb);
+INSERT INTO ulak.endpoints (name, protocol, config) VALUES ('c_mqtt', 'mqtt', '{"host":"localhost"}'::jsonb);
+INSERT INTO ulak.endpoints (name, protocol, config) VALUES ('c_redis', 'redis', '{"host":"localhost"}'::jsonb);
+INSERT INTO ulak.endpoints (name, protocol, config) VALUES ('c_amqp', 'amqp', '{"host":"localhost"}'::jsonb);
+
+-- Count of valid protocol endpoints
+SELECT count(*) AS valid_protocol_count
+FROM ulak.endpoints
+WHERE name LIKE 'c_%';
+
+-- Invalid protocol should fail
+DO $$
+BEGIN
+    INSERT INTO ulak.endpoints (name, protocol, config)
+    VALUES ('c_bad', 'grpc', '{"host":"localhost"}'::jsonb);
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'CHECK constraint violation: %', SQLERRM;
+END
+$$;
+
+-- ============================================================================
+-- STATUS CHECK CONSTRAINT
+-- ============================================================================
+
+-- Get an endpoint_id for queue inserts
+DO $$
+DECLARE
+    v_eid bigint;
+BEGIN
+    SELECT id INTO v_eid FROM ulak.endpoints WHERE name = 'c_http';
+
+    -- Valid statuses (insert directly to test constraint)
+    INSERT INTO ulak.queue (endpoint_id, payload, status) VALUES (v_eid, '{"s":"pending"}'::jsonb, 'pending');
+    INSERT INTO ulak.queue (endpoint_id, payload, status) VALUES (v_eid, '{"s":"processing"}'::jsonb, 'processing');
+    INSERT INTO ulak.queue (endpoint_id, payload, status) VALUES (v_eid, '{"s":"completed"}'::jsonb, 'completed');
+    INSERT INTO ulak.queue (endpoint_id, payload, status) VALUES (v_eid, '{"s":"failed"}'::jsonb, 'failed');
+    INSERT INTO ulak.queue (endpoint_id, payload, status) VALUES (v_eid, '{"s":"expired"}'::jsonb, 'expired');
+END $$;
+
+-- Verify all 5 valid statuses were inserted
+SELECT count(*) AS valid_status_count
+FROM ulak.queue
+WHERE payload->>'s' IN ('pending', 'processing', 'completed', 'failed', 'expired');
+
+-- Invalid status should fail
+DO $$
+DECLARE
+    v_eid bigint;
+BEGIN
+    SELECT id INTO v_eid FROM ulak.endpoints WHERE name = 'c_http';
+    INSERT INTO ulak.queue (endpoint_id, payload, status)
+    VALUES (v_eid, '{"s":"cancelled"}'::jsonb, 'cancelled');
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'CHECK constraint violation: %', SQLERRM;
+END
+$$;
+
+-- ============================================================================
+-- FOREIGN KEY CONSTRAINT
+-- ============================================================================
+
+-- Queue entry referencing non-existent endpoint_id should fail
+DO $$
+BEGIN
+    INSERT INTO ulak.queue (endpoint_id, payload)
+    VALUES (999999, '{"test": true}'::jsonb);
+EXCEPTION WHEN foreign_key_violation THEN
+    RAISE NOTICE 'FK violation: %', SQLERRM;
+END
+$$;
+
+-- ============================================================================
+-- CLEANUP
+-- ============================================================================
+
+-- Delete queue entries first (FK constraint)
+DELETE FROM ulak.queue WHERE endpoint_id IN (SELECT id FROM ulak.endpoints WHERE name LIKE 'c_%');
+DELETE FROM ulak.endpoints WHERE name LIKE 'c_%';

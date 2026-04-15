@@ -1,0 +1,177 @@
+-- 19_http_proxy.sql: HTTP proxy configuration validation
+-- Tests proxy config parsing and validation in endpoint creation
+-- ============================================================================
+-- VALID PROXY CONFIGURATIONS
+-- ============================================================================
+-- Proxy with URL only (minimal config)
+SELECT ulak.create_endpoint('proxy_basic', 'http', '{
+    "url": "http://localhost:9999/webhook",
+    "proxy": {"url": "http://proxy.corp.com:8080"}
+}'::jsonb) IS NOT NULL AS proxy_basic_ok;
+INFO:  [ulak] Created endpoint with ID 45
+ proxy_basic_ok 
+----------------
+ t
+(1 row)
+
+-- Proxy with all options
+SELECT ulak.create_endpoint('proxy_full', 'http', '{
+    "url": "http://localhost:9999/webhook",
+    "proxy": {
+        "url": "http://proxy.corp.com:8080",
+        "type": "http",
+        "username": "proxyuser",
+        "password": "proxypass",
+        "no_proxy": "*.internal,127.0.0.1",
+        "ca_bundle": "/etc/ssl/proxy-ca.pem",
+        "ssl_verify": true
+    }
+}'::jsonb) IS NOT NULL AS proxy_full_ok;
+INFO:  [ulak] Created endpoint with ID 46
+ proxy_full_ok 
+---------------
+ t
+(1 row)
+
+-- SOCKS5 proxy
+SELECT ulak.create_endpoint('proxy_socks5', 'http', '{
+    "url": "http://localhost:9999/webhook",
+    "proxy": {"url": "socks5://socks.corp.com:1080", "type": "socks5"}
+}'::jsonb) IS NOT NULL AS proxy_socks5_ok;
+INFO:  [ulak] Created endpoint with ID 47
+ proxy_socks5_ok 
+-----------------
+ t
+(1 row)
+
+-- HTTPS proxy with CA bundle
+SELECT ulak.create_endpoint('proxy_https', 'http', '{
+    "url": "http://localhost:9999/webhook",
+    "proxy": {
+        "url": "https://secure-proxy.corp.com:8443",
+        "type": "https",
+        "ca_bundle": "/etc/ssl/proxy-ca.pem",
+        "ssl_verify": true
+    }
+}'::jsonb) IS NOT NULL AS proxy_https_ok;
+INFO:  [ulak] Created endpoint with ID 48
+ proxy_https_ok 
+----------------
+ t
+(1 row)
+
+-- Proxy with ssl_verify disabled (for dev/test environments)
+SELECT ulak.create_endpoint('proxy_noverify', 'http', '{
+    "url": "http://localhost:9999/webhook",
+    "proxy": {"url": "https://dev-proxy.local:8080", "ssl_verify": false}
+}'::jsonb) IS NOT NULL AS proxy_noverify_ok;
+INFO:  [ulak] Created endpoint with ID 49
+ proxy_noverify_ok 
+-------------------
+ t
+(1 row)
+
+-- Proxy combined with auth and CloudEvents
+SELECT ulak.create_endpoint('proxy_combined', 'http', '{
+    "url": "http://localhost:9999/webhook",
+    "proxy": {"url": "http://proxy.corp.com:8080"},
+    "auth": {"type": "bearer", "token": "my-token"},
+    "cloudevents": true,
+    "cloudevents_mode": "binary"
+}'::jsonb) IS NOT NULL AS proxy_combined_ok;
+INFO:  [ulak] Created endpoint with ID 50
+ proxy_combined_ok 
+-------------------
+ t
+(1 row)
+
+-- ============================================================================
+-- INVALID PROXY CONFIGURATIONS
+-- ============================================================================
+-- Proxy missing url (should fail)
+SELECT ulak.create_endpoint('proxy_no_url', 'http', '{
+    "url": "http://localhost:9999/webhook",
+    "proxy": {"type": "http"}
+}'::jsonb) IS NOT NULL AS proxy_no_url;
+WARNING:  [ulak] ERROR: Proxy config requires 'url'
+ERROR:  Invalid configuration for protocol http
+-- Proxy with bad scheme (ftp://)
+SELECT ulak.create_endpoint('proxy_bad_scheme', 'http', '{
+    "url": "http://localhost:9999/webhook",
+    "proxy": {"url": "ftp://proxy.com:8080"}
+}'::jsonb) IS NOT NULL AS proxy_bad_scheme;
+WARNING:  [ulak] ERROR: Proxy URL has invalid scheme. Only http://, https://, socks5:// are allowed
+ERROR:  Invalid configuration for protocol http
+-- Proxy with username but no password
+SELECT ulak.create_endpoint('proxy_missing_pass', 'http', '{
+    "url": "http://localhost:9999/webhook",
+    "proxy": {"url": "http://proxy.com:8080", "username": "user"}
+}'::jsonb) IS NOT NULL AS proxy_missing_pass;
+WARNING:  [ulak] ERROR: Proxy config requires both 'username' and 'password' or neither
+ERROR:  Invalid configuration for protocol http
+-- Proxy with password but no username
+SELECT ulak.create_endpoint('proxy_missing_user', 'http', '{
+    "url": "http://localhost:9999/webhook",
+    "proxy": {"url": "http://proxy.com:8080", "password": "pass"}
+}'::jsonb) IS NOT NULL AS proxy_missing_user;
+WARNING:  [ulak] ERROR: Proxy config requires both 'username' and 'password' or neither
+ERROR:  Invalid configuration for protocol http
+-- Proxy with bad type
+SELECT ulak.create_endpoint('proxy_bad_type', 'http', '{
+    "url": "http://localhost:9999/webhook",
+    "proxy": {"url": "http://proxy.com:8080", "type": "ftp"}
+}'::jsonb) IS NOT NULL AS proxy_bad_type;
+WARNING:  [ulak] ERROR: Proxy type 'ftp' invalid. Allowed: http, https, socks5
+ERROR:  Invalid configuration for protocol http
+-- Proxy with embedded credentials in URL (should fail)
+SELECT ulak.create_endpoint('proxy_embedded_creds', 'http', '{
+    "url": "http://localhost:9999/webhook",
+    "proxy": {"url": "http://user:pass@proxy.com:8080"}
+}'::jsonb) IS NOT NULL AS proxy_embedded_creds;
+WARNING:  [ulak] ERROR: Proxy URL must not contain embedded credentials. Use separate 'username' and 'password' fields
+ERROR:  Invalid configuration for protocol http
+-- ============================================================================
+-- CLEANUP
+-- ============================================================================
+SELECT ulak.drop_endpoint('proxy_basic');
+INFO:  [ulak] Dropped endpoint 'proxy_basic'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT ulak.drop_endpoint('proxy_full');
+INFO:  [ulak] Dropped endpoint 'proxy_full'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT ulak.drop_endpoint('proxy_socks5');
+INFO:  [ulak] Dropped endpoint 'proxy_socks5'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT ulak.drop_endpoint('proxy_https');
+INFO:  [ulak] Dropped endpoint 'proxy_https'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT ulak.drop_endpoint('proxy_noverify');
+INFO:  [ulak] Dropped endpoint 'proxy_noverify'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT ulak.drop_endpoint('proxy_combined');
+INFO:  [ulak] Dropped endpoint 'proxy_combined'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+

@@ -1,0 +1,108 @@
+-- ============================================================================
+-- Test: Unified metrics() function
+-- ============================================================================
+-- 1. _shmem_metrics() returns rows without error
+SELECT count(*) > 0 AS has_shmem_metrics FROM ulak._shmem_metrics();
+ has_shmem_metrics 
+-------------------
+ t
+(1 row)
+
+-- 2. Verify _shmem_metrics column structure
+SELECT metric_name, metric_type
+FROM ulak._shmem_metrics()
+WHERE labels = '{}'::jsonb
+ORDER BY metric_name;
+       metric_name        | metric_type 
+--------------------------+-------------
+ errors_total             | counter
+ messages_processed_total | counter
+ restarts_total           | counter
+ spawn_failures_total     | counter
+ spawns_total             | counter
+(5 rows)
+
+-- 3. metrics() returns rows without error
+SELECT count(*) > 0 AS has_metrics FROM ulak.metrics();
+ has_metrics 
+-------------
+ t
+(1 row)
+
+-- 4. Verify expected metric names from shmem
+SELECT DISTINCT metric_name
+FROM ulak.metrics()
+WHERE metric_name IN ('messages_processed_total', 'errors_total',
+                       'spawns_total', 'spawn_failures_total', 'restarts_total')
+ORDER BY metric_name;
+       metric_name        
+--------------------------
+ errors_total
+ messages_processed_total
+ restarts_total
+ spawn_failures_total
+ spawns_total
+(5 rows)
+
+-- 5. Create endpoint and queue messages to verify SQL-sourced metrics
+-- Use direct INSERT to avoid non-deterministic endpoint ID in elog(INFO) output
+INSERT INTO ulak.endpoints (name, protocol, config, enabled)
+VALUES ('metrics_test_ep', 'http',
+        '{"url": "http://localhost:9999/test"}'::jsonb, true);
+INSERT INTO ulak.queue (endpoint_id, payload, status)
+SELECT e.id, '{"test": true}'::jsonb, 'pending'
+FROM ulak.endpoints e WHERE e.name = 'metrics_test_ep';
+INSERT INTO ulak.queue (endpoint_id, payload, status)
+SELECT e.id, '{"test": true}'::jsonb, 'pending'
+FROM ulak.endpoints e WHERE e.name = 'metrics_test_ep';
+-- 6. Verify queue_depth metric reflects inserted messages
+SELECT metric_name, metric_value, labels->>'status' AS status
+FROM ulak.metrics()
+WHERE metric_name = 'queue_depth' AND labels->>'status' = 'pending';
+ metric_name | metric_value | status  
+-------------+--------------+---------
+ queue_depth |            2 | pending
+(1 row)
+
+-- 7. Verify queue_depth_by_endpoint metric
+SELECT metric_name, metric_value, labels->>'endpoint' AS endpoint
+FROM ulak.metrics()
+WHERE metric_name = 'queue_depth_by_endpoint'
+  AND labels->>'endpoint' = 'metrics_test_ep'
+  AND labels->>'status' = 'pending';
+       metric_name       | metric_value |    endpoint     
+-------------------------+--------------+-----------------
+ queue_depth_by_endpoint |            2 | metrics_test_ep
+(1 row)
+
+-- 8. Verify endpoint_circuit_state metric
+SELECT metric_name, metric_value, labels->>'endpoint' AS endpoint
+FROM ulak.metrics()
+WHERE metric_name = 'endpoint_circuit_state'
+  AND labels->>'endpoint' = 'metrics_test_ep';
+      metric_name       | metric_value |    endpoint     
+------------------------+--------------+-----------------
+ endpoint_circuit_state |            0 | metrics_test_ep
+(1 row)
+
+-- 9. Verify metric_type values are valid
+SELECT DISTINCT metric_type FROM ulak.metrics() ORDER BY metric_type;
+ metric_type 
+-------------
+ counter
+ gauge
+(2 rows)
+
+-- 10. Verify all labels are valid JSONB
+SELECT count(*) AS invalid_labels
+FROM ulak.metrics()
+WHERE labels IS NULL;
+ invalid_labels 
+----------------
+              0
+(1 row)
+
+-- Cleanup
+DELETE FROM ulak.queue
+WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'metrics_test_ep');
+DELETE FROM ulak.endpoints WHERE name = 'metrics_test_ep';

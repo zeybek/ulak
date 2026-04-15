@@ -1,0 +1,43 @@
+name: Reusable Static Analysis
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  static-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Install LLVM 22 toolchain
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 22
+          sudo apt-get update
+          sudo apt-get install -y cppcheck clang-format-22
+
+      - name: Show tool versions
+        run: |
+          clang-format-22 --version
+          cppcheck --version
+
+      - name: Run cppcheck
+        run: |
+          cppcheck --error-exitcode=1 \
+            --enable=warning,performance,portability \
+            --suppress=preprocessorErrorDirective \
+            --suppressions-list=.cppcheck-suppressions \
+            --std=c99 \
+            -I include/ \
+            src/
+
+      - name: Check clang-format
+        run: |
+          find src include \( -name '*.c' -o -name '*.h' \) | \
+            xargs clang-format-22 --dry-run --Werror

@@ -1,0 +1,69 @@
+Parsed test spec with 2 sessions
+
+starting permutation: w1_fail w2_fail w1_check
+step w1_fail: 
+    SELECT ulak.update_circuit_breaker(
+        (SELECT id FROM ulak.endpoints WHERE name = 'iso_cb_thresh'),
+        false
+    );
+
+update_circuit_breaker
+----------------------
+                      
+(1 row)
+
+step w2_fail: 
+    SELECT ulak.update_circuit_breaker(
+        (SELECT id FROM ulak.endpoints WHERE name = 'iso_cb_thresh'),
+        false
+    );
+
+update_circuit_breaker
+----------------------
+                      
+(1 row)
+
+step w1_check: 
+    SELECT circuit_state, circuit_failure_count,
+           (circuit_half_open_at IS NOT NULL) AS has_half_open_at
+    FROM ulak.endpoints WHERE name = 'iso_cb_thresh';
+
+circuit_state|circuit_failure_count|has_half_open_at
+-------------+---------------------+----------------
+open         |                   11|t               
+(1 row)
+
+
+starting permutation: w1_fail w2_fail w2_check
+step w1_fail: 
+    SELECT ulak.update_circuit_breaker(
+        (SELECT id FROM ulak.endpoints WHERE name = 'iso_cb_thresh'),
+        false
+    );
+
+update_circuit_breaker
+----------------------
+                      
+(1 row)
+
+step w2_fail: 
+    SELECT ulak.update_circuit_breaker(
+        (SELECT id FROM ulak.endpoints WHERE name = 'iso_cb_thresh'),
+        false
+    );
+
+update_circuit_breaker
+----------------------
+                      
+(1 row)
+
+step w2_check: 
+    SELECT circuit_state, circuit_failure_count,
+           (circuit_half_open_at IS NOT NULL) AS has_half_open_at
+    FROM ulak.endpoints WHERE name = 'iso_cb_thresh';
+
+circuit_state|circuit_failure_count|has_half_open_at
+-------------+---------------------+----------------
+open         |                   11|t               
+(1 row)
+

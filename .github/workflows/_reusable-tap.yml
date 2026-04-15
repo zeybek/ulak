@@ -1,0 +1,56 @@
+name: Reusable TAP
+
+on:
+  workflow_call:
+    inputs:
+      pg-version:
+        required: true
+        type: string
+      make-flags:
+        required: true
+        type: string
+      protocol-deps:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  tap:
+    runs-on: ubuntu-latest
+    container: pgxn/pgxn-tools
+    timeout-minutes: 30
+    steps:
+      - name: Start PostgreSQL ${{ inputs.pg-version }}
+        run: |
+          apt-get update
+          apt-get install -y libipc-run-perl
+          pg-start ${{ inputs.pg-version }} ${{ inputs.protocol-deps }}
+
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Build and install
+        run: make ${{ inputs.make-flags }} && sudo make ${{ inputs.make-flags }} install
+
+      - name: Configure shared_preload_libraries
+        run: |
+          echo "shared_preload_libraries = 'ulak'" >> \
+            "$(psql --no-psqlrc -U postgres -Atqc 'SHOW config_file')"
+          sudo pg_ctlcluster ${{ inputs.pg-version }} test restart
+
+      - name: Run TAP lifecycle tests
+        run: |
+          sudo chown -R postgres:postgres "$GITHUB_WORKSPACE"
+          sudo -u postgres env PATH="$PATH" \
+            make ${{ inputs.make-flags }} installcheck-tap PGUSER=postgres
+
+      - name: Upload TAP logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tap-logs-pg${{ inputs.pg-version }}
+          path: |
+            tmp_check/
+            log/

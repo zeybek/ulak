@@ -1,0 +1,93 @@
+name: Reusable Sanitizers
+
+on:
+  workflow_call:
+    inputs:
+      make-flags:
+        required: true
+        type: string
+      protocol-deps:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  sanitizers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -i -v 18
+          sudo apt-get update
+          sudo apt-get install -y \
+            postgresql-server-dev-18 \
+            postgresql-18 \
+            ${{ inputs.protocol-deps }}
+
+      - name: Build with sanitizers
+        run: |
+          make ${{ inputs.make-flags }} \
+            CFLAGS="-g -fsanitize=address,undefined -fno-omit-frame-pointer -O1"
+
+      - name: Install extension
+        run: sudo make ${{ inputs.make-flags }} install
+
+      - name: Configure PostgreSQL
+        run: |
+          SAN_LOG=/tmp/ulak_asan_data/server.log
+          ASAN_RT="$(gcc -print-file-name=libasan.so)"
+          UBSAN_RT="$(gcc -print-file-name=libubsan.so)"
+          sudo rm -rf /tmp/ulak_asan_data /tmp/ulak_asan_socket "$GITHUB_WORKSPACE/sanitizer-server.log"
+          sudo install -d -o postgres -g postgres /tmp/ulak_asan_data /tmp/ulak_asan_socket
+          sudo -u postgres /usr/lib/postgresql/18/bin/initdb \
+            -D /tmp/ulak_asan_data \
+            -A trust
+          cat <<'EOF' | sudo tee -a /tmp/ulak_asan_data/postgresql.conf
+          shared_preload_libraries = 'ulak'
+          listen_addresses = ''
+          unix_socket_directories = '/tmp/ulak_asan_socket'
+          EOF
+          sudo -u postgres env \
+            LD_PRELOAD="${ASAN_RT}:${UBSAN_RT}" \
+            ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:print_stacktrace=1" \
+            UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+            /usr/lib/postgresql/18/bin/pg_ctl \
+              -D /tmp/ulak_asan_data \
+              -l "$SAN_LOG" \
+              start || {
+                sudo cat "$SAN_LOG" || true
+                sudo cp "$SAN_LOG" "$GITHUB_WORKSPACE/sanitizer-server.log" || true
+                sudo chown "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/sanitizer-server.log" || true
+                exit 1
+              }
+          sudo -u postgres createdb -h /tmp/ulak_asan_socket -p 5432 ulak_test
+
+      - name: Run regress and isolation tests with sanitizers
+        env:
+          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:print_stacktrace=1"
+          UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+          PGHOST: /tmp/ulak_asan_socket
+          PGPORT: "5432"
+        run: make ${{ inputs.make-flags }} installcheck-regress PGUSER=postgres
+
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-results
+          path: |
+            tests/regress/results/
+            tests/isolation/output_iso/
+
+      - name: Upload sanitizer server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-server-log
+          path: sanitizer-server.log

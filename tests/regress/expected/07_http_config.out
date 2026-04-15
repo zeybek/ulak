@@ -1,0 +1,102 @@
+-- 07_http_config.sql: HTTP endpoint configuration validation
+-- pg_regress test for ulak
+-- ============================================================================
+-- VALID HTTP CONFIGS
+-- ============================================================================
+-- Minimal valid HTTP config
+SELECT ulak.create_endpoint(
+    'http_minimal',
+    'http',
+    '{"url": "http://example.com/webhook", "method": "POST"}'::jsonb
+) IS NOT NULL AS minimal_created;
+INFO:  [ulak] Created endpoint with ID 14
+ minimal_created 
+-----------------
+ t
+(1 row)
+
+-- HTTP config with all optional fields
+SELECT ulak.create_endpoint(
+    'http_full',
+    'http',
+    '{"url": "https://api.example.com/events", "method": "POST", "timeout": 30, "headers": {"Authorization": "Bearer token123"}, "ssl_verify": true}'::jsonb
+) IS NOT NULL AS full_created;
+WARNING:  [ulak] ERROR: HTTP config contains unknown key 'ssl_verify'. Allowed keys: url, method, headers, timeout, connect_timeout, signing_secret, cloudevents, ce_mode, ce_type, rate_limit, auth, tls_client_cert, tls_client_key, tls_ca_bundle, tls_pinned_public_key, proxy, auto_disable_on_gone
+ERROR:  Invalid configuration for protocol http
+-- Verify configs stored correctly
+SELECT name, protocol, config->>'url' AS url, config->>'method' AS method
+FROM ulak.endpoints
+WHERE name IN ('http_minimal', 'http_full')
+ORDER BY name;
+     name     | protocol |            url             | method 
+--------------+----------+----------------------------+--------
+ http_minimal | http     | http://example.com/webhook | POST
+(1 row)
+
+-- ============================================================================
+-- VALIDATE_ENDPOINT_CONFIG FOR HTTP
+-- ============================================================================
+-- Valid HTTP config passes validation
+SELECT ulak.validate_endpoint_config(
+    'http',
+    '{"url": "http://example.com", "method": "POST"}'::jsonb
+) AS valid_post;
+ valid_post 
+------------
+ t
+(1 row)
+
+-- Different HTTP methods
+SELECT ulak.validate_endpoint_config(
+    'http',
+    '{"url": "http://example.com", "method": "GET"}'::jsonb
+) AS valid_get;
+ valid_get 
+-----------
+ t
+(1 row)
+
+SELECT ulak.validate_endpoint_config(
+    'http',
+    '{"url": "http://example.com", "method": "PUT"}'::jsonb
+) AS valid_put;
+ valid_put 
+-----------
+ t
+(1 row)
+
+-- ============================================================================
+-- HTTP ENDPOINT ALTER
+-- ============================================================================
+-- Alter HTTP endpoint config
+SELECT ulak.alter_endpoint(
+    'http_minimal',
+    '{"url": "http://example.com/webhook-v2", "method": "PUT", "timeout": 60}'::jsonb
+);
+INFO:  [ulak] Altered endpoint 'http_minimal'
+ alter_endpoint 
+----------------
+ t
+(1 row)
+
+-- Verify altered config
+SELECT config->>'url' AS url, config->>'method' AS method, config->>'timeout' AS timeout
+FROM ulak.endpoints
+WHERE name = 'http_minimal';
+              url              | method | timeout 
+-------------------------------+--------+---------
+ http://example.com/webhook-v2 | PUT    | 60
+(1 row)
+
+-- ============================================================================
+-- CLEANUP
+-- ============================================================================
+SELECT ulak.drop_endpoint('http_minimal');
+INFO:  [ulak] Dropped endpoint 'http_minimal'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+SELECT ulak.drop_endpoint('http_full');
+ERROR:  endpoint 'http_full' does not exist

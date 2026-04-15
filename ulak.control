@@ -1,0 +1,8 @@
+# ulak extension control file
+comment = 'Transactional Outbox Pattern for PostgreSQL'
+default_version = '0.0.0' # x-release-please-version
+module_pathname = '$libdir/ulak'
+relocatable = false
+schema = ulak
+requires = ''
+superuser = false

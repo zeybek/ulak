@@ -1,0 +1,124 @@
+-- 02_endpoints_crud.sql: Endpoint CRUD — create, alter, drop, enable/disable
+-- pg_regress test for ulak
+-- ============================================================================
+-- CREATE ENDPOINT
+-- ============================================================================
+-- Create an HTTP endpoint
+SELECT ulak.create_endpoint(
+    'crud_test_http',
+    'http',
+    '{"url": "http://example.com/hook", "method": "POST"}'::jsonb
+) IS NOT NULL AS created;
+INFO:  [ulak] Created endpoint with ID 2
+ created 
+---------
+ t
+(1 row)
+
+-- Verify it exists
+SELECT name, protocol, enabled
+FROM ulak.endpoints
+WHERE name = 'crud_test_http';
+      name      | protocol | enabled 
+----------------+----------+---------
+ crud_test_http | http     | t
+(1 row)
+
+-- Create a Kafka endpoint
+SELECT ulak.create_endpoint(
+    'crud_test_kafka',
+    'kafka',
+    '{"broker": "localhost:9092", "topic": "test-topic"}'::jsonb
+) IS NOT NULL AS created;
+INFO:  [ulak] Created endpoint with ID 3
+ created 
+---------
+ t
+(1 row)
+
+-- ============================================================================
+-- ALTER ENDPOINT
+-- ============================================================================
+-- Alter the HTTP endpoint config
+SELECT ulak.alter_endpoint(
+    'crud_test_http',
+    '{"url": "http://example.com/hook-v2", "method": "PUT"}'::jsonb
+);
+INFO:  [ulak] Altered endpoint 'crud_test_http'
+ alter_endpoint 
+----------------
+ t
+(1 row)
+
+-- Verify the config was updated
+SELECT config->>'url' AS url, config->>'method' AS method
+FROM ulak.endpoints
+WHERE name = 'crud_test_http';
+            url             | method 
+----------------------------+--------
+ http://example.com/hook-v2 | PUT
+(1 row)
+
+-- ============================================================================
+-- DISABLE / ENABLE ENDPOINT
+-- ============================================================================
+-- Disable the endpoint
+SELECT ulak.disable_endpoint('crud_test_http');
+ disable_endpoint 
+------------------
+ t
+(1 row)
+
+-- Verify disabled
+SELECT name, enabled
+FROM ulak.endpoints
+WHERE name = 'crud_test_http';
+      name      | enabled 
+----------------+---------
+ crud_test_http | f
+(1 row)
+
+-- Enable the endpoint
+SELECT ulak.enable_endpoint('crud_test_http');
+ enable_endpoint 
+-----------------
+ t
+(1 row)
+
+-- Verify enabled
+SELECT name, enabled
+FROM ulak.endpoints
+WHERE name = 'crud_test_http';
+      name      | enabled 
+----------------+---------
+ crud_test_http | t
+(1 row)
+
+-- ============================================================================
+-- DROP ENDPOINT
+-- ============================================================================
+-- Drop the Kafka endpoint
+SELECT ulak.drop_endpoint('crud_test_kafka');
+INFO:  [ulak] Dropped endpoint 'crud_test_kafka'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
+-- Verify it's gone
+SELECT EXISTS(
+    SELECT 1 FROM ulak.endpoints WHERE name = 'crud_test_kafka'
+) AS still_exists;
+ still_exists 
+--------------
+ f
+(1 row)
+
+-- Clean up
+SELECT ulak.drop_endpoint('crud_test_http');
+INFO:  [ulak] Dropped endpoint 'crud_test_http'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+

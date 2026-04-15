@@ -1,0 +1,176 @@
+-- 13_ordering_key.sql: Message ordering via ordering_key
+-- pg_regress test for ulak
+-- ============================================================================
+-- SETUP
+-- ============================================================================
+SELECT ulak.create_endpoint('ord_ep', 'http',
+    '{"url": "http://localhost:9999/ord"}'::jsonb) IS NOT NULL AS ep_created;
+INFO:  [ulak] Created endpoint with ID 26
+ ep_created 
+------------
+ t
+(1 row)
+
+CREATE TEMP TABLE ord_ep AS
+SELECT id FROM ulak.endpoints WHERE name = 'ord_ep';
+-- ============================================================================
+-- SEND WITH ORDERING KEY
+-- ============================================================================
+SELECT ulak.send_with_options(
+    'ord_ep', '{"seq": 1}'::jsonb,
+    p_ordering_key => 'order-123'
+) IS NOT NULL AS msg1;
+ msg1 
+------
+ t
+(1 row)
+
+SELECT ulak.send_with_options(
+    'ord_ep', '{"seq": 2}'::jsonb,
+    p_ordering_key => 'order-123'
+) IS NOT NULL AS msg2;
+ msg2 
+------
+ t
+(1 row)
+
+SELECT ulak.send_with_options(
+    'ord_ep', '{"seq": 3}'::jsonb,
+    p_ordering_key => 'order-456'
+) IS NOT NULL AS msg3;
+ msg3 
+------
+ t
+(1 row)
+
+-- NULL ordering_key (no ordering constraint)
+SELECT ulak.send_with_options(
+    'ord_ep', '{"seq": 4}'::jsonb
+) IS NOT NULL AS msg4_nokey;
+ msg4_nokey 
+------------
+ t
+(1 row)
+
+-- Verify ordering_key stored correctly
+SELECT ordering_key, payload->>'seq' AS seq
+FROM ulak.queue
+WHERE endpoint_id = (SELECT id FROM ord_ep)
+ORDER BY id;
+ ordering_key | seq 
+--------------+-----
+ order-123    | 1
+ order-123    | 2
+ order-456    | 3
+              | 4
+(4 rows)
+
+-- ============================================================================
+-- ORDERING ENFORCEMENT: processing blocks same key
+-- ============================================================================
+-- Simulate: set first order-123 message to 'processing'
+UPDATE ulak.queue
+SET status = 'processing', processing_started_at = NOW()
+WHERE id = (
+    SELECT id FROM ulak.queue
+    WHERE ordering_key = 'order-123' AND status = 'pending'
+    ORDER BY created_at ASC LIMIT 1
+);
+-- Query like worker does: should NOT return order-123 (already processing)
+-- Should return: order-456 (different key) + NULL key message
+SELECT ordering_key, payload->>'seq' AS seq
+FROM ulak.queue q
+WHERE q.status = 'pending'
+  AND (q.ordering_key IS NULL
+       OR NOT EXISTS (
+           SELECT 1 FROM ulak.queue q2
+           WHERE q2.ordering_key = q.ordering_key
+             AND q2.status = 'processing'
+             AND q2.id != q.id
+       ))
+ORDER BY q.created_at;
+ ordering_key | seq 
+--------------+-----
+ order-456    | 3
+              | 4
+(2 rows)
+
+-- ============================================================================
+-- DIFFERENT KEYS ARE INDEPENDENT
+-- ============================================================================
+-- order-456 and NULL key should both be fetchable
+SELECT count(*) AS fetchable_count
+FROM ulak.queue q
+WHERE q.status = 'pending'
+  AND q.endpoint_id = (SELECT id FROM ord_ep)
+  AND (q.ordering_key IS NULL
+       OR NOT EXISTS (
+           SELECT 1 FROM ulak.queue q2
+           WHERE q2.ordering_key = q.ordering_key
+             AND q2.status = 'processing'
+             AND q2.id != q.id
+       ));
+ fetchable_count 
+-----------------
+               2
+(1 row)
+
+-- ============================================================================
+-- COMPLETED STATUS DOES NOT BLOCK
+-- ============================================================================
+-- Mark the processing message as completed
+UPDATE ulak.queue
+SET status = 'completed', completed_at = NOW()
+WHERE ordering_key = 'order-123' AND status = 'processing';
+-- Now the second order-123 message should be fetchable
+SELECT ordering_key, payload->>'seq' AS seq
+FROM ulak.queue q
+WHERE q.status = 'pending'
+  AND q.endpoint_id = (SELECT id FROM ord_ep)
+  AND (q.ordering_key IS NULL
+       OR NOT EXISTS (
+           SELECT 1 FROM ulak.queue q2
+           WHERE q2.ordering_key = q.ordering_key
+             AND q2.status = 'processing'
+             AND q2.id != q.id
+       ))
+ORDER BY q.ordering_key NULLS LAST, q.created_at;
+ ordering_key | seq 
+--------------+-----
+ order-123    | 2
+ order-456    | 3
+              | 4
+(3 rows)
+
+-- ============================================================================
+-- FAILED STATUS DOES NOT BLOCK
+-- ============================================================================
+-- Set second order-123 to failed
+UPDATE ulak.queue
+SET status = 'failed', failed_at = NOW()
+WHERE ordering_key = 'order-123' AND status = 'pending';
+-- No more order-123 pending, so nothing to block
+-- Remaining: order-456 + NULL
+SELECT ordering_key, payload->>'seq' AS seq
+FROM ulak.queue q
+WHERE q.status = 'pending'
+  AND q.endpoint_id = (SELECT id FROM ord_ep)
+ORDER BY q.created_at;
+ ordering_key | seq 
+--------------+-----
+ order-456    | 3
+              | 4
+(2 rows)
+
+-- ============================================================================
+-- CLEANUP
+-- ============================================================================
+DELETE FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ord_ep);
+DROP TABLE ord_ep;
+SELECT ulak.drop_endpoint('ord_ep');
+INFO:  [ulak] Dropped endpoint 'ord_ep'
+ drop_endpoint 
+---------------
+ t
+(1 row)
+
