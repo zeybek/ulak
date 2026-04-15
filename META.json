@@ -6,7 +6,7 @@
   "maintainer": [
     "Ahmet Zeybek <me@zeybek.dev>"
   ],
-  "license": "Apache-2.0",
+  "license": "apache_2_0",
   "release_status": "testing",
   "provides": {
     "ulak": {
@@ -57,6 +57,6 @@
     "amqp",
     "circuit breaker",
     "dead letter queue",
-    "pub/sub"
+    "pubsub"
   ]
 }
