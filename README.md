@@ -3,93 +3,272 @@
 [![CI](https://github.com/zeybek/ulak/actions/workflows/ci.yml/badge.svg)](https://github.com/zeybek/ulak/actions/workflows/ci.yml)
 [![PostgreSQL 14-18](https://img.shields.io/badge/PostgreSQL-14--18-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE.md)
-<!-- x-release-please-start-version -->
-[![Version](https://img.shields.io/badge/version-0.0.2)](CHANGELOG.md)
-<!-- x-release-please-end -->
+[![GitHub Release](https://img.shields.io/github/v/release/zeybek/ulak)](https://github.com/zeybek/ulak/releases/latest)
 
-**Transactional Outbox Pattern for PostgreSQL** — messages committed atomically with your business transactions, delivered reliably via background workers.
+`ulak` is a PostgreSQL extension for the transactional outbox pattern.
 
-ulak writes messages to a PostgreSQL table **inside your transaction**. Background workers pick them up and deliver asynchronously with retries, circuit breaking, and dead letter queues. Your application gets **exactly-once semantics for writes** and **at-least-once delivery**.
+It solves the dual-write problem by inserting messages into `ulak.queue` **inside the same transaction** as your business data, then dispatching them asynchronously through PostgreSQL background workers. You get **exactly-once writes to the local queue** and **at-least-once delivery** to external systems.
 
-## Features
+`ulak` means "messenger". The point of the project is to keep enqueue atomic with your data, while moving retries, backoff, circuit breaking, DLQ handling, and redrive out of application code.
 
-- **6 Protocols** — [HTTP](https://github.com/zeybek/ulak/wiki/Protocol-HTTP) (built-in), [Kafka](https://github.com/zeybek/ulak/wiki/Protocol-Kafka), [MQTT](https://github.com/zeybek/ulak/wiki/Protocol-MQTT), [Redis Streams](https://github.com/zeybek/ulak/wiki/Protocol-Redis), [AMQP](https://github.com/zeybek/ulak/wiki/Protocol-AMQP), [NATS](https://github.com/zeybek/ulak/wiki/Protocol-NATS)
-- **Multi-Worker** — 1–32 parallel workers with `FOR UPDATE SKIP LOCKED` and [modulo partitioning](https://github.com/zeybek/ulak/wiki/Architecture)
-- **Reliability** — [Circuit breaker, exponential backoff retry, DLQ with redrive](https://github.com/zeybek/ulak/wiki/Reliability)
-- **Security** — [RBAC, SSRF protection, TLS/mTLS, OAuth2, AWS SigV4, webhook HMAC signing](https://github.com/zeybek/ulak/wiki/Security)
-- **Pub/Sub** — [Event types with JSONB containment filters and multi-endpoint fan-out](https://github.com/zeybek/ulak/wiki/Pub-Sub)
-- **Message Control** — [Priority, ordering keys, idempotency, TTL, scheduled delivery](https://github.com/zeybek/ulak/wiki/Message-Features)
-- **CloudEvents** — Binary and structured mode support
-- **Operational** — [Backpressure, monthly archive partitions, health checks, response capture](https://github.com/zeybek/ulak/wiki/Monitoring)
+## Why ulak
 
-## Quick Start
+- **Atomic enqueue**: `ulak.send()` and `ulak.publish()` write to the queue inside your transaction. If the transaction rolls back, the message never exists.
+- **Database-native execution model**: background workers poll `ulak.queue` with `FOR UPDATE SKIP LOCKED` and dispatch without requiring a separate CDC stack.
+- **Operational safety built in**: retry policy, stale-processing recovery, circuit breaker, DLQ, archive, health checks, and redrive are part of the engine.
+- **Protocol adapters, one queue model**: HTTP is built in; Kafka, MQTT, Redis Streams, AMQP, and NATS are optional adapters behind the same lifecycle.
+
+## Use ulak when
+
+- PostgreSQL is your source of truth and you want outbox semantics close to the data.
+- You need reliable webhook or broker delivery without rebuilding retry and DLQ logic in every service.
+- You prefer database-native operations over an external CDC pipeline.
+
+## Do not use ulak when
+
+- You already operate a CDC stack such as Debezium and are satisfied with that model.
+- Your main problem is large-scale event streaming infrastructure rather than transactional outbox delivery.
+- You do not want background worker activity, queue state, and delivery policy managed inside PostgreSQL.
+
+## How ulak compares
+
+| Approach | Atomic enqueue with business transaction | Built-in retry / DLQ / circuit breaker | Runs inside PostgreSQL | Best fit |
+|----------|-------------------------------------------|----------------------------------------|------------------------|----------|
+| **ulak** | Yes | Yes | Yes | PostgreSQL-centric systems that want native outbox delivery |
+| **App-level outbox** | Usually yes | Usually custom | No | Teams that prefer delivery logic in application services |
+| **Debezium / CDC** | Yes | Broker or consumer dependent | No | Existing Kafka + CDC estates |
+| **Direct broker publish** | No | Broker dependent | No | Fire-and-forget or eventually consistent integrations |
+
+## Supported protocols
+
+- **HTTP / HTTPS**: built in, always available
+- **Kafka**: compile with `ENABLE_KAFKA=1`
+- **MQTT**: compile with `ENABLE_MQTT=1`
+- **Redis Streams**: compile with `ENABLE_REDIS=1`
+- **AMQP**: compile with `ENABLE_AMQP=1`
+- **NATS**: compile with `ENABLE_NATS=1`
+
+All non-HTTP protocols depend on their client libraries at build time.
+
+## 5-Minute HTTP Quick Start
+
+`ulak` is a PostgreSQL background worker extension. It will not run unless PostgreSQL starts with:
+
+```conf
+shared_preload_libraries = 'ulak'
+```
+
+The shortest path is to start with HTTP only.
 
 ```bash
-# Start PostgreSQL + all protocol services
 git clone https://github.com/zeybek/ulak.git
 cd ulak
-docker compose up -d
 
-# Build with all protocols and install
+# Start PostgreSQL only
+docker compose up -d postgres
+
+# Build and install HTTP-only ulak
 docker exec ulak-postgres-1 bash -c \
-  "cd /src/ulak && make clean && make ENABLE_KAFKA=1 ENABLE_MQTT=1 ENABLE_REDIS=1 ENABLE_AMQP=1 ENABLE_NATS=1 && make install"
+  "cd /src/ulak && make clean && make && make install"
 
-# Configure and restart
+# Preload ulak and point workers at the test database
 docker exec ulak-postgres-1 psql -U postgres -c \
   "ALTER SYSTEM SET shared_preload_libraries = 'ulak';
-   ALTER SYSTEM SET ulak.database = 'ulak_test';"
+   ALTER SYSTEM SET ulak.database = 'ulak_test';
+   ALTER SYSTEM SET ulak.capture_response = 'on';"
+
 docker restart ulak-postgres-1
 
-# Create extension
+# Create the extension
 docker exec ulak-postgres-1 psql -U postgres -d ulak_test -c \
   "CREATE EXTENSION ulak;"
 ```
 
-Send your first message:
+Create one endpoint and send one message:
 
 ```sql
--- Create an HTTP endpoint
-SELECT ulak.create_endpoint('my-webhook', 'http',
-  '{"url": "https://httpbin.org/post", "method": "POST"}'::jsonb);
+SELECT ulak.create_endpoint(
+  'httpbin',
+  'http',
+  '{"url": "https://httpbin.org/post", "method": "POST"}'::jsonb
+);
 
--- Send a message (inside your transaction)
 BEGIN;
-  INSERT INTO orders (id, total) VALUES (1, 99.99);
-  SELECT ulak.send('my-webhook', '{"order_id": 1, "total": 99.99}'::jsonb);
+  SELECT ulak.send(
+    'httpbin',
+    '{"event": "order.created", "order_id": 123, "total": 99.99}'::jsonb
+  );
 COMMIT;
--- Message is now queued and will be delivered by a background worker
 ```
 
-Other protocols work the same way:
+Check delivery state:
 
 ```sql
--- Kafka
-SELECT ulak.create_endpoint('events', 'kafka',
-  '{"broker": "kafka:9092", "topic": "order-events"}'::jsonb);
+SELECT id, status, retry_count, completed_at, last_error
+FROM ulak.queue
+ORDER BY id DESC
+LIMIT 1;
 
--- Redis Streams
-SELECT ulak.create_endpoint('stream', 'redis',
-  '{"host": "redis", "stream_key": "my-events"}'::jsonb);
+SELECT response
+FROM ulak.queue
+ORDER BY id DESC
+LIMIT 1;
 
--- MQTT
-SELECT ulak.create_endpoint('sensor', 'mqtt',
-  '{"broker": "mosquitto", "topic": "sensors/temp", "qos": 1}'::jsonb);
-
--- AMQP / RabbitMQ
-SELECT ulak.create_endpoint('queue', 'amqp',
-  '{"host": "rabbitmq", "exchange": "", "routing_key": "my-queue",
-    "username": "guest", "password": "guest"}'::jsonb);
-
--- NATS
-SELECT ulak.create_endpoint('bus', 'nats',
-  '{"url": "nats://nats:4222", "subject": "orders.created"}'::jsonb);
+SELECT * FROM ulak.health_check();
+SELECT * FROM ulak.get_worker_status();
 ```
+
+If the target is reachable, the newest row should move from `pending` to `completed`. If delivery fails, `retry_count` and `last_error` show why, and the worker retries according to policy.
+
+## Message lifecycle
+
+```mermaid
+flowchart TD
+    A[Application transaction] --> B[ulak.send / ulak.publish]
+    B --> C[Insert into ulak.queue]
+    C --> D{Transaction commits?}
+    D -- No --> E[No message exists]
+    D -- Yes --> F[Background worker claims pending row]
+    F --> G{Dispatch result}
+    G -- Success --> H[status = completed]
+    H --> I[Archived by maintenance]
+    G -- Retryable failure --> J[status = pending with next_retry_at]
+    J --> F
+    G -- Permanent failure or max retries --> K[Move to ulak.dlq]
+    K --> L[Operator redrive]
+    L --> C
+```
+
+## Architecture
+
+```mermaid
+flowchart LR
+    App[Application SQL transaction] --> API[SQL API: send publish subscribe]
+    API --> Queue[(ulak.queue)]
+    Queue --> Workers[Background workers 1..32]
+    Workers --> CB[Circuit breaker and retry policy]
+    Workers --> Dispatch[Dispatcher factory]
+    Dispatch --> HTTP[HTTP]
+    Dispatch --> Kafka[Kafka]
+    Dispatch --> MQTT[MQTT]
+    Dispatch --> Redis[Redis Streams]
+    Dispatch --> AMQP[AMQP]
+    Dispatch --> NATS[NATS]
+    Workers --> DLQ[(ulak.dlq)]
+    Workers --> Archive[(ulak.archive)]
+    Workers --> Metrics[health_check worker_status endpoint_health metrics]
+```
+
+## Delivery model and guarantees
+
+- **Exactly-once write to the queue**: the enqueue happens inside the same transaction as your business data.
+- **At-least-once delivery**: messages are only terminal after confirmed delivery or explicit failure handling.
+- **Retryable failures stay in the queue**: the worker updates `retry_count`, schedules `next_retry_at`, and tries again.
+- **Permanent failures move to the DLQ**: exhausted or permanent failures are archived into `ulak.dlq`.
+- **Crash recovery is built in**: stale `processing` rows are reset back to `pending`.
+- **Per-endpoint circuit breaker**: endpoints move through `closed`, `open`, and `half_open`.
+
+What `ulak` does **not** claim is exactly-once delivery to remote systems. Remote consumers should still be idempotent.
+
+## Core SQL API
+
+### Queueing
+
+```sql
+SELECT ulak.send('endpoint_name', '{"event":"user.created"}'::jsonb);
+
+SELECT ulak.send_with_options(
+  'endpoint_name',
+  '{"event":"user.created"}'::jsonb,
+  5,
+  NOW() + INTERVAL '10 minutes',
+  'user-42-created',
+  '550e8400-e29b-41d4-a716-446655440000'::uuid,
+  NOW() + INTERVAL '1 hour',
+  'user-42'
+);
+
+SELECT ulak.send_batch('endpoint_name', ARRAY[
+  '{"id":1}'::jsonb,
+  '{"id":2}'::jsonb
+]);
+```
+
+### Endpoints
+
+```sql
+SELECT ulak.create_endpoint('orders-http', 'http',
+  '{"url":"https://example.com/webhook","method":"POST"}'::jsonb);
+
+SELECT * FROM ulak.get_endpoint_health();
+```
+
+### Pub/Sub
+
+```sql
+SELECT ulak.create_event_type('order.created', 'Order created');
+SELECT ulak.subscribe('order.created', 'orders-http');
+SELECT ulak.publish('order.created', '{"order_id":123}'::jsonb);
+```
+
+### Operations
+
+```sql
+SELECT * FROM ulak.health_check();
+SELECT * FROM ulak.get_worker_status();
+SELECT * FROM ulak.dlq_summary();
+SELECT * FROM ulak.metrics();
+
+SELECT ulak.redrive_message(42);
+SELECT ulak.redrive_endpoint('orders-http');
+SELECT ulak.redrive_all();
+
+SELECT ulak.replay_message(100);
+SELECT ulak.replay_range(
+  1,
+  date_trunc('month', now()) - interval '1 month',
+  date_trunc('month', now())
+);
+```
+
+## Reliability and operations
+
+### Built-in behaviors
+
+- **Retry policies**: configurable fixed, linear, or exponential backoff
+- **Circuit breaker**: configurable threshold and cooldown per endpoint
+- **Stale-processing recovery**: recovers messages left in `processing` after worker failure
+- **Backpressure**: queue depth protection via `ulak.max_queue_size`
+- **Archive management**: completed messages can be moved out of the hot queue into `ulak.archive`
+- **DLQ retention and redrive**: failed messages stay inspectable and can be replayed into the queue
+- **Event log**: internal lifecycle and operational events are recorded in `ulak.event_log`
+
+### Operational checklist
+
+- Set `shared_preload_libraries = 'ulak'`
+- Set `ulak.database` to the database the workers should connect to
+- Size `ulak.workers`, `ulak.poll_interval`, and `ulak.batch_size` for your workload
+- Decide whether `ulak.capture_response` should be on in production
+- Monitor `ulak.health_check()`, `ulak.get_worker_status()`, `ulak.get_endpoint_health()`, `ulak.dlq_summary()`, and `ulak.metrics()`
+- Review `ulak.dlq_retention_days`, `ulak.archive_retention_months`, and `ulak.stale_recovery_timeout`
+
+## Security and access model
+
+`ulak` includes:
+
+- **RBAC roles**: `ulak_admin`, `ulak_application`, `ulak_monitor`
+- **HTTP SSRF protection**: internal URLs are blocked unless explicitly allowed
+- **TLS / mTLS support**
+- **HTTP auth helpers**: OAuth2 and AWS SigV4 validation paths are present in the repo
+- **Webhook signing / CloudEvents support**
+
+For the full protocol-specific security surface, see the wiki pages linked below.
 
 ## Installation
 
 ### Prerequisites
 
-| Dependency | Required | Build Flag |
+| Dependency | Required | Build flag |
 |------------|----------|------------|
 | PostgreSQL 14–18 | Yes | — |
 | libcurl | Yes | — |
@@ -99,21 +278,23 @@ SELECT ulak.create_endpoint('bus', 'nats',
 | librabbitmq | Optional | `ENABLE_AMQP=1` |
 | libnats / cnats | Optional | `ENABLE_NATS=1` |
 
-### Build from Source
+### Build from source
 
 ```bash
-# HTTP only (default)
+# HTTP only
 make && make install
 
-# With all protocols
+# All adapters
 make ENABLE_KAFKA=1 ENABLE_MQTT=1 ENABLE_REDIS=1 ENABLE_AMQP=1 ENABLE_NATS=1 && make install
 ```
 
-Add to `postgresql.conf` and restart:
+Then preload the extension and restart PostgreSQL:
 
-```
+```conf
 shared_preload_libraries = 'ulak'
 ```
+
+Create the extension in the target database:
 
 ```sql
 CREATE EXTENSION ulak;
@@ -121,177 +302,78 @@ CREATE EXTENSION ulak;
 
 ### Docker
 
-The Dockerfile accepts a `PG_MAJOR` build argument (default: 18):
-
 ```bash
-# Default (PostgreSQL 18)
+# Default PostgreSQL major
 docker compose up -d
 
-# Specific version
+# Specific PostgreSQL version
 PG_MAJOR=15 docker compose up -d
 ```
 
-The compose file includes PostgreSQL, Kafka, Redis, Mosquitto (MQTT), RabbitMQ (AMQP), and NATS.
+The compose file includes PostgreSQL, Kafka, Redis, Mosquitto, RabbitMQ, and NATS for local development and e2e testing.
 
-## Usage
+## Configuration essentials
 
-### Sending Messages
+All settings use the `ulak.` prefix.
 
-```sql
--- Simple send
-SELECT ulak.send('my-webhook', '{"event": "order.created"}'::jsonb);
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `ulak.workers` | `4` | Number of background workers |
+| `ulak.database` | unset | Database workers connect to |
+| `ulak.poll_interval` | `500ms` | Queue polling interval |
+| `ulak.batch_size` | `200` | Messages claimed per cycle |
+| `ulak.default_max_retries` | `10` | Default retry budget |
+| `ulak.retry_base_delay` | `10s` | Retry backoff base |
+| `ulak.circuit_breaker_threshold` | `10` | Failures before opening the breaker |
+| `ulak.circuit_breaker_cooldown` | `30s` | Cooldown before half-open probe |
+| `ulak.capture_response` | `false` | Store protocol response payloads |
+| `ulak.max_queue_size` | `1000000` | Backpressure limit |
+| `ulak.dlq_retention_days` | `30` | DLQ retention |
+| `ulak.archive_retention_months` | `6` | Archive retention |
 
--- With options (priority, idempotency, scheduling)
-SELECT ulak.send_with_options(
-  'my-webhook',
-  '{"event": "order.created"}'::jsonb,
-  5,                                    -- priority (0-10, higher = first)
-  NOW() + INTERVAL '10 minutes',        -- scheduled delivery
-  'order-123-created',                  -- idempotency key
-  '550e8400-e29b-41d4-a716-446655440000'::uuid, -- correlation ID (UUID)
-  NOW() + INTERVAL '1 hour',           -- TTL / expires at
-  'order-123'                           -- ordering key (FIFO per key)
-);
-
--- Batch send
-SELECT ulak.send_batch('my-webhook', ARRAY[
-  '{"id": 1}'::jsonb,
-  '{"id": 2}'::jsonb,
-  '{"id": 3}'::jsonb
-]);
-```
-
-### Pub/Sub
-
-```sql
--- Create event types and subscribe endpoints
-SELECT ulak.create_event_type('order.created', 'New order placed');
-SELECT ulak.subscribe('order.created', 'my-webhook');
-SELECT ulak.subscribe('order.created', 'events');  -- fan-out
-
--- Publish to all subscribers
-SELECT ulak.publish('order.created', '{"order_id": 123}'::jsonb);
-```
-
-### Monitoring
-
-```sql
-SELECT * FROM ulak.health_check();
-SELECT * FROM ulak.get_worker_status();
-SELECT * FROM ulak.get_endpoint_health();
-SELECT * FROM ulak.dlq_summary();
-```
-
-### DLQ Management
-
-```sql
--- Redrive failed messages
-SELECT ulak.redrive_message(42);           -- single message
-SELECT ulak.redrive_endpoint('my-webhook'); -- all for endpoint
-SELECT ulak.redrive_all();                  -- everything
-
--- Replay from archive
-SELECT ulak.replay_message(100);
-SELECT ulak.replay_range(
-  1,
-  date_trunc('month', now()) - interval '1 month',
-  date_trunc('month', now())
-);
-```
-
-## Configuration
-
-All parameters use the `ulak.` prefix. Key settings:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `workers` | 4 | Background workers (1–32) |
-| `poll_interval` | 500ms | Queue polling frequency |
-| `batch_size` | 200 | Messages per batch cycle |
-| `max_queue_size` | 1,000,000 | Backpressure threshold |
-| `circuit_breaker_threshold` | 10 | Failures before circuit opens |
-| `circuit_breaker_cooldown` | 30s | Wait before half-open probe |
-| `http_timeout` | 10s | HTTP request timeout |
-| `dlq_retention_days` | 30 | DLQ message retention |
-
-See the [Configuration Reference](https://github.com/zeybek/ulak/wiki/Configuration-Reference) for all 57 parameters with types, ranges, and restart/reload semantics.
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────────┐
-│  Application Transaction                                  │
-│  ┌──────────────────────────────────────────────────────┐ │
-│  │ BEGIN;                                                │ │
-│  │   INSERT INTO orders ...                              │ │
-│  │   SELECT ulak.send('webhook', '{...}');         │ │
-│  │ COMMIT;                    ▲                          │ │
-│  └────────────────────────────│──────────────────────────┘ │
-│                               │ SPI INSERT (atomic)        │
-│  ┌────────────────────────────▼──────────────────────────┐ │
-│  │ ulak.queue          (pending messages)          │ │
-│  └───────┬───────────┬───────────┬───────────────────────┘ │
-│          │           │           │                          │
-│   Worker 0    Worker 1    Worker N                          │
-│   (id%N=0)    (id%N=1)    (id%N=N)                         │
-│      │           │           │                              │
-│      ▼           ▼           ▼                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Dispatcher Factory                                   │   │
-│  │  HTTP │ Kafka │ MQTT │ Redis │ AMQP │ NATS           │   │
-│  └──┬──────┬──────┬──────┬──────┬──────┬───────────────┘   │
-└─────│──────│──────│──────│──────│───────────────────────────┘
-      ▼      ▼      ▼      ▼      ▼      ▼
-   Endpoints (HTTP APIs, Kafka topics, MQTT brokers, message buses, ...)
-```
-
-See the [Architecture](https://github.com/zeybek/ulak/wiki/Architecture) wiki page for the full technical deep-dive.
+See the [Configuration Reference](https://github.com/zeybek/ulak/wiki/Configuration-Reference) for the full GUC surface.
 
 ## Testing
 
+The repository includes:
+
+- **TAP tests** in [`t/`](/Users/ahmet/Code/ulak/t:1) for worker startup, reload, and stale recovery
+- **Regression tests** in [`tests/regress`](/Users/ahmet/Code/ulak/tests/regress:1)
+- **Isolation tests** in [`tests/isolation`](/Users/ahmet/Code/ulak/tests/isolation:1)
+- **End-to-end protocol tests** in [`tests/e2e`](/Users/ahmet/Code/ulak/tests/e2e:1)
+
+Run the core regression suite:
+
 ```bash
-# Regression and isolation tests
 docker exec ulak-postgres-1 bash -c \
   "cd /src/ulak && make installcheck"
-
-# Code quality
-make tools-install  # install clang-format, cppcheck, lefthook locally
-make tools-versions # print local tool versions
-make format    # clang-format
-make lint      # cppcheck
-make hooks-install  # install local git hooks (auto-installs lefthook via Homebrew or Go when available)
-make hooks-run      # run local pre-commit checks manually
 ```
 
-With `lefthook` installed, the `pre-commit` hook auto-formats staged C/H files under `src/` and `include/`, re-stages them, and then runs the remaining checks.
+For local code quality:
 
-CI uses `clang-format-22` and `clang-tidy-22`. For the closest local parity, install tools with `make tools-install` and verify with `make tools-versions`.
-
-Conventional commit headers are enforced locally through the `commit-msg` hook:
-
-```text
-feat(scope): subject
-fix: subject
-chore(ci)!: subject
+```bash
+make tools-install
+make tools-versions
+make format
+make lint
+make hooks-install
+make hooks-run
 ```
 
 ## Documentation
 
-Full documentation is available in the **[Wiki](https://github.com/zeybek/ulak/wiki)**.
+Full documentation lives in the **[Wiki](https://github.com/zeybek/ulak/wiki)**.
 
 | Category | Pages |
 |----------|-------|
-| **Getting Started** | [Quick Start](https://github.com/zeybek/ulak/wiki/Getting-Started) |
-| **Architecture** | [System Architecture](https://github.com/zeybek/ulak/wiki/Architecture) |
-| **Protocols** | [HTTP](https://github.com/zeybek/ulak/wiki/Protocol-HTTP) · [Kafka](https://github.com/zeybek/ulak/wiki/Protocol-Kafka) · [MQTT](https://github.com/zeybek/ulak/wiki/Protocol-MQTT) · [Redis](https://github.com/zeybek/ulak/wiki/Protocol-Redis) · [AMQP](https://github.com/zeybek/ulak/wiki/Protocol-AMQP) · [NATS](https://github.com/zeybek/ulak/wiki/Protocol-NATS) |
-| **Features** | [Pub/Sub Events](https://github.com/zeybek/ulak/wiki/Pub-Sub) · [Message Features](https://github.com/zeybek/ulak/wiki/Message-Features) |
-| **Operations** | [Reliability](https://github.com/zeybek/ulak/wiki/Reliability) · [Monitoring](https://github.com/zeybek/ulak/wiki/Monitoring) · [Security](https://github.com/zeybek/ulak/wiki/Security) |
-| **Reference** | [Configuration (57 GUCs)](https://github.com/zeybek/ulak/wiki/Configuration-Reference) · [SQL API (40+ Functions)](https://github.com/zeybek/ulak/wiki/SQL-API-Reference) |
-| **Development** | [Building & Testing](https://github.com/zeybek/ulak/wiki/Building-and-Testing) · [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) |
+| Getting Started | [Quick Start](https://github.com/zeybek/ulak/wiki/Getting-Started) |
+| Architecture | [System Architecture](https://github.com/zeybek/ulak/wiki/Architecture) |
+| Reliability | [Reliability](https://github.com/zeybek/ulak/wiki/Reliability) |
+| Monitoring | [Monitoring](https://github.com/zeybek/ulak/wiki/Monitoring) |
+| Security | [Security](https://github.com/zeybek/ulak/wiki/Security) |
+| Protocols | [HTTP](https://github.com/zeybek/ulak/wiki/Protocol-HTTP) · [Kafka](https://github.com/zeybek/ulak/wiki/Protocol-Kafka) · [MQTT](https://github.com/zeybek/ulak/wiki/Protocol-MQTT) · [Redis](https://github.com/zeybek/ulak/wiki/Protocol-Redis) · [AMQP](https://github.com/zeybek/ulak/wiki/Protocol-AMQP) · [NATS](https://github.com/zeybek/ulak/wiki/Protocol-NATS) |
+| API Reference | [SQL API](https://github.com/zeybek/ulak/wiki/SQL-API-Reference) · [Configuration](https://github.com/zeybek/ulak/wiki/Configuration-Reference) |
 
 ## License
 
-`ulak` is licensed under [Apache License 2.0](LICENSE.md).
-
-You may use, modify, and distribute the project in commercial and
-non-commercial settings under Apache 2.0.
+`ulak` is licensed under the [Apache License 2.0](LICENSE.md).
