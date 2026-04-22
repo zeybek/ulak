@@ -31,6 +31,8 @@
 #include "utils/retry_policy.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "worker/batch_types.h"
+#include "worker/circuit_breaker.h"
 #include "worker/dispatcher_cache.h"
 #include "worker/maintenance.h"
 
@@ -44,35 +46,6 @@
 
 static volatile sig_atomic_t got_sigterm = false;
 static volatile sig_atomic_t got_sighup = false;
-
-typedef struct {
-    int64 message_id;
-    int64 endpoint_id;
-    char *payload_str;
-    int32 retry_count;
-    Jsonb *retry_policy;
-    char *protocol; /* Copied from endpoint */
-    Jsonb *config;  /* Copied from endpoint */
-    bool processed;
-    bool success;
-    char *error_message;
-    /* Additional fields */
-    int16 priority;
-    TimestampTz scheduled_at;
-    TimestampTz expires_at;
-    char *correlation_id;
-    bool endpoint_enabled;
-    int32 endpoint_failure_count;
-    /* discrete circuit breaker fields (no jsonb) */
-    char circuit_state[16];
-    int32 circuit_failure_count;
-    TimestampTz circuit_opened_at;
-    TimestampTz circuit_half_open_at;
-    DispatchResult *result; /* Dispatch result for response capture */
-    Jsonb *headers;         /* Per-message headers */
-    Jsonb *metadata;        /* Per-message metadata */
-    bool rate_limited;      /* Deferred by rate limiter — skip dispatch */
-} MessageBatchInfo;
 
 /* Database name from GUC */
 static char worker_dbname[NAMEDATALEN] = "";
@@ -665,18 +638,8 @@ static int64 process_pending_messages_batch(void) {
                      */
                     if (all_messages[batch_start].circuit_half_open_at > 0 &&
                         GetCurrentTimestamp() >= all_messages[batch_start].circuit_half_open_at) {
-                        int cb_ret;
-
-                        /* Transition to half_open: use CAS-style UPDATE so exactly one
-                         * worker wins the transition. The WHERE clause ensures only one
-                         * UPDATE succeeds; others see SPI_processed == 0 and defer. */
-                        cb_ret = SPI_execute_with_args(
-                            "UPDATE ulak.endpoints SET circuit_state = 'half_open' "
-                            "WHERE id = $1 AND circuit_state = 'open'",
-                            1, (Oid[]){INT8OID}, (Datum[]){Int64GetDatum(current_endpoint_id)},
-                            NULL, false, 0);
-
-                        if (cb_ret != SPI_OK_UPDATE || SPI_processed == 0) {
+                        /* CAS-style transition: only one worker wins. Losers defer. */
+                        if (!cb_try_half_open_transition(current_endpoint_id)) {
                             /* Another worker already transitioned — defer like open */
                             uint64 m;
                             for (m = batch_start; m < (uint64)batch_end; m++) {
@@ -794,8 +757,6 @@ static int64 process_pending_messages_batch(void) {
                 static const char *success_response_query =
                     "UPDATE ulak.queue SET status = $1, last_error = NULL, "
                     "completed_at = NOW(), response = $2::jsonb WHERE id = $3";
-                static const char *cb_query_str = "SELECT ulak.update_circuit_breaker($1, $2)";
-
                 /* Batch collection arrays */
                 Datum *success_ids = palloc(sizeof(Datum) * total_messages);
                 int success_count = 0;
@@ -974,21 +935,8 @@ static int64 process_pending_messages_batch(void) {
                         /* Messages are ordered by endpoint_id, so track transitions */
                         if (all_messages[i].endpoint_id != last_ep_id) {
                             /* Flush previous endpoint's CB if any */
-                            if (last_ep_id >= 0) {
-                                Oid cb_argtypes[2] = {INT8OID, BOOLOID};
-                                Datum cb_values[2];
-                                char cb_nulls[2] = {' ', ' '};
-                                cb_values[0] = Int64GetDatum(last_ep_id);
-                                cb_values[1] = BoolGetDatum(last_ep_success);
-                                int cb_ret = SPI_execute_with_args(cb_query_str, 2, cb_argtypes,
-                                                                   cb_values, cb_nulls, false, 0);
-                                if (cb_ret != SPI_OK_SELECT) {
-                                    elog(WARNING,
-                                         "[ulak] Failed to update circuit breaker for endpoint "
-                                         "%lld: SPI error %d",
-                                         (long long)last_ep_id, cb_ret);
-                                }
-                            }
+                            if (last_ep_id >= 0)
+                                cb_update_after_dispatch(last_ep_id, last_ep_success);
                             last_ep_id = all_messages[i].endpoint_id;
                             last_ep_success = all_messages[i].success;
                         } else {
@@ -998,21 +946,8 @@ static int64 process_pending_messages_batch(void) {
                         }
                     }
                     /* Flush last endpoint */
-                    if (last_ep_id >= 0) {
-                        Oid cb_argtypes[2] = {INT8OID, BOOLOID};
-                        Datum cb_values[2];
-                        char cb_nulls[2] = {' ', ' '};
-                        cb_values[0] = Int64GetDatum(last_ep_id);
-                        cb_values[1] = BoolGetDatum(last_ep_success);
-                        int cb_ret = SPI_execute_with_args(cb_query_str, 2, cb_argtypes, cb_values,
-                                                           cb_nulls, false, 0);
-                        if (cb_ret != SPI_OK_SELECT) {
-                            elog(WARNING,
-                                 "[ulak] Failed to update circuit breaker for endpoint %lld: "
-                                 "SPI error %d",
-                                 (long long)last_ep_id, cb_ret);
-                        }
-                    }
+                    if (last_ep_id >= 0)
+                        cb_update_after_dispatch(last_ep_id, last_ep_success);
                 }
 
                 /* Phase 2: Execute batch UPDATEs */
