@@ -8,40 +8,24 @@
  */
 
 #include <unistd.h>
+
 #include "config/guc.h"
-#include "core/entities.h"
-#include "dispatchers/dispatcher.h"
-#include "lib/stringinfo.h"
 #include "shmem.h"
 #include "ulak.h"
 
-#include <curl/curl.h>
-#include "access/hash.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
+#include "executor/spi.h"
 #include "storage/ipc.h"
-#include "utils/array.h"
 #include "utils/builtins.h"
-#include "utils/hsearch.h"
-#include "utils/json_utils.h"
 #include "utils/memutils.h"
-#include "utils/numeric.h"
-#include "utils/rate_limit.h"
-#include "utils/retry_policy.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+
 #include "worker/batch_processor.h"
 #include "worker/dispatcher_cache.h"
 #include "worker/maintenance.h"
-
-#ifdef ENABLE_MQTT
-#include <mosquitto.h>
-#endif
-
-#ifdef ENABLE_KAFKA
-#include <librdkafka/rdkafka.h>
-#endif
 
 static volatile sig_atomic_t got_sigterm = false;
 static volatile sig_atomic_t got_sighup = false;
