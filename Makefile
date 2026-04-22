@@ -41,6 +41,7 @@ OBJS += src/utils/retry_policy.o
 OBJS += src/worker/dispatcher_cache.o
 OBJS += src/worker/maintenance.o
 OBJS += src/worker/circuit_breaker.o
+OBJS += src/worker/batch_processor.o
 
 # Conditional protocol objects
 ifdef ENABLE_KAFKA
