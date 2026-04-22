@@ -39,6 +39,7 @@ OBJS += src/utils/cloudevents.o
 OBJS += src/utils/rate_limit.o
 OBJS += src/utils/retry_policy.o
 OBJS += src/worker/dispatcher_cache.o
+OBJS += src/worker/maintenance.o
 
 # Conditional protocol objects
 ifdef ENABLE_KAFKA
