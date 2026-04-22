@@ -37,6 +37,7 @@ OBJS += src/utils/json_utils.o
 OBJS += src/utils/logging.o
 OBJS += src/utils/cloudevents.o
 OBJS += src/utils/rate_limit.o
+OBJS += src/utils/retry_policy.o
 
 # Conditional protocol objects
 ifdef ENABLE_KAFKA

@@ -28,6 +28,7 @@
 #include "utils/memutils.h"
 #include "utils/numeric.h"
 #include "utils/rate_limit.h"
+#include "utils/retry_policy.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
@@ -119,9 +120,6 @@ static Dispatcher *get_or_create_dispatcher(int64 endpoint_id, ProtocolType prot
 static void dispatcher_cache_exit_callback(int code, Datum arg);
 
 static int64 process_pending_messages_batch(void);
-static int get_max_retries_from_policy(Jsonb *retry_policy);
-static int calculate_exponential_backoff(int retry_count);
-static int calculate_delay_from_policy(Jsonb *retry_policy, int retry_count);
 static void process_endpoint_batch(MessageBatchInfo *messages, int count, const char *protocol,
                                    Jsonb *config, Jsonb *retry_policy);
 static void ulak_worker_loop(void);
@@ -1199,135 +1197,6 @@ static int64 process_pending_messages_batch(void) {
         worker_batch_context = NULL;
 
         return messages_processed;
-    }
-}
-
-/**
- * @brief Extract max retries from retry policy.
- * @private
- *
- * Falls back to ulak_default_max_retries GUC if policy is NULL or
- * does not contain a valid max_retries field.
- *
- * @param retry_policy Retry policy JSONB, or NULL.
- * @return Maximum number of retries.
- */
-static int get_max_retries_from_policy(Jsonb *retry_policy) {
-    JsonbValue max_retries_val;
-    int max_retries;
-
-    /* Default max retries if no policy specified */
-    if (!retry_policy)
-        return ulak_default_max_retries;
-
-    /* Parse retry_policy JSON to extract max_retries */
-    if (extract_jsonb_value(retry_policy, "max_retries", &max_retries_val)) {
-        if (max_retries_val.type == jbvNumeric) {
-            max_retries = DatumGetInt32(
-                DirectFunctionCall1(numeric_int4, NumericGetDatum(max_retries_val.val.numeric)));
-            if (max_retries > 0)
-                return max_retries;
-        }
-    }
-
-    /* Fallback to default */
-    return ulak_default_max_retries;
-}
-
-/**
- * @brief Extract backoff type from retry policy.
- * @private
- *
- * Returns a static string constant -- no memory allocation, no leak possible.
- *
- * @param retry_policy Retry policy JSONB, or NULL.
- * @return One of "exponential", "fixed", or "linear".
- */
-static const char *get_backoff_type_from_policy(Jsonb *retry_policy) {
-    JsonbValue backoff_val;
-
-    /* Default backoff type if no policy specified */
-    if (!retry_policy)
-        return "exponential";
-
-    /* Parse retry_policy JSON to extract backoff type */
-    if (extract_jsonb_value(retry_policy, "backoff", &backoff_val)) {
-        if (backoff_val.type == jbvString) {
-            /* Compare against known backoff types and return static string */
-            if (backoff_val.val.string.len == 5 &&
-                strncmp(backoff_val.val.string.val, "fixed", 5) == 0) {
-                return "fixed";
-            } else if (backoff_val.val.string.len == 6 &&
-                       strncmp(backoff_val.val.string.val, "linear", 6) == 0) {
-                return "linear";
-            }
-            /* Unknown backoff type - fall through to default */
-        }
-    }
-
-    return "exponential"; /* Default */
-}
-
-/**
- * @brief Calculate delay for exponential backoff.
- * @private
- *
- * Uses configurable GUC values: ulak.retry_base_delay, retry_max_delay.
- * Includes overflow protection for large retry counts.
- *
- * @param retry_count Current retry attempt number.
- * @return Delay in seconds, capped at ulak_retry_max_delay.
- */
-static int calculate_exponential_backoff(int retry_count) {
-    int multiplier;
-    int delay;
-
-    /* Simple exponential backoff: base_delay * 2^retry_count */
-    /* Max delay capped at ulak_retry_max_delay */
-
-    /* Overflow protection: cap retry_count to prevent overflow */
-    if (retry_count > MAX_RETRY_COUNT_FOR_EXPONENTIAL)
-        return ulak_retry_max_delay;
-
-    multiplier = (1 << retry_count); /* 2^retry_count */
-    delay = ulak_retry_base_delay * multiplier;
-
-    /* Check for overflow (delay should be >= base_delay) */
-    if (delay < ulak_retry_base_delay)
-        return ulak_retry_max_delay;
-
-    return (delay > ulak_retry_max_delay) ? ulak_retry_max_delay : delay;
-}
-
-/**
- * @brief Calculate retry delay based on retry policy.
- * @private
- *
- * Supports fixed, linear, and exponential backoff strategies.
- * Uses configurable GUC values for defaults.
- *
- * @param retry_policy Retry policy JSONB, or NULL for default exponential.
- * @param retry_count  Current retry attempt number.
- * @return Delay in seconds.
- */
-static int calculate_delay_from_policy(Jsonb *retry_policy, int retry_count) {
-    const char *backoff_type = get_backoff_type_from_policy(retry_policy);
-
-    if (strcmp(backoff_type, "fixed") == 0) {
-        /* Fixed delay - use base_delay as fixed value */
-        JsonbValue delay_val;
-        if (extract_jsonb_value(retry_policy, "delay", &delay_val) &&
-            delay_val.type == jbvNumeric) {
-            return ulak_retry_base_delay;
-        }
-        return ulak_retry_base_delay;
-    } else if (strcmp(backoff_type, "linear") == 0) {
-        /* Linear backoff: base_delay + (retry_count * increment) */
-        int delay = ulak_retry_base_delay + (retry_count * ulak_retry_increment);
-        return (delay > ulak_retry_max_delay) ? ulak_retry_max_delay : delay;
-    } else {
-        /* Exponential backoff (default) */
-        return calculate_exponential_backoff(retry_count);
     }
 }
 
