@@ -31,6 +31,7 @@
 #include "utils/retry_policy.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "worker/dispatcher_cache.h"
 
 #ifdef ENABLE_MQTT
 #include <mosquitto.h>
@@ -83,41 +84,8 @@ static Oid worker_dboid = InvalidOid;
 static int worker_id = 0;     /* This worker's ID (0 to total_workers-1) */
 static int total_workers = 1; /* Total number of workers for this database */
 
-/**
- * @brief Dispatcher connection pool -- caches dispatchers across batch cycles.
- *
- * Pattern: pg_net (Supabase) dedicated MemoryContext for bulk cleanup.
- * Ref: libcurl docs (curl.se), everything.curl.dev/libcurl/caches.html
- *
- * Each worker process has its own cache (no locking needed -- fork-based).
- * curl_multi handles retain connection pool, DNS cache, TLS session cache
- * across batches. Stale dispatchers evicted by idle timeout.
- */
-static MemoryContext DispatcherCacheContext = NULL;
-
-typedef struct DispatcherCacheEntry {
-    int64 endpoint_id;      /* hash key (must be first field for HASH_BLOBS) */
-    Dispatcher *dispatcher; /* cached dispatcher instance */
-    uint32 config_hash;     /* hash_any() of Jsonb binary for invalidation */
-    TimestampTz last_used;  /* timestamp for idle eviction */
-} DispatcherCacheEntry;
-
-static HTAB *dispatcher_cache = NULL;
-
-/* Eviction: check every 60 seconds, evict dispatchers idle for 60 seconds */
-#define DISPATCHER_EVICT_INTERVAL_MS 60000L
-#define DISPATCHER_IDLE_TIMEOUT_MS 60000L
-static TimestampTz last_eviction_check = 0;
-
 /* Saved reference for PG_CATCH cleanup of orphaned batch context */
 static MemoryContext worker_batch_context = NULL;
-
-static void dispatcher_cache_init(void);
-static void dispatcher_cache_destroy(void);
-static void dispatcher_cache_evict_stale(void);
-static Dispatcher *get_or_create_dispatcher(int64 endpoint_id, ProtocolType proto_type,
-                                            Jsonb *config);
-static void dispatcher_cache_exit_callback(int code, Datum arg);
 
 static int64 process_pending_messages_batch(void);
 static void process_endpoint_batch(MessageBatchInfo *messages, int count, const char *protocol,
@@ -1199,179 +1167,6 @@ static int64 process_pending_messages_batch(void) {
         return messages_processed;
     }
 }
-
-/** @name Dispatcher Connection Pool
- *
- * Caches dispatchers across batch cycles to enable TCP/TLS connection reuse.
- * curl_multi handles retain connection pool, DNS cache, and TLS session cache.
- * Config changes detected via hash_any() on Jsonb binary representation.
- * Stale entries evicted by idle timeout (DISPATCHER_IDLE_TIMEOUT_MS).
- * Guaranteed cleanup via before_shmem_exit hook.
- * @{ */
-
-/**
- * @brief Initialize the dispatcher cache hash table and memory context.
- * @private
- */
-static void dispatcher_cache_init(void) {
-    HASHCTL ctl;
-
-    DispatcherCacheContext =
-        AllocSetContextCreate(TopMemoryContext, "ulak dispatcher cache", ALLOCSET_DEFAULT_SIZES);
-
-    memset(&ctl, 0, sizeof(ctl));
-    ctl.keysize = sizeof(int64);
-    ctl.entrysize = sizeof(DispatcherCacheEntry);
-    ctl.hcxt = DispatcherCacheContext;
-    dispatcher_cache =
-        hash_create("ulak dispatcher cache", 16, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-    last_eviction_check = GetCurrentTimestamp();
-}
-
-/**
- * @brief Destroy the dispatcher cache, freeing all cached dispatchers.
- * @private
- *
- * Iterates all entries, calls dispatcher_free() on each, then destroys
- * the hash table and its memory context.
- */
-static void dispatcher_cache_destroy(void) {
-    HASH_SEQ_STATUS status;
-    DispatcherCacheEntry *entry;
-
-    if (!dispatcher_cache)
-        return;
-
-    /* dispatcher_free() cleans up curl handles (libcurl-managed, non-palloc) */
-    hash_seq_init(&status, dispatcher_cache);
-    while ((entry = hash_seq_search(&status)) != NULL) {
-        if (entry->dispatcher) {
-            dispatcher_free(entry->dispatcher);
-            entry->dispatcher = NULL;
-        }
-    }
-
-    hash_destroy(dispatcher_cache);
-    dispatcher_cache = NULL;
-
-    if (DispatcherCacheContext) {
-        MemoryContextDelete(DispatcherCacheContext);
-        DispatcherCacheContext = NULL;
-    }
-}
-
-/**
- * @brief Evict idle dispatchers from the cache.
- * @private
- *
- * Removes entries that have been idle longer than DISPATCHER_IDLE_TIMEOUT_MS.
- */
-static void dispatcher_cache_evict_stale(void) {
-    HASH_SEQ_STATUS status;
-    DispatcherCacheEntry *entry;
-    TimestampTz now = GetCurrentTimestamp();
-    int evicted = 0;
-
-    if (!dispatcher_cache)
-        return;
-
-    hash_seq_init(&status, dispatcher_cache);
-    while ((entry = hash_seq_search(&status)) != NULL) {
-        if (TimestampDifferenceExceeds(entry->last_used, now, DISPATCHER_IDLE_TIMEOUT_MS)) {
-            if (entry->dispatcher) {
-                dispatcher_free(entry->dispatcher);
-                entry->dispatcher = NULL;
-            }
-            /* Safe: dynahash allows removing the current entry during hash_seq_search */
-            hash_search(dispatcher_cache, &entry->endpoint_id, HASH_REMOVE, NULL);
-            evicted++;
-        }
-    }
-
-    if (evicted > 0)
-        elog(DEBUG1, "[ulak] Evicted %d stale dispatchers from cache", evicted);
-
-    last_eviction_check = now;
-}
-
-/**
- * @brief Return a cached or newly created dispatcher for an endpoint.
- * @private
- *
- * Config invalidation: hash_any() on Jsonb binary. Different binary
- * representation (e.g. key reordering) causes harmless false invalidation.
- * Connection lifecycle managed by libcurl: MAXAGE_CONN (118s idle),
- * dead connection auto-detection, transparent retry on reused connection.
- *
- * @param endpoint_id Endpoint ID (hash key).
- * @param proto_type  Protocol type enum.
- * @param config      Endpoint configuration JSONB.
- * @return Cached or new Dispatcher, or NULL on creation failure.
- */
-static Dispatcher *get_or_create_dispatcher(int64 endpoint_id, ProtocolType proto_type,
-                                            Jsonb *config) {
-    DispatcherCacheEntry *entry;
-    bool found;
-    uint32 config_hash;
-    MemoryContext old_ctx;
-
-    /* Periodic stale eviction — time-based, not iteration-based */
-    if (TimestampDifferenceExceeds(last_eviction_check, GetCurrentTimestamp(),
-                                   DISPATCHER_EVICT_INTERVAL_MS))
-        dispatcher_cache_evict_stale();
-
-    config_hash = hash_any((unsigned char *)config, VARSIZE(config));
-
-    entry = hash_search(dispatcher_cache, &endpoint_id, HASH_ENTER, &found);
-
-    if (found && entry->dispatcher) {
-        if (entry->config_hash == config_hash) {
-            /* Cache hit — reuse dispatcher (connection pool preserved) */
-            entry->last_used = GetCurrentTimestamp();
-            return entry->dispatcher;
-        }
-        /* Config changed — destroy old dispatcher, create new one */
-        elog(DEBUG1, "[ulak] Config changed for endpoint %lld, recreating dispatcher",
-             (long long)endpoint_id);
-        dispatcher_free(entry->dispatcher);
-        entry->dispatcher = NULL;
-    }
-
-    /* Create new dispatcher in DispatcherCacheContext (survives batch_context deletion).
-     * CRITICAL: Deep-copy config Jsonb because dispatcher stores pointers into it
-     * (Dispatcher.config and HttpDispatcher.headers point INTO the Jsonb).
-     * The original config lives in batch_context which is freed after each batch. */
-    old_ctx = MemoryContextSwitchTo(DispatcherCacheContext);
-    {
-        Jsonb *config_copy = (Jsonb *)palloc(VARSIZE(config));
-        memcpy(config_copy, config, VARSIZE(config));
-
-        entry->dispatcher = dispatcher_create(proto_type, config_copy);
-        entry->config_hash = config_hash;
-        entry->last_used = GetCurrentTimestamp();
-        entry->endpoint_id = endpoint_id;
-    }
-    MemoryContextSwitchTo(old_ctx);
-
-    if (!entry->dispatcher) {
-        hash_search(dispatcher_cache, &endpoint_id, HASH_REMOVE, NULL);
-        return NULL;
-    }
-
-    elog(DEBUG1, "[ulak] Created and cached dispatcher for endpoint %lld", (long long)endpoint_id);
-    return entry->dispatcher;
-}
-
-/**
- * @brief before_shmem_exit callback -- guaranteed cleanup on worker exit.
- * @private
- *
- * @param code Exit code (unused).
- * @param arg  Callback argument (unused).
- */
-static void dispatcher_cache_exit_callback(int code, Datum arg) { dispatcher_cache_destroy(); }
-
-/** @} */
 
 /**
  * @brief Process a batch of messages for a single endpoint.
