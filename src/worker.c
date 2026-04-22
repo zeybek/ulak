@@ -136,7 +136,6 @@ PGDLLEXPORT void ulak_worker_main(Datum main_arg) {
     proc_exit(0);
 }
 
-
 /**
  * @brief Main worker loop.
  * @private
