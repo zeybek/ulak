@@ -1,12 +1,13 @@
 name: Publish Docker Images
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.0.1)"
+        description: "Release tag (e.g. v0.0.1) — used for backfill/manual publish"
         required: true
 
 env:
@@ -21,7 +22,6 @@ jobs:
   publish:
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         pg: [18, 17, 16, 15, 14]
     name: PG ${{ matrix.pg }}
@@ -41,25 +41,51 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version from release tag
+      - name: Extract version from tag or input
         id: version
         run: |
-          VERSION="${{ github.event.release.tag_name }}"
+          # workflow_dispatch input takes precedence; tag-push uses GITHUB_REF_NAME
+          if [ -n "${{ inputs.tag }}" ]; then
+            VERSION="${{ inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF_NAME}"
+          fi
           VERSION="${VERSION#v}"
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from inputs.tag or GITHUB_REF_NAME"
+            exit 1
+          fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building version: ${VERSION}"
+
+      - name: Check out ref at requested tag
+        if: ${{ inputs.tag != '' }}
+        run: |
+          # For workflow_dispatch backfill: checkout the requested tag so the
+          # Dockerfile build context matches that release.
+          git fetch --tags --depth=1 origin "refs/tags/${{ inputs.tag }}:refs/tags/${{ inputs.tag }}"
+          git checkout "${{ inputs.tag }}"
+
+      - name: Compute short version (major.minor)
+        id: shortver
+        run: |
+          # 0.1.2 → 0.1 ; non-semver inputs fall back to full version
+          FULL="${{ steps.version.outputs.version }}"
+          SHORT="$(echo "$FULL" | awk -F. '{ if (NF >= 2) print $1"."$2; else print $0 }')"
+          echo "value=${SHORT}" >> "$GITHUB_OUTPUT"
 
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Use raw tags so workflow_dispatch (no github.ref tag) also gets
+          # version-suffixed images — type=semver only fires on tag pushes.
           tags: |
-            # v1.2.3 tag → 1.2.3-pg18, pg18, latest (only for PG 18)
-            type=semver,pattern={{version}},suffix=-pg${{ matrix.pg }}
-            type=semver,pattern={{major}}.{{minor}},suffix=-pg${{ matrix.pg }}
-            type=raw,value=pg${{ matrix.pg }}
-            type=raw,value=latest,enable=${{ matrix.pg == 18 }}
+            type=raw,value=${{ steps.version.outputs.version }}-pg${{ matrix.pg }}
+            type=raw,value=${{ steps.shortver.outputs.value }}-pg${{ matrix.pg }}
+            type=raw,value=pg${{ matrix.pg }},enable=${{ github.event_name == 'push' }}
+            type=raw,value=latest,enable=${{ matrix.pg == 18 && github.event_name == 'push' }}
           labels: |
             org.opencontainers.image.title=ulak
             org.opencontainers.image.description=PostgreSQL ${{ matrix.pg }} with ulak extension
@@ -82,13 +108,27 @@ jobs:
     needs: publish
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         pg: [18, 17, 16, 15, 14]
     name: Verify PG ${{ matrix.pg }}
     steps:
+      - name: Determine image tag to verify
+        id: tag
+        run: |
+          # Tag-push: pg<N> is updated atomically, prefer that.
+          # workflow_dispatch backfill: pull the version-suffixed tag instead.
+          if [ -n "${{ inputs.tag }}" ]; then
+            VERSION="${{ inputs.tag }}"
+            VERSION="${VERSION#v}"
+            echo "value=${VERSION}-pg${{ matrix.pg }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=pg${{ matrix.pg }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Pull and test image
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:pg${{ matrix.pg }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.value }}"
           docker pull "$IMAGE"
 
           # Start container
