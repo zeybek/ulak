@@ -1,0 +1,40 @@
+Parsed test spec with 2 sessions
+
+starting permutation: w0_fetch w1_fetch w0_commit w1_commit
+step w0_fetch: 
+    -- Lock then count via CTE (FOR UPDATE not allowed with aggregates).
+    WITH locked AS (
+        SELECT q.id
+        FROM ulak.queue q
+        WHERE q.status = 'pending'
+          AND ((CASE WHEN q.ordering_key IS NULL THEN q.id
+                     ELSE abs(hashtext(q.ordering_key))::bigint
+                END) % 2) = 0
+        FOR UPDATE OF q SKIP LOCKED
+    )
+    SELECT count(*) AS fetched FROM locked;
+
+fetched
+-------
+      5
+(1 row)
+
+step w1_fetch: 
+    WITH locked AS (
+        SELECT q.id
+        FROM ulak.queue q
+        WHERE q.status = 'pending'
+          AND ((CASE WHEN q.ordering_key IS NULL THEN q.id
+                     ELSE abs(hashtext(q.ordering_key))::bigint
+                END) % 2) = 1
+        FOR UPDATE OF q SKIP LOCKED
+    )
+    SELECT count(*) AS fetched FROM locked;
+
+fetched
+-------
+      0
+(1 row)
+
+step w0_commit: COMMIT;
+step w1_commit: COMMIT;

@@ -460,7 +460,15 @@ int64 batch_processor_run(Oid worker_dboid, int worker_id, int total_workers) {
                              "               WHERE q2.ordering_key = q.ordering_key "
                              "                 AND q2.status = 'pending' "
                              "                 AND q2.id < q.id))) "
-                             "  AND (q.id %% %d) = %d " /* Modulo partitioning */
+                             /*
+                              * Hash-partition by ordering_key when set so all
+                              * messages sharing a key route to the same worker;
+                              * id-based fallback preserves balance for unkeyed
+                              * messages. Required for per-key FIFO under N>1.
+                              */
+                             "  AND ((CASE WHEN q.ordering_key IS NULL THEN q.id "
+                             "             ELSE abs(hashtext(q.ordering_key))::bigint "
+                             "        END) %% %d) = %d "
                              "ORDER BY q.priority DESC, q.endpoint_id, q.created_at ASC "
                              "LIMIT %d FOR UPDATE OF q SKIP LOCKED",
                              STATUS_PENDING, total_workers, worker_id, ulak_batch_size);

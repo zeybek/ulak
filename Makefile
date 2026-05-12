@@ -213,7 +213,8 @@ REGRESS = 00_setup 01_schema 02_endpoints_crud 03_endpoints_validation \
 REGRESS_OPTS = --inputdir=tests/regress --outputdir=tests/regress --dbname=ulak_test
 
 # Isolation tests for concurrency scenarios (FOR UPDATE SKIP LOCKED, circuit breaker, ordering)
-ISOLATION = skip_locked modulo_partition ordering_key circuit_breaker batch_mark_processing \
+ISOLATION = skip_locked modulo_partition ordering_key ordering_key_partition \
+            circuit_breaker batch_mark_processing \
             circuit_breaker_threshold circuit_breaker_recovery ordering_key_completion \
             retry_visibility priority_contention idempotency_conflict dlq_concurrent_redrive
 ISOLATION_OPTS = --inputdir=tests/isolation --outputdir=tests/isolation --dbname=ulak_test

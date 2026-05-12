@@ -76,3 +76,10 @@ tmp_check_iso/
 # Static analysis output
 /tmp/clang-tidy-output.txt
 
+TODO.md
+
+# Claude Code — per-user overrides (project-level settings.json is committed)
+.claude
+CLAUDE.md
+scripts/validate-claude-setup.sh
+docs/
