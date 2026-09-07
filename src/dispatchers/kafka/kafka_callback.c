@@ -54,7 +54,8 @@ const char *kafka_classify_error(rd_kafka_resp_err_t err) {
  */
 void kafka_delivery_report(rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, void *opaque) {
     KafkaDispatcher *kafka_dispatcher = (KafkaDispatcher *)opaque;
-    intptr_t index;
+    uintptr_t raw;
+    int index;
     int pending_count;
     KafkaPendingMessage *pm;
     const char *err_str;
@@ -67,8 +68,10 @@ void kafka_delivery_report(rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, 
         return;
     }
 
-    /* Check if this is a batch mode message (has valid index in _private) */
-    index = (intptr_t)rkmessage->_private;
+    /* Batch-mode messages carry a generation-stamped slot index in _private;
+     * synchronous dispatch passes NULL (raw == 0). */
+    raw = (uintptr_t)rkmessage->_private;
+    index = (raw != 0) ? KAFKA_OPAQUE_INDEX(raw) : -1;
 
     /*
      * Thread safety: Acquire spinlock before accessing ANY shared state.
@@ -80,8 +83,21 @@ void kafka_delivery_report(rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, 
 
     pending_count = kafka_dispatcher->pending_count;
 
-    if (index >= 0 && index < pending_count && kafka_dispatcher->pending_messages != NULL) {
-        /* Batch mode - update specific message status */
+    if (raw != 0 && KAFKA_OPAQUE_GENERATION(raw) != kafka_dispatcher->batch_generation) {
+        /* Stale report from an earlier batch (flush already timed out and the
+         * slot may have been reused). Ignore it — the message was reported as
+         * failed/retryable when its own flush ended. */
+        SpinLockRelease(&kafka_dispatcher->pending_lock);
+        return;
+    }
+
+    if (raw != 0) {
+        /* Batch mode - update the specific slot; never fall through to the
+         * single-message fields, which belong to the synchronous path only. */
+        if (index < 0 || index >= pending_count || kafka_dispatcher->pending_messages == NULL) {
+            SpinLockRelease(&kafka_dispatcher->pending_lock);
+            return;
+        }
         pm = &kafka_dispatcher->pending_messages[index];
         pm->delivered = true;
         pm->success = (rkmessage->err == RD_KAFKA_RESP_ERR_NO_ERROR);

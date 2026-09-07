@@ -14,6 +14,7 @@
 #include "storage/spin.h"
 #include "utils/json_utils.h"
 #include "utils/logging.h"
+#include "utils/memutils.h"
 
 /* ============================================================================
  * Headers Helpers
@@ -66,12 +67,56 @@ static void kafka_add_jsonb_headers(rd_kafka_headers_t *hdrs, Jsonb *jsonb) {
 
 /**
  * @private
+ * @brief Add headers from a flat JSONB object ({"key": "value", ...}).
+ *
+ * This is the shape of ulak.queue.headers (per-message headers), which is NOT
+ * wrapped in a "headers" key like the endpoint config is. Only string values
+ * are forwarded; nested values are skipped.
+ *
+ * @param hdrs rd_kafka_headers to populate
+ * @param jsonb Flat JSONB object of header key/value pairs
+ */
+static void kafka_add_flat_headers(rd_kafka_headers_t *hdrs, Jsonb *jsonb) {
+    JsonbIterator *it;
+    JsonbValue v;
+    JsonbIteratorToken tok;
+    char *current_key = NULL;
+
+    if (!jsonb || !hdrs)
+        return;
+
+    it = JsonbIteratorInit(&jsonb->root);
+
+    while ((tok = JsonbIteratorNext(&it, &v, true)) != WJB_DONE) {
+        if (tok == WJB_KEY && v.type == jbvString) {
+            if (current_key)
+                pfree(current_key);
+            current_key = pnstrdup(v.val.string.val, v.val.string.len);
+        } else if (tok == WJB_VALUE && current_key) {
+            if (v.type == jbvString) {
+                char *val = pnstrdup(v.val.string.val, v.val.string.len);
+                /* rd_kafka_header_add() replaces an existing header with the same
+                 * name only when rd_kafka_header_remove() is called first. */
+                rd_kafka_header_remove(hdrs, current_key);
+                rd_kafka_header_add(hdrs, current_key, -1, val, strlen(val));
+                pfree(val);
+            }
+            pfree(current_key);
+            current_key = NULL;
+        }
+    }
+    if (current_key)
+        pfree(current_key);
+}
+
+/**
+ * @private
  * @brief Build rd_kafka_headers from static endpoint headers and per-message headers.
  *
  * Per-message headers override static headers with the same key.
  *
  * @param kd Kafka dispatcher with static_headers config
- * @param per_msg_headers Per-message JSONB headers, or NULL
+ * @param per_msg_headers Per-message JSONB headers (flat object), or NULL
  * @return Populated rd_kafka_headers (never NULL)
  */
 static rd_kafka_headers_t *kafka_build_headers(KafkaDispatcher *kd, Jsonb *per_msg_headers) {
@@ -81,14 +126,14 @@ static rd_kafka_headers_t *kafka_build_headers(KafkaDispatcher *kd, Jsonb *per_m
      * RD_KAFKA_V_HEADERS(NULL) causes segfault in rd_kafka_producev. */
     hdrs = rd_kafka_headers_new(8);
 
-    /* Static headers from endpoint config */
+    /* Static headers from endpoint config (nested under "headers") */
     if (kd->static_headers) {
         kafka_add_jsonb_headers(hdrs, kd->static_headers);
     }
 
-    /* Per-message headers override static ones */
+    /* Per-message headers (flat object) override static ones */
     if (per_msg_headers) {
-        kafka_add_jsonb_headers(hdrs, per_msg_headers);
+        kafka_add_flat_headers(hdrs, per_msg_headers);
     }
 
     return hdrs;
@@ -261,9 +306,25 @@ static bool kafka_ensure_batch_capacity(KafkaDispatcher *kd, char **error_msg) {
     if (current_count < current_capacity)
         return true;
 
-    /* Need to grow - allocate new array OUTSIDE the lock */
+    /* Need to grow - allocate new array OUTSIDE the lock.
+     *
+     * CRITICAL: allocate in the memory context that owns the current array
+     * (the worker's dispatcher cache context). CurrentMemoryContext at this
+     * point is the per-batch SPI context, which is destroyed after every batch;
+     * a plain palloc() here would leave kd->pending_messages dangling for the
+     * next batch (use-after-free). */
     new_capacity = current_capacity * 2;
-    new_array = palloc(sizeof(KafkaPendingMessage) * new_capacity);
+    if (new_capacity > KAFKA_OPAQUE_MAX_INDEX + 1)
+        new_capacity = KAFKA_OPAQUE_MAX_INDEX + 1;
+    if (new_capacity <= current_capacity) {
+        if (error_msg)
+            *error_msg =
+                pstrdup(ERROR_PREFIX_RETRYABLE
+                        " Kafka batch capacity limit reached, flush before producing more");
+        return false;
+    }
+    new_array = MemoryContextAlloc(GetMemoryChunkContext(kd->pending_messages),
+                                   sizeof(KafkaPendingMessage) * new_capacity);
 
     /* Copy and swap under lock */
     SpinLockAcquire(&kd->pending_lock);
@@ -308,6 +369,7 @@ bool kafka_dispatcher_produce(Dispatcher *dispatcher, const char *payload, int64
                               char **error_msg) {
     KafkaDispatcher *kafka_dispatcher;
     int index;
+    uint32 generation;
     KafkaPendingMessage *pm;
     rd_kafka_resp_err_t err;
     const char *prefix;
@@ -339,6 +401,7 @@ bool kafka_dispatcher_produce(Dispatcher *dispatcher, const char *payload, int64
     }
 
     index = kafka_dispatcher->pending_count;
+    generation = kafka_dispatcher->batch_generation;
     pm = &kafka_dispatcher->pending_messages[index];
     pm->msg_id = msg_id;
     pm->delivered = false;
@@ -357,7 +420,8 @@ bool kafka_dispatcher_produce(Dispatcher *dispatcher, const char *payload, int64
     {
         rd_kafka_headers_t *hdrs = kafka_build_headers(kafka_dispatcher, NULL);
 
-        /* Produce message using rd_kafka_producev - pass index as opaque for callback */
+        /* Produce message using rd_kafka_producev - pass generation-stamped
+         * slot index as opaque for the delivery callback */
         err = rd_kafka_producev(
             kafka_dispatcher->producer, RD_KAFKA_V_TOPIC(kafka_dispatcher->topic),
             RD_KAFKA_V_PARTITION(kafka_dispatcher->partition),
@@ -365,7 +429,8 @@ bool kafka_dispatcher_produce(Dispatcher *dispatcher, const char *payload, int64
             RD_KAFKA_V_VALUE((void *)payload, strlen(payload)),
             RD_KAFKA_V_KEY(kafka_dispatcher->key,
                            kafka_dispatcher->key ? strlen(kafka_dispatcher->key) : 0),
-            RD_KAFKA_V_HEADERS(hdrs), RD_KAFKA_V_OPAQUE((void *)(intptr_t)index), RD_KAFKA_V_END);
+            RD_KAFKA_V_HEADERS(hdrs), RD_KAFKA_V_OPAQUE(KAFKA_OPAQUE_ENCODE(generation, index)),
+            RD_KAFKA_V_END);
 
         if (err) {
             /* On failure we still own headers */
@@ -499,8 +564,11 @@ int kafka_dispatcher_flush(Dispatcher *dispatcher, int timeout_ms, int64 **faile
          */
         success_count = pending - fail_count;
 
-        /* Reset pending count for next batch while still under lock */
+        /* Reset pending count for next batch while still under lock, and bump
+         * the generation so late delivery reports for THIS batch (e.g. after a
+         * flush timeout) cannot be mistaken for reports of the next batch. */
         kafka_dispatcher->pending_count = 0;
+        kafka_dispatcher->batch_generation++;
 
         if (fail_count > 0 && failed_ids && failed_count) {
             /*
@@ -744,6 +812,7 @@ bool kafka_dispatcher_produce_ex(Dispatcher *dispatcher, const char *payload, in
                                  Jsonb *headers, Jsonb *metadata, char **error_msg) {
     KafkaDispatcher *kafka_dispatcher;
     int index;
+    uint32 generation;
     KafkaPendingMessage *pm;
     rd_kafka_resp_err_t err;
     const char *prefix;
@@ -792,6 +861,7 @@ bool kafka_dispatcher_produce_ex(Dispatcher *dispatcher, const char *payload, in
     }
 
     index = kafka_dispatcher->pending_count;
+    generation = kafka_dispatcher->batch_generation;
     pm = &kafka_dispatcher->pending_messages[index];
     pm->msg_id = msg_id;
     pm->delivered = false;
@@ -813,7 +883,8 @@ bool kafka_dispatcher_produce_ex(Dispatcher *dispatcher, const char *payload, in
         kafka_dispatcher->producer, RD_KAFKA_V_TOPIC(kafka_dispatcher->topic),
         RD_KAFKA_V_PARTITION(kafka_dispatcher->partition), RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
         RD_KAFKA_V_VALUE((void *)payload, strlen(payload)), RD_KAFKA_V_KEY(msg_key, msg_key_len),
-        RD_KAFKA_V_HEADERS(hdrs), RD_KAFKA_V_OPAQUE((void *)(intptr_t)index), RD_KAFKA_V_END);
+        RD_KAFKA_V_HEADERS(hdrs), RD_KAFKA_V_OPAQUE(KAFKA_OPAQUE_ENCODE(generation, index)),
+        RD_KAFKA_V_END);
 
     if (err) {
         /* On failure we still own the headers */

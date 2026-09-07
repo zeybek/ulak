@@ -21,6 +21,21 @@
 #define KAFKA_PENDING_INITIAL_CAPACITY 64 /**< Initial capacity for pending messages array. */
 #define KAFKA_ERROR_BUFFER_SIZE 256 /**< Maximum error message length for thread-safe storage. */
 
+/*
+ * Opaque encoding for batch delivery reports. The high bits carry the batch
+ * generation and the low 16 bits carry (index + 1), so that a NULL opaque
+ * (value 0) always means "synchronous dispatch, no batch slot". The generation
+ * lets the delivery callback discard reports that belong to an earlier batch
+ * (e.g. a report that arrives after flush timed out and the slot was reused).
+ */
+#define KAFKA_OPAQUE_INDEX_BITS 16
+#define KAFKA_OPAQUE_MAX_INDEX ((1 << KAFKA_OPAQUE_INDEX_BITS) - 2)
+#define KAFKA_OPAQUE_ENCODE(gen, idx)                                                              \
+    ((void *)(uintptr_t)((((uintptr_t)(gen)) << KAFKA_OPAQUE_INDEX_BITS) | ((uintptr_t)(idx) + 1)))
+#define KAFKA_OPAQUE_GENERATION(raw) ((uint32)((uintptr_t)(raw) >> KAFKA_OPAQUE_INDEX_BITS))
+#define KAFKA_OPAQUE_INDEX(raw)                                                                    \
+    ((int)(((uintptr_t)(raw)) & ((1 << KAFKA_OPAQUE_INDEX_BITS) - 1)) - 1)
+
 /** @brief Tracks a single in-flight message during batch produce/flush. */
 typedef struct KafkaPendingMessage {
     int64 msg_id;                        /**< PostgreSQL queue row ID. */
@@ -72,6 +87,7 @@ typedef struct KafkaDispatcher {
     volatile int
         pending_count;    /**< Current number of pending messages (volatile for thread safety). */
     int pending_capacity; /**< Allocated capacity of pending array. */
+    uint32 batch_generation; /**< Incremented on every flush; stamps produce() opaques. */
     /** @} */
 
     /** @name Thread safety */
