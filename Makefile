@@ -83,7 +83,7 @@ ifdef ENABLE_NATS
     OBJS += src/dispatchers/nats/nats_callback.o
     OBJS += src/dispatchers/nats/nats_delivery.o
     PG_CPPFLAGS += -DENABLE_NATS
-    SHLIB_LINK += -lnats
+    SHLIB_LINK += -lnats -lpthread
 endif
 
 # External libraries - HTTP always enabled

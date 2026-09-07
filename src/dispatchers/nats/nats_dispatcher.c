@@ -105,6 +105,10 @@ static void nats_dispatcher_cleanup(Dispatcher *self) {
         pfree(nats->tls_cert);
 
     /* Free batch tracking */
+    if (nats->pending_lock_initialized) {
+        pthread_mutex_destroy(&nats->pending_lock);
+        nats->pending_lock_initialized = false;
+    }
     if (nats->pending_messages)
         pfree(nats->pending_messages);
 
@@ -382,6 +386,11 @@ Dispatcher *nats_dispatcher_create(Jsonb *config) {
     nats->pending_capacity = ulak_nats_batch_capacity;
     nats->pending_messages = palloc0(sizeof(NatsPendingMessage) * nats->pending_capacity);
     nats->pending_count = 0;
+    if (pthread_mutex_init(&nats->pending_lock, NULL) != 0) {
+        elog(WARNING, "[ulak] Failed to initialize NATS pending mutex");
+        goto error;
+    }
+    nats->pending_lock_initialized = true;
 
     /* Create NATS options */
     s = natsOptions_Create(&nats->opts);
@@ -431,8 +440,7 @@ Dispatcher *nats_dispatcher_create(Jsonb *config) {
     /* Create JetStream context if enabled */
     if (nats->jetstream) {
         jsOptions jsOpts;
-        jsOptions_Init(&jsOpts);
-        jsOpts.PublishAsync.MaxPending = nats->pending_capacity;
+        nats_configure_js_options(nats, &jsOpts);
 
         s = natsConnection_JetStream(&nats->js, nats->conn, &jsOpts);
         if (s != NATS_OK) {
@@ -453,6 +461,10 @@ error:
     if (nats->opts) {
         natsOptions_Destroy(nats->opts);
         nats->opts = NULL;
+    }
+    if (nats->pending_lock_initialized) {
+        pthread_mutex_destroy(&nats->pending_lock);
+        nats->pending_lock_initialized = false;
     }
     nats_ReleaseThreadMemory();
     MemoryContextDelete(cache_ctx);

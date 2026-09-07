@@ -13,8 +13,7 @@
 #ifndef ULAK_NATS_INTERNAL_H
 #define ULAK_NATS_INTERNAL_H
 
-#include <nats/nats.h>
-#include "dispatchers/dispatcher.h"
+#include "nats_dispatcher.h"
 
 /* ── JSONB config key constants ── */
 
@@ -58,6 +57,15 @@ extern const char *nats_classify_error(natsStatus status);
  * Retryable: JSInsufficientResourcesErr, JSClusterNoPeersErr, etc.
  */
 extern const char *nats_classify_js_error(int js_err_code);
+
+/**
+ * @brief Initialize jsOptions with ulak's async publish result handler.
+ *
+ * The NATS C client invokes AckHandler for both positive and negative async
+ * publish responses when it is configured. The handler marks the matching
+ * NatsPendingMessage before flush reads delivery outcomes.
+ */
+extern void nats_configure_js_options(NatsDispatcher *nats, jsOptions *js_opts);
 
 /* ── Config Parsing ── */
 

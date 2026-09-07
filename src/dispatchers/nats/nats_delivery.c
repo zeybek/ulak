@@ -12,8 +12,11 @@
 #include "nats_internal.h"
 #include "utils/json_utils.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include "utils/memutils.h"
 
 /**
  * @private
@@ -96,15 +99,143 @@ static natsMsg *nats_build_msg(NatsDispatcher *nats, const char *payload, int64 
 /**
  * @private
  * @brief Ensure batch capacity, growing the array if needed.
+ *
+ * Must be called WITHOUT pending_lock held: the allocation may ereport(ERROR)
+ * (longjmp), which would leave the mutex locked forever. Only the worker
+ * thread changes pending_count/pending_capacity, so the size check itself is
+ * race-free; the pointer swap is done under the lock because the ack callback
+ * thread indexes into the array while holding it. The new array is allocated
+ * in the context that owns the old one (dispatcher cache context), never in
+ * the per-batch SPI context.
+ *
  * @param nats NATS dispatcher instance
  */
 static void nats_ensure_batch_capacity(NatsDispatcher *nats) {
-    if (nats->pending_count >= nats->pending_capacity) {
-        int new_capacity = nats->pending_capacity * 2;
-        nats->pending_messages =
-            repalloc(nats->pending_messages, sizeof(NatsPendingMessage) * new_capacity);
-        nats->pending_capacity = new_capacity;
+    NatsPendingMessage *new_array;
+    NatsPendingMessage *old_array;
+    int new_capacity;
+
+    if (nats->pending_count < nats->pending_capacity)
+        return;
+
+    new_capacity = nats->pending_capacity * 2;
+    new_array = MemoryContextAlloc(GetMemoryChunkContext(nats->pending_messages),
+                                   sizeof(NatsPendingMessage) * new_capacity);
+
+    pthread_mutex_lock(&nats->pending_lock);
+    memcpy(new_array, nats->pending_messages, sizeof(NatsPendingMessage) * nats->pending_count);
+    old_array = nats->pending_messages;
+    nats->pending_messages = new_array;
+    nats->pending_capacity = new_capacity;
+    pthread_mutex_unlock(&nats->pending_lock);
+
+    pfree(old_array);
+}
+
+static bool nats_message_id_from_msg(natsMsg *msg, int64 *msg_id) {
+    const char *msg_id_str = NULL;
+    char *end = NULL;
+    long long parsed;
+
+    if (msg == NULL || msg_id == NULL)
+        return false;
+
+    if (natsMsgHeader_Get(msg, "Nats-Msg-Id", &msg_id_str) != NATS_OK || msg_id_str == NULL ||
+        msg_id_str[0] == '\0')
+        return false;
+
+    parsed = strtoll(msg_id_str, &end, 10);
+    if (end == msg_id_str || (end != NULL && *end != '\0') || parsed <= 0)
+        return false;
+
+    *msg_id = (int64)parsed;
+    return true;
+}
+
+static NatsPendingMessage *nats_find_pending_message_locked(NatsDispatcher *nats, int64 msg_id) {
+    int i;
+
+    for (i = 0; i < nats->pending_count; i++) {
+        if (nats->pending_messages[i].msg_id == msg_id)
+            return &nats->pending_messages[i];
     }
+
+    return NULL;
+}
+
+static void nats_mark_pending_success(NatsDispatcher *nats, natsMsg *msg, jsPubAck *pa) {
+    int64 msg_id;
+    NatsPendingMessage *pm;
+
+    if (!nats_message_id_from_msg(msg, &msg_id))
+        return;
+
+    pthread_mutex_lock(&nats->pending_lock);
+    pm = nats_find_pending_message_locked(nats, msg_id);
+    if (pm != NULL) {
+        pm->completed = true;
+        pm->success = true;
+        pm->error[0] = '\0';
+        if (pa != NULL) {
+            pm->js_sequence = pa->Sequence;
+            strlcpy(pm->js_stream, pa->Stream ? pa->Stream : "", sizeof(pm->js_stream));
+            pm->js_duplicate = pa->Duplicate;
+        }
+    }
+    pthread_mutex_unlock(&nats->pending_lock);
+}
+
+static void nats_mark_pending_failure(NatsDispatcher *nats, natsMsg *msg, natsStatus status,
+                                      jsErrCode js_err_code, const char *err_text) {
+    int64 msg_id;
+    NatsPendingMessage *pm;
+    const char *prefix;
+    const char *status_text;
+
+    if (!nats_message_id_from_msg(msg, &msg_id))
+        return;
+
+    prefix = (js_err_code != 0) ? nats_classify_js_error(js_err_code) : nats_classify_error(status);
+    status_text = err_text ? err_text : natsStatus_GetText(status);
+
+    pthread_mutex_lock(&nats->pending_lock);
+    pm = nats_find_pending_message_locked(nats, msg_id);
+    if (pm != NULL) {
+        pm->completed = true;
+        pm->success = false;
+        snprintf(pm->error, sizeof(pm->error),
+                 "%s NATS JetStream async publish failed: %s (status=%d, js_err=%d)", prefix,
+                 status_text ? status_text : "unknown", status, js_err_code);
+    }
+    pthread_mutex_unlock(&nats->pending_lock);
+}
+
+static void nats_js_puback_handler(jsCtx *js, natsMsg *msg, jsPubAck *pa, jsPubAckErr *pae,
+                                   void *closure) {
+    NatsDispatcher *nats = (NatsDispatcher *)closure;
+
+    (void)js;
+
+    if (nats != NULL) {
+        if (pae != NULL)
+            nats_mark_pending_failure(nats, msg, pae->Err, pae->ErrCode, pae->ErrText);
+        else if (pa != NULL)
+            nats_mark_pending_success(nats, msg, pa);
+        else
+            nats_mark_pending_failure(nats, msg, NATS_ERR, 0,
+                                      "JetStream publish completed without ack details");
+    }
+
+    /* With AckHandler configured, cnats transfers ownership of the original
+     * message to the callback. */
+    natsMsg_Destroy(msg);
+}
+
+void nats_configure_js_options(NatsDispatcher *nats, jsOptions *js_opts) {
+    jsOptions_Init(js_opts);
+    js_opts->PublishAsync.MaxPending = nats->pending_capacity;
+    js_opts->PublishAsync.AckHandler = nats_js_puback_handler;
+    js_opts->PublishAsync.AckHandlerClosure = nats;
 }
 
 /**
@@ -142,7 +273,7 @@ static bool nats_ensure_connected(NatsDispatcher *nats, char **error_msg) {
         }
 
         if (nats->jetstream) {
-            jsOptions_Init(&jsOpts);
+            nats_configure_js_options(nats, &jsOpts);
             s = natsConnection_JetStream(&nats->js, nats->conn, &jsOpts);
             if (s != NATS_OK) {
                 *error_msg = psprintf("%s JetStream context creation failed: %s",
@@ -235,8 +366,10 @@ bool nats_dispatcher_dispatch_ex(Dispatcher *self, const char *payload, Jsonb *h
 
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    /* Use dispatch with headers support */
-    msg = nats_build_msg(nats, payload, 0, headers);
+    /* Use dispatch with headers support. The queue row id (when the caller set
+     * result->message_id) becomes Nats-Msg-Id so JetStream de-duplicates
+     * retries of the same message on the synchronous path too. */
+    msg = nats_build_msg(nats, payload, result ? result->message_id : 0, headers);
     if (msg == NULL) {
         result->success = false;
         result->error_msg = pstrdup("[RETRYABLE] Failed to create NATS message");
@@ -310,8 +443,15 @@ bool nats_dispatcher_produce(Dispatcher *self, const char *payload, int64 msg_id
     if (!nats_ensure_connected(nats, error_msg))
         return false;
 
+    msg = nats_build_msg(nats, payload, msg_id, NULL);
+    if (msg == NULL) {
+        *error_msg = pstrdup("[RETRYABLE] Failed to create NATS message");
+        return false;
+    }
+
     nats_ensure_batch_capacity(nats);
 
+    pthread_mutex_lock(&nats->pending_lock);
     pm = &nats->pending_messages[nats->pending_count];
     pm->msg_id = msg_id;
     pm->completed = false;
@@ -320,26 +460,19 @@ bool nats_dispatcher_produce(Dispatcher *self, const char *payload, int64 msg_id
     pm->js_sequence = 0;
     pm->js_stream[0] = '\0';
     pm->js_duplicate = false;
-
-    msg = nats_build_msg(nats, payload, msg_id, NULL);
-    if (msg == NULL) {
-        snprintf(pm->error, sizeof(pm->error), "[RETRYABLE] Failed to create NATS message");
-        pm->completed = true;
-        pm->success = false;
-        nats->pending_count++;
-        *error_msg = pstrdup(pm->error);
-        return false;
-    }
+    nats->pending_count++;
+    pthread_mutex_unlock(&nats->pending_lock);
 
     if (nats->jetstream) {
         s = js_PublishMsgAsync(nats->js, &msg, NULL);
         if (s != NATS_OK) {
             natsMsg_Destroy(msg);
+            pthread_mutex_lock(&nats->pending_lock);
             snprintf(pm->error, sizeof(pm->error), "%s NATS async publish failed: %s",
                      nats_classify_error(s), natsStatus_GetText(s));
             pm->completed = true;
             pm->success = false;
-            nats->pending_count++;
+            pthread_mutex_unlock(&nats->pending_lock);
             *error_msg = pstrdup(pm->error);
             return false;
         }
@@ -349,19 +482,20 @@ bool nats_dispatcher_produce(Dispatcher *self, const char *payload, int64 msg_id
         s = natsConnection_PublishMsg(nats->conn, msg);
         natsMsg_Destroy(msg);
 
+        pthread_mutex_lock(&nats->pending_lock);
         pm->completed = true;
         if (s != NATS_OK) {
             snprintf(pm->error, sizeof(pm->error), "%s NATS publish failed: %s",
                      nats_classify_error(s), natsStatus_GetText(s));
             pm->success = false;
-            nats->pending_count++;
+            pthread_mutex_unlock(&nats->pending_lock);
             *error_msg = pstrdup(pm->error);
             return false;
         }
         pm->success = true;
+        pthread_mutex_unlock(&nats->pending_lock);
     }
 
-    nats->pending_count++;
     return true;
 }
 
@@ -385,8 +519,15 @@ bool nats_dispatcher_produce_ex(Dispatcher *self, const char *payload, int64 msg
     if (!nats_ensure_connected(nats, error_msg))
         return false;
 
+    msg = nats_build_msg(nats, payload, msg_id, headers);
+    if (msg == NULL) {
+        *error_msg = pstrdup("[RETRYABLE] Failed to create NATS message");
+        return false;
+    }
+
     nats_ensure_batch_capacity(nats);
 
+    pthread_mutex_lock(&nats->pending_lock);
     pm = &nats->pending_messages[nats->pending_count];
     pm->msg_id = msg_id;
     pm->completed = false;
@@ -395,42 +536,38 @@ bool nats_dispatcher_produce_ex(Dispatcher *self, const char *payload, int64 msg
     pm->js_sequence = 0;
     pm->js_stream[0] = '\0';
     pm->js_duplicate = false;
-
-    msg = nats_build_msg(nats, payload, msg_id, headers);
-    if (msg == NULL) {
-        snprintf(pm->error, sizeof(pm->error), "[RETRYABLE] Failed to create NATS message");
-        pm->completed = true;
-        nats->pending_count++;
-        *error_msg = pstrdup(pm->error);
-        return false;
-    }
+    nats->pending_count++;
+    pthread_mutex_unlock(&nats->pending_lock);
 
     if (nats->jetstream) {
         s = js_PublishMsgAsync(nats->js, &msg, NULL);
         if (s != NATS_OK) {
             natsMsg_Destroy(msg);
+            pthread_mutex_lock(&nats->pending_lock);
             snprintf(pm->error, sizeof(pm->error), "%s NATS async publish failed: %s",
                      nats_classify_error(s), natsStatus_GetText(s));
             pm->completed = true;
-            nats->pending_count++;
+            pm->success = false;
+            pthread_mutex_unlock(&nats->pending_lock);
             *error_msg = pstrdup(pm->error);
             return false;
         }
     } else {
         s = natsConnection_PublishMsg(nats->conn, msg);
         natsMsg_Destroy(msg);
+        pthread_mutex_lock(&nats->pending_lock);
         pm->completed = true;
         pm->success = (s == NATS_OK);
         if (s != NATS_OK) {
             snprintf(pm->error, sizeof(pm->error), "%s NATS publish failed: %s",
                      nats_classify_error(s), natsStatus_GetText(s));
-            nats->pending_count++;
+            pthread_mutex_unlock(&nats->pending_lock);
             *error_msg = pstrdup(pm->error);
             return false;
         }
+        pthread_mutex_unlock(&nats->pending_lock);
     }
 
-    nats->pending_count++;
     return true;
 }
 
@@ -476,37 +613,38 @@ int nats_dispatcher_flush(Dispatcher *self, int timeout_ms, int64 **failed_ids, 
         s = js_PublishAsyncGetPendingList(&pending, nats->js);
 
         if (s == NATS_OK && pending.Count > 0) {
-            /* These are messages that failed -- mark corresponding pending messages */
+            /* These messages never received an async publish response. */
+            pthread_mutex_lock(&nats->pending_lock);
             for (i = 0; i < pending.Count; i++) {
-                /* Try to match by Nats-Msg-Id header */
-                const char *msg_id_str = NULL;
-                natsMsgHeader_Get(pending.Msgs[i], "Nats-Msg-Id", &msg_id_str);
+                int64 msg_id;
+                NatsPendingMessage *pm;
 
-                if (msg_id_str != NULL) {
-                    int64 msg_id = atoll(msg_id_str);
-                    int j;
-                    for (j = 0; j < nats->pending_count; j++) {
-                        if (nats->pending_messages[j].msg_id == msg_id) {
-                            nats->pending_messages[j].completed = true;
-                            nats->pending_messages[j].success = false;
-                            snprintf(nats->pending_messages[j].error,
-                                     sizeof(nats->pending_messages[j].error),
-                                     "[RETRYABLE] NATS JetStream async publish failed");
-                            break;
-                        }
+                if (nats_message_id_from_msg(pending.Msgs[i], &msg_id)) {
+                    pm = nats_find_pending_message_locked(nats, msg_id);
+                    if (pm != NULL) {
+                        pm->completed = true;
+                        pm->success = false;
+                        snprintf(pm->error, sizeof(pm->error),
+                                 "[RETRYABLE] NATS JetStream async publish unacknowledged");
                     }
                 }
             }
+            pthread_mutex_unlock(&nats->pending_lock);
             natsMsgList_Destroy(&pending);
         }
 
-        /* Mark remaining as success */
+        /* Positive AckHandler callbacks are the only success source. Anything
+         * still incomplete after Complete/GetPendingList is retryable failure. */
+        pthread_mutex_lock(&nats->pending_lock);
         for (i = 0; i < nats->pending_count; i++) {
             if (!nats->pending_messages[i].completed) {
                 nats->pending_messages[i].completed = true;
-                nats->pending_messages[i].success = true;
+                nats->pending_messages[i].success = false;
+                snprintf(nats->pending_messages[i].error, sizeof(nats->pending_messages[i].error),
+                         "[RETRYABLE] NATS JetStream async publish unacknowledged");
             }
         }
+        pthread_mutex_unlock(&nats->pending_lock);
     } else {
         /* Core NATS -- just flush the connection buffer */
         s = natsConnection_FlushTimeout(nats->conn, timeout_ms);
@@ -515,6 +653,7 @@ int nats_dispatcher_flush(Dispatcher *self, int timeout_ms, int64 **failed_ids, 
         }
 
         /* Core NATS messages were already marked success in produce() */
+        pthread_mutex_lock(&nats->pending_lock);
         for (i = 0; i < nats->pending_count; i++) {
             if (!nats->pending_messages[i].completed) {
                 nats->pending_messages[i].completed = true;
@@ -526,9 +665,11 @@ int nats_dispatcher_flush(Dispatcher *self, int timeout_ms, int64 **failed_ids, 
                 }
             }
         }
+        pthread_mutex_unlock(&nats->pending_lock);
     }
 
     /* Collect failed messages */
+    pthread_mutex_lock(&nats->pending_lock);
     for (i = 0; i < nats->pending_count; i++) {
         if (!nats->pending_messages[i].success)
             fail_count++;
@@ -552,6 +693,7 @@ int nats_dispatcher_flush(Dispatcher *self, int timeout_ms, int64 **failed_ids, 
     }
 
     nats->pending_count = 0;
+    pthread_mutex_unlock(&nats->pending_lock);
     return success_count;
 }
 

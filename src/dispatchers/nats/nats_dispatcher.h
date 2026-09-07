@@ -15,6 +15,7 @@
 #define ULAK_NATS_DISPATCHER_H
 
 #include <nats/nats.h>
+#include <pthread.h>
 #include "dispatchers/dispatcher.h"
 
 /** @brief Tracks a single in-flight message during batch produce/flush. */
@@ -71,11 +72,13 @@ typedef struct NatsDispatcher {
     jsCtx *js;            /**< JetStream context (NULL for Core NATS). */
     /** @} */
 
-    /** @name Batch tracking (no spinlock — single-threaded PG worker) */
+    /** @name Batch tracking */
     /** @{ */
     NatsPendingMessage *pending_messages; /**< Array of in-flight messages. */
     int pending_count;                    /**< Current number of pending messages. */
     int pending_capacity;                 /**< Allocated capacity (grows via repalloc). */
+    pthread_mutex_t pending_lock;         /**< Guards async ack callbacks vs worker flush. */
+    bool pending_lock_initialized;        /**< True after pending_lock is initialized. */
     /** @} */
 
     /** @name Last synchronous dispatch result (for dispatch_ex) */
