@@ -91,12 +91,8 @@ int calculate_delay_from_policy(Jsonb *retry_policy, int retry_count) {
     const char *backoff_type = get_backoff_type_from_policy(retry_policy);
 
     if (strcmp(backoff_type, "fixed") == 0) {
-        /* Fixed delay - use base_delay as fixed value */
-        JsonbValue delay_val;
-        if (extract_jsonb_value(retry_policy, "delay", &delay_val) &&
-            delay_val.type == jbvNumeric) {
-            return ulak_retry_base_delay;
-        }
+        /* Fixed delay: ulak.retry_base_delay on every attempt. Per-endpoint
+         * retry_policy only selects the strategy; delays come from the GUCs. */
         return ulak_retry_base_delay;
     } else if (strcmp(backoff_type, "linear") == 0) {
         /* Linear backoff: base_delay + (retry_count * increment) */

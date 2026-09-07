@@ -153,15 +153,6 @@ extern Datum ulak_drop_endpoint(PG_FUNCTION_ARGS);
  */
 PGDLLEXPORT extern void ulak_worker_main(Datum main_arg);
 
-/**
- * @brief Entry point for dynamically parameterized database workers.
- *
- * Uses the main_arg DSM handle to load database-specific worker parameters.
- *
- * @param main_arg DSM handle for UlakWorkerParams.
- */
-PGDLLEXPORT extern void ulak_database_worker_main(Datum main_arg);
-
 /** @} */
 
 /** @name Utility functions

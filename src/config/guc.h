@@ -136,12 +136,6 @@ extern int config_get_default_max_retries(void);
 extern LogLevel config_get_log_level(void);
 extern int config_get_stale_recovery_timeout(void);
 
-/* Configuration Setters */
-extern void config_set_poll_interval(int interval);
-extern void config_set_batch_size(int batch_size);
-extern void config_set_default_max_retries(int max_retries);
-extern void config_set_log_level(LogLevel log_level);
-
 /* Response Tracking Configuration Getters */
 extern bool config_get_capture_response(void);
 extern int config_get_response_body_max_size(void);

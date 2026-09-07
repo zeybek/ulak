@@ -10,7 +10,6 @@ SELECT ulak.create_endpoint(
     'redis',
     '{"host": "localhost", "stream_key": "test-stream"}'::jsonb
 ) IS NOT NULL AS minimal_created;
-INFO:  [ulak] Created endpoint with ID 54
  minimal_created 
 -----------------
  t
@@ -22,7 +21,6 @@ SELECT ulak.create_endpoint(
     'redis',
     '{"host": "redis", "port": 6380, "db": 2, "stream_key": "events", "password": "secret", "connect_timeout": 10, "command_timeout": 60, "maxlen": 10000, "maxlen_approximate": true, "nomkstream": false}'::jsonb
 ) IS NOT NULL AS full_created;
-INFO:  [ulak] Created endpoint with ID 55
  full_created 
 --------------
  t
@@ -34,7 +32,6 @@ SELECT ulak.create_endpoint(
     'redis',
     '{"host": "redis-tls", "stream_key": "secure-stream", "tls": true, "tls_ca_cert": "/certs/ca.pem", "tls_cert": "/certs/client.pem", "tls_key": "/certs/client-key.pem"}'::jsonb
 ) IS NOT NULL AS tls_created;
-INFO:  [ulak] Created endpoint with ID 56
  tls_created 
 -------------
  t
@@ -163,7 +160,6 @@ SELECT ulak.alter_endpoint(
     'redis_minimal',
     '{"host": "new-redis", "stream_key": "new-stream", "port": 6380}'::jsonb
 ) AS altered;
-INFO:  [ulak] Altered endpoint 'redis_minimal'
  altered 
 ---------
  t
@@ -239,21 +235,18 @@ DELETE FROM ulak.queue WHERE endpoint_id IN (
     SELECT id FROM ulak.endpoints WHERE name LIKE 'redis_%'
 );
 SELECT ulak.drop_endpoint('redis_minimal');
-INFO:  [ulak] Dropped endpoint 'redis_minimal'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('redis_full');
-INFO:  [ulak] Dropped endpoint 'redis_full'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('redis_tls');
-INFO:  [ulak] Dropped endpoint 'redis_tls'
  drop_endpoint 
 ---------------
  t

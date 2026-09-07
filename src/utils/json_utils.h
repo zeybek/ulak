@@ -122,38 +122,6 @@ extern double jsonb_get_double(Jsonb *jsonb, const char *key, double default_val
 extern Jsonb *jsonb_get_nested(Jsonb *jsonb, const char *key);
 /** @} */
 
-/** @name Iterator utilities */
-/** @{ */
-
-/**
- * @brief Create an iterator over a JSONB object.
- * @param jsonb  JSONB object to iterate.
- * @return New iterator; caller must free with jsonb_iterator_free().
- */
-extern JsonbIterator *jsonb_iterator_create(Jsonb *jsonb);
-
-/**
- * @brief Free a JSONB iterator.
- * @param it  Iterator to free.
- */
-extern void jsonb_iterator_free(JsonbIterator *it);
-
-/**
- * @brief Advance iterator and populate value.
- * @param it     JSONB iterator.
- * @param value  Output value buffer.
- * @return true if a value was produced, false if iteration complete.
- */
-extern bool jsonb_iterator_next(JsonbIterator *it, JsonbValue *value);
-
-/**
- * @brief Check if iterator has more elements.
- * @param it  JSONB iterator.
- * @return true if more elements remain.
- */
-extern bool jsonb_iterator_has_next(JsonbIterator *it);
-/** @} */
-
 /** @name Key validation */
 /** @{ */
 

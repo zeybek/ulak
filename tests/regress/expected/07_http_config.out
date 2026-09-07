@@ -9,7 +9,6 @@ SELECT ulak.create_endpoint(
     'http',
     '{"url": "http://example.com/webhook", "method": "POST"}'::jsonb
 ) IS NOT NULL AS minimal_created;
-INFO:  [ulak] Created endpoint with ID 14
  minimal_created 
 -----------------
  t
@@ -73,7 +72,6 @@ SELECT ulak.alter_endpoint(
     'http_minimal',
     '{"url": "http://example.com/webhook-v2", "method": "PUT", "timeout": 60}'::jsonb
 );
-INFO:  [ulak] Altered endpoint 'http_minimal'
  alter_endpoint 
 ----------------
  t
@@ -92,7 +90,6 @@ WHERE name = 'http_minimal';
 -- CLEANUP
 -- ============================================================================
 SELECT ulak.drop_endpoint('http_minimal');
-INFO:  [ulak] Dropped endpoint 'http_minimal'
  drop_endpoint 
 ---------------
  t

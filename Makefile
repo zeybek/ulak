@@ -32,7 +32,6 @@ OBJS += src/dispatchers/http/http_batch.o
 OBJS += src/dispatchers/http/http_auth.o
 OBJS += src/dispatchers/http/http_auth_oauth2.o
 OBJS += src/dispatchers/http/http_auth_sigv4.o
-OBJS += src/queue/queue_manager.o
 OBJS += src/utils/json_utils.o
 OBJS += src/utils/logging.o
 OBJS += src/utils/cloudevents.o
@@ -102,7 +101,6 @@ PG_CPPFLAGS += -I$(srcdir)/src/dispatchers/mqtt
 PG_CPPFLAGS += -I$(srcdir)/src/dispatchers/redis
 PG_CPPFLAGS += -I$(srcdir)/src/dispatchers/amqp
 PG_CPPFLAGS += -I$(srcdir)/src/dispatchers/nats
-PG_CPPFLAGS += -I$(srcdir)/src/queue
 PG_CPPFLAGS += -I$(srcdir)/src/utils
 
 PG_CONFIG ?= pg_config

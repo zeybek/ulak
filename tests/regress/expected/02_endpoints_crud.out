@@ -9,7 +9,6 @@ SELECT ulak.create_endpoint(
     'http',
     '{"url": "http://example.com/hook", "method": "POST"}'::jsonb
 ) IS NOT NULL AS created;
-INFO:  [ulak] Created endpoint with ID 2
  created 
 ---------
  t
@@ -30,7 +29,6 @@ SELECT ulak.create_endpoint(
     'kafka',
     '{"broker": "localhost:9092", "topic": "test-topic"}'::jsonb
 ) IS NOT NULL AS created;
-INFO:  [ulak] Created endpoint with ID 3
  created 
 ---------
  t
@@ -44,7 +42,6 @@ SELECT ulak.alter_endpoint(
     'crud_test_http',
     '{"url": "http://example.com/hook-v2", "method": "PUT"}'::jsonb
 );
-INFO:  [ulak] Altered endpoint 'crud_test_http'
  alter_endpoint 
 ----------------
  t
@@ -99,7 +96,6 @@ WHERE name = 'crud_test_http';
 -- ============================================================================
 -- Drop the Kafka endpoint
 SELECT ulak.drop_endpoint('crud_test_kafka');
-INFO:  [ulak] Dropped endpoint 'crud_test_kafka'
  drop_endpoint 
 ---------------
  t
@@ -116,7 +112,6 @@ SELECT EXISTS(
 
 -- Clean up
 SELECT ulak.drop_endpoint('crud_test_http');
-INFO:  [ulak] Dropped endpoint 'crud_test_http'
  drop_endpoint 
 ---------------
  t

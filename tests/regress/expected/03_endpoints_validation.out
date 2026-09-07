@@ -23,7 +23,6 @@ SELECT ulak.create_endpoint(
     'http',
     '{"url": "http://example.com/hook", "method": "POST"}'::jsonb
 ) IS NOT NULL AS created;
-INFO:  [ulak] Created endpoint with ID 5
  created 
 ---------
  t
@@ -108,7 +107,6 @@ CONTEXT:  PL/pgSQL function ulak.disable_endpoint(text) line 10 at RAISE
 -- CLEANUP
 -- ============================================================================
 SELECT ulak.drop_endpoint('validation_test');
-INFO:  [ulak] Dropped endpoint 'validation_test'
  drop_endpoint 
 ---------------
  t

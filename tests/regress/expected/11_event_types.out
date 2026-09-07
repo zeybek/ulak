@@ -72,7 +72,6 @@ NOTICE:  drop nonexistent rejected
 -- ============================================================================
 SELECT ulak.create_endpoint('sub_ep_a', 'http',
     '{"url": "http://localhost:9999/a"}'::jsonb) IS NOT NULL AS ep_a;
-INFO:  [ulak] Created endpoint with ID 20
  ep_a 
 ------
  t
@@ -80,7 +79,6 @@ INFO:  [ulak] Created endpoint with ID 20
 
 SELECT ulak.create_endpoint('sub_ep_b', 'http',
     '{"url": "http://localhost:9999/b"}'::jsonb) IS NOT NULL AS ep_b;
-INFO:  [ulak] Created endpoint with ID 21
  ep_b 
 ------
  t
@@ -88,7 +86,6 @@ INFO:  [ulak] Created endpoint with ID 21
 
 SELECT ulak.create_endpoint('sub_ep_c', 'http',
     '{"url": "http://localhost:9999/c"}'::jsonb) IS NOT NULL AS ep_c;
-INFO:  [ulak] Created endpoint with ID 22
  ep_c 
 ------
  t
@@ -231,7 +228,6 @@ SELECT count(*) AS subs_before_ep_drop FROM ulak.subscriptions;
 (1 row)
 
 SELECT ulak.drop_endpoint('sub_ep_a');
-INFO:  [ulak] Dropped endpoint 'sub_ep_a'
  drop_endpoint 
 ---------------
  t
@@ -250,14 +246,12 @@ DELETE FROM ulak.queue;
 DELETE FROM ulak.subscriptions;
 DELETE FROM ulak.event_types;
 SELECT ulak.drop_endpoint('sub_ep_b');
-INFO:  [ulak] Dropped endpoint 'sub_ep_b'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('sub_ep_c');
-INFO:  [ulak] Dropped endpoint 'sub_ep_c'
  drop_endpoint 
 ---------------
  t

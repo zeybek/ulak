@@ -17,8 +17,7 @@ SELECT count(*) > 0 AS has_metrics FROM ulak.metrics();
 -- 4. Verify expected metric names from shmem
 SELECT DISTINCT metric_name
 FROM ulak.metrics()
-WHERE metric_name IN ('messages_processed_total', 'errors_total',
-                       'spawns_total', 'spawn_failures_total', 'restarts_total')
+WHERE metric_name IN ('messages_processed_total', 'errors_total')
 ORDER BY metric_name;
 
 -- 5. Create endpoint and queue messages to verify SQL-sourced metrics
