@@ -4,6 +4,16 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to package (e.g. v0.1.0)"
+        required: true
+
+# Tags pushed by release-please with GITHUB_TOKEN do not trigger tag-push
+# workflows, so release-please.yml dispatches this workflow with the tag.
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -16,13 +26,19 @@ jobs:
       archive: ${{ steps.archive.outputs.path }}
       version: ${{ steps.version.outputs.value }}
     steps:
-      - name: Check out the repo
+      - name: Check out the release tag
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Extract version from tag
         id: version
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$RELEASE_TAG" ]; then
+            echo "::error::Release tag '$RELEASE_TAG' is not of the form vX.Y.Z"
+            exit 1
+          fi
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Verify tag matches version.txt
@@ -49,6 +65,7 @@ jobs:
       - name: Create or update GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: ${{ steps.archive.outputs.path }}
           generate_release_notes: true
 
