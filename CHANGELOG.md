@@ -5,6 +5,14 @@ All notable changes to ulak will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1](https://github.com/zeybek/ulak/compare/v0.1.0...v0.1.1) (2026-09-07)
+
+
+### Bug Fixes
+
+* **docker:** install every runtime library ulak.so needs in the published image ([6a1df54](https://github.com/zeybek/ulak/commit/6a1df542e304ca114daea851a1e2bc4d22a8e11f))
+* **docker:** install every runtime library ulak.so needs in the published image ([de15b93](https://github.com/zeybek/ulak/commit/de15b930a3b61047f49da038e967550f6220b27b))
+
 ## [0.1.0](https://github.com/zeybek/ulak/compare/v0.0.3...v0.1.0) (2026-09-07)
 
 
