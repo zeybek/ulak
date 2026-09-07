@@ -5,6 +5,50 @@ All notable changes to ulak will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0](https://github.com/zeybek/ulak/compare/v0.0.3...v0.1.0) (2026-09-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* **sql:** ulak_application and ulak_monitor lose SELECT on ulak.endpoints (use ulak.endpoint_status); ulak.prevent_payload_modification() is removed; redrive_message() raises for DLQ rows that are not in failed state.
+* **core:** ulak.database requires a server restart to change (pg_reload_conf no longer applies it), and metrics() no longer returns spawns_total, spawn_failures_total or restarts_total.
+
+### Features
+
+* **sql:** endpoint_status view, tighter grants, single queue trigger and 0.1.0 upgrade path ([0ffc72e](https://github.com/zeybek/ulak/commit/0ffc72e16d5dd96e99f41d4a350976aa60f15cd3))
+
+
+### Bug Fixes
+
+* **http:** stable webhook ids, whsec_ secrets, stricter SSRF guard and 4xx handling ([9f2d3d4](https://github.com/zeybek/ulak/commit/9f2d3d49c96bfb47f1c6696d8d2f1fc282d6cafb))
+* **kafka:** fix use-after-free in batch growth and stale delivery callbacks ([cdc4aec](https://github.com/zeybek/ulak/commit/cdc4aec83812f40c7c1dc65e094ea1bbb037471f))
+* **mqtt:** wait for the broker acknowledgement on synchronous QoS 1/2 publishes ([52a4059](https://github.com/zeybek/ulak/commit/52a405999f00d90623aef20a72b485ab958d56f2))
+* **nats:** confirm JetStream publishes via AckHandler instead of dropping errors ([02ae498](https://github.com/zeybek/ulak/commit/02ae498a1341cd673c24cc9de7c89b35763c5c6b))
+* **nats:** require the result buffer in dispatch_ex ([2f85dcb](https://github.com/zeybek/ulak/commit/2f85dcbb27b91a4c46de11d41b3981e5447f0763))
+* resolve v0.0.3 review findings and prepare the 0.1.0 upgrade path ([64aafb5](https://github.com/zeybek/ulak/commit/64aafb51919a4c706f4b442d4011d72172de5061))
+* **worker:** drain LISTEN queue, defer rate-limited rows and expire messages ([948ed2f](https://github.com/zeybek/ulak/commit/948ed2f4aab45d94a8258c470bd3cea5ea7993a1))
+
+
+### Code Refactoring
+
+* **core:** remove dead launcher, DSM and entity layers; log endpoint DDL at LOG level ([6438255](https://github.com/zeybek/ulak/commit/643825589644f851fb9ad57c1caa2da5fbb8de9b))
+
+
+### Documentation
+
+* **readme:** link test directories with relative paths ([19aca5c](https://github.com/zeybek/ulak/commit/19aca5ca1097ea74c76422324131a33fdc419017))
+
+
+### Continuous Integration
+
+* fail the clang-tidy gate on errors and suppress cppcheck's branch-limit notice ([73b1d31](https://github.com/zeybek/ulak/commit/73b1d314827d963a226c9446a57ba3bbff08521a))
+
+
+### Miscellaneous
+
+* **release:** list every commit type in the changelog ([f8b29ae](https://github.com/zeybek/ulak/commit/f8b29ae039f37c2997977348b460cf3a8c3278c7))
+* **release:** verify the extension upgrade chain reaches the released version ([569fa79](https://github.com/zeybek/ulak/commit/569fa792e1ddc4c3ed63fa0718904e44da8e4a82))
+
 ## [0.0.3](https://github.com/zeybek/ulak/compare/v0.0.2...v0.0.3) (2026-05-12)
 
 
