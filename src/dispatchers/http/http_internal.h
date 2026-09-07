@@ -88,9 +88,18 @@ static const char *HTTP_ALLOWED_CONFIG_KEYS[] __attribute__((unused)) = {
 bool http_validate_url_scheme(const char *url, size_t url_len);
 
 /**
+ * @brief Check whether a URL carries userinfo ("user:pass@host") in its authority.
+ *
+ * @param url      URL string.
+ * @param url_len  Length of the URL string.
+ * @return true if the authority contains '@' (URL must be rejected).
+ */
+bool http_url_has_userinfo(const char *url, size_t url_len);
+
+/**
  * @brief Check if URL targets an internal/private IP address (SSRF protection).
  *
- * Blocks RFC 1918, loopback, and link-local addresses unless
+ * Blocks RFC 1918, loopback, link-local and CGNAT addresses unless
  * the http_allow_internal_urls GUC is enabled.
  *
  * @param url      URL string to check.
@@ -120,6 +129,22 @@ bool http_is_valid_method(const char *method, size_t len);
  * @return true if proxy scheme is valid, false otherwise.
  */
 bool http_validate_proxy_url_scheme(const char *url, size_t url_len);
+
+/**
+ * @brief curl CURLOPT_OPENSOCKETFUNCTION callback enforcing SSRF protection.
+ *
+ * Inspects the actual resolved address curl is about to connect to (every
+ * connection, including redirects) and aborts the connect when it targets an
+ * internal/private address — closing the DNS-rebinding TOCTOU that a
+ * validate-time URL check cannot. Honors ulak.http_allow_internal_urls.
+ *
+ * @param clientp  Unused.
+ * @param purpose  Connection purpose; only IP connections (CURLSOCKTYPE_IPCXN) are guarded.
+ * @param address  Resolved address curl is about to connect to.
+ * @return An open socket fd, or CURL_SOCKET_BAD to abort the connect.
+ */
+curl_socket_t ulak_http_opensocket_guard(void *clientp, curlsocktype purpose,
+                                         struct curl_sockaddr *address);
 
 /* ============================================================================
  * Webhook Signing Functions (http_request.c)

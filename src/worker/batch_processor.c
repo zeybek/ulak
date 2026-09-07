@@ -156,15 +156,23 @@ static void process_endpoint_batch(MessageBatchInfo *messages, int count, const 
         return;
     }
 
-    /* Apply rate limiting — defer messages that exceed endpoint rate limit */
+    /* Apply rate limiting — defer messages that exceed endpoint rate limit.
+     * Deferred messages get a next_retry_at of roughly one token interval so
+     * they are not re-fetched (and re-reverted) on every poll cycle. */
     {
         double rl_tokens_per_second = 0.0;
         int rl_burst = 0;
         rate_limit_parse_config(config, &rl_tokens_per_second, &rl_burst);
         if (rl_tokens_per_second > 0.0) {
+            int defer_ms = (int)(1000.0 / rl_tokens_per_second);
+            if (defer_ms < 100)
+                defer_ms = 100;
+            if (defer_ms > 60000)
+                defer_ms = 60000;
             for (i = 0; i < count; i++) {
                 if (!rate_limit_acquire(messages[i].endpoint_id, rl_tokens_per_second, rl_burst)) {
                     messages[i].rate_limited = true;
+                    messages[i].rate_limit_defer_ms = defer_ms;
                     elog(DEBUG1, "[ulak] Rate limited message %lld for endpoint %lld",
                          (long long)messages[i].message_id, (long long)messages[i].endpoint_id);
                 }
@@ -312,6 +320,8 @@ static void process_endpoint_batch(MessageBatchInfo *messages, int count, const 
 
             if (use_dispatch_ex) {
                 DispatchResult *result = dispatch_result_create();
+                if (result != NULL)
+                    result->message_id = messages[i].message_id;
                 if (result == NULL) {
                     messages[i].processed = true;
                     messages[i].success = false;
@@ -356,6 +366,7 @@ int64 batch_processor_run(Oid worker_dboid, int worker_id, int total_workers) {
     int ret;
     int spi_ret;
     int64 messages_processed = 0;
+    int64 fetched_count = 0;
     MemoryContext batch_context;
     MemoryContext old_context;
     MemoryContext spi_context;
@@ -871,8 +882,12 @@ int64 batch_processor_run(Oid worker_dboid, int worker_id, int total_workers) {
                     "completed_at = NOW(), updated_at = NOW() "
                     "WHERE id = ANY($1::bigint[])";
                 static const char *batch_revert_query =
-                    "UPDATE ulak.queue SET status = 'pending', "
-                    "processing_started_at = NULL WHERE id = ANY($1::bigint[])";
+                    "UPDATE ulak.queue q SET status = 'pending', "
+                    "processing_started_at = NULL, "
+                    "next_retry_at = NOW() + (v.defer_ms::text || ' milliseconds')::interval "
+                    "FROM (SELECT unnest($1::bigint[]) AS id, "
+                    "             unnest($2::int[]) AS defer_ms) v "
+                    "WHERE q.id = v.id";
                 static const char *batch_failed_query =
                     "UPDATE ulak.queue q SET status = 'failed', "
                     "retry_count = v.retry_count, last_error = v.last_error, "
@@ -900,6 +915,7 @@ int64 batch_processor_run(Oid worker_dboid, int worker_id, int total_workers) {
                 Datum *success_ids = palloc(sizeof(Datum) * total_messages);
                 int success_count = 0;
                 Datum *rate_limited_ids = palloc(sizeof(Datum) * total_messages);
+                Datum *rate_limited_delays = palloc(sizeof(Datum) * total_messages);
                 int rate_limited_count = 0;
                 Datum *perm_fail_ids = palloc(sizeof(Datum) * total_messages);
                 Datum *perm_fail_retries = palloc(sizeof(Datum) * total_messages);
@@ -914,8 +930,13 @@ int64 batch_processor_run(Oid worker_dboid, int worker_id, int total_workers) {
                 /* Phase 1: Categorize messages into batch groups */
                 for (i = 0; i < total_messages; i++) {
                     if (all_messages[i].rate_limited) {
-                        rate_limited_ids[rate_limited_count++] =
+                        rate_limited_ids[rate_limited_count] =
                             Int64GetDatum(all_messages[i].message_id);
+                        rate_limited_delays[rate_limited_count] =
+                            Int32GetDatum(all_messages[i].rate_limit_defer_ms > 0
+                                              ? all_messages[i].rate_limit_defer_ms
+                                              : 1000);
+                        rate_limited_count++;
                         continue;
                     }
 
@@ -1091,15 +1112,18 @@ int64 batch_processor_run(Oid worker_dboid, int worker_id, int total_workers) {
 
                 /* Phase 2: Execute batch UPDATEs */
 
-                /* Batch revert rate-limited messages */
+                /* Batch revert rate-limited messages (deferred by ~1 token interval) */
                 if (rate_limited_count > 0) {
                     ArrayType *id_array =
                         construct_array(rate_limited_ids, rate_limited_count, INT8OID,
                                         sizeof(int64), true, TYPALIGN_DOUBLE);
-                    Oid argtypes[1] = {INT8ARRAYOID};
-                    Datum values[1] = {PointerGetDatum(id_array)};
-                    char nulls[1] = {' '};
-                    ret = SPI_execute_with_args(batch_revert_query, 1, argtypes, values, nulls,
+                    ArrayType *delay_array =
+                        construct_array(rate_limited_delays, rate_limited_count, INT4OID,
+                                        sizeof(int32), true, TYPALIGN_INT);
+                    Oid argtypes[2] = {INT8ARRAYOID, INT4ARRAYOID};
+                    Datum values[2] = {PointerGetDatum(id_array), PointerGetDatum(delay_array)};
+                    char nulls[2] = {' ', ' '};
+                    ret = SPI_execute_with_args(batch_revert_query, 2, argtypes, values, nulls,
                                                 false, 0);
                     if (ret != SPI_OK_UPDATE) {
                         elog(WARNING, "[ulak] Batch revert rate-limited failed: SPI error %d", ret);
@@ -1181,6 +1205,7 @@ int64 batch_processor_run(Oid worker_dboid, int worker_id, int total_workers) {
 
                 pfree(success_ids);
                 pfree(rate_limited_ids);
+                pfree(rate_limited_delays);
                 pfree(perm_fail_ids);
                 pfree(perm_fail_retries);
                 pfree(perm_fail_errors);
@@ -1214,9 +1239,11 @@ int64 batch_processor_run(Oid worker_dboid, int worker_id, int total_workers) {
                 }
 
                 if (messages_processed > 0)
-                    elog(LOG, "[ulak] Processed %lld/%lu messages in this batch",
+                    elog(DEBUG1, "[ulak] Processed %lld/%lu messages in this batch",
                          (long long)messages_processed, (unsigned long)total_messages);
             }
+
+            fetched_count = (int64)total_messages;
         } else if (ret != SPI_OK_SELECT) {
             elog(WARNING, "[ulak] Failed to query pending messages: SPI error %d", ret);
         }
@@ -1233,6 +1260,6 @@ int64 batch_processor_run(Oid worker_dboid, int worker_id, int total_workers) {
         MemoryContextDelete(batch_context);
         worker_batch_context = NULL;
 
-        return messages_processed;
+        return fetched_count;
     }
 }

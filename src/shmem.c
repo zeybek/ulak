@@ -3,7 +3,8 @@
  * @brief Shared memory implementation for ulak.
  *
  * Stores runtime state for the configured database workers, aggregate
- * monitoring counters, and shared rate-limit buckets.
+ * monitoring counters, the backpressure count cache, and shared rate-limit
+ * buckets.
  */
 
 #include "postgres.h"
@@ -79,14 +80,13 @@ static void ulak_shmem_startup(void) {
         ulak_shmem->worker_started_at = 0;
         pg_atomic_init_u64(&ulak_shmem->atomic_messages_processed, 0);
         pg_atomic_init_u32(&ulak_shmem->atomic_error_count, 0);
-        ulak_shmem->messages_processed = 0;
-        ulak_shmem->error_count = 0;
         ulak_shmem->last_activity = 0;
         ulak_shmem->last_error_msg[0] = '\0';
 
         ulak_shmem->database_count = 0;
-        ulak_shmem->launcher_started = false;
-        ulak_shmem->launcher_pid = 0;
+        ulak_shmem->active_count_dboid = InvalidOid;
+        ulak_shmem->active_count_cache = 0;
+        ulak_shmem->active_count_checked_at = 0;
 
         /* Initialize per-database spinlocks for metrics */
         {
@@ -94,12 +94,6 @@ static void ulak_shmem_startup(void) {
             for (k = 0; k < ULAK_MAX_DATABASES; k++)
                 SpinLockInit(&ulak_shmem->databases[k].metrics_mutex);
         }
-
-        ulak_shmem->launcher_started_at = 0;
-        ulak_shmem->total_spawns = 0;
-        ulak_shmem->total_spawn_failures = 0;
-        ulak_shmem->total_restarts = 0;
-        ulak_shmem->last_check_cycle = 0;
 
         /* Initialize rate limit buckets */
         {
@@ -209,11 +203,10 @@ void ulak_register_database(const char *dbname, Oid dboid) {
             ulak_shmem->databases[i].active = true;
             ulak_shmem->databases[i].target_workers = 1; /* Default until worker startup sets it */
             ulak_shmem->databases[i].active_workers = 0;
-            /* Initialize worker PID array, generation counters, and metrics */
+            /* Initialize worker PID array and metrics */
             SpinLockInit(&ulak_shmem->databases[i].metrics_mutex);
             for (j = 0; j < ULAK_MAX_WORKERS; j++) {
                 ulak_shmem->databases[i].worker_pids[j] = 0;
-                ulak_shmem->databases[i].generation[j] = 0;
                 ulak_shmem->databases[i].worker_started_at[j] = 0;
                 ulak_shmem->databases[i].messages_processed[j] = 0;
                 ulak_shmem->databases[i].error_count[j] = 0;
@@ -221,10 +214,6 @@ void ulak_register_database(const char *dbname, Oid dboid) {
                 ulak_shmem->databases[i].last_error_msg[j][0] = '\0';
                 ulak_shmem->databases[i].last_activity[j] = 0;
             }
-            /* Initialize circuit breaker state */
-            ulak_shmem->databases[i].consecutive_spawn_failures = 0;
-            ulak_shmem->databases[i].circuit_open_until = 0;
-            ulak_shmem->databases[i].total_spawn_failures = 0;
             ulak_shmem->databases[i].registered_at = GetCurrentTimestamp();
             ulak_shmem->database_count++;
 
@@ -236,33 +225,6 @@ void ulak_register_database(const char *dbname, Oid dboid) {
 
     LWLockRelease(ulak_shmem->lock);
     elog(WARNING, "[ulak] Failed to find empty slot for database '%s'", dbname);
-}
-
-/**
- * @brief Unregister a database from the shared memory registry.
- *
- * Called when DROP EXTENSION ulak is executed.
- *
- * @param dboid Database OID to unregister.
- */
-void ulak_unregister_database(Oid dboid) {
-    int i;
-
-    if (ulak_shmem == NULL || ulak_shmem->lock == NULL)
-        return;
-
-    LWLockAcquire(ulak_shmem->lock, LW_EXCLUSIVE);
-
-    for (i = 0; i < ULAK_MAX_DATABASES; i++) {
-        if (ulak_shmem->databases[i].active && ulak_shmem->databases[i].dboid == dboid) {
-            ulak_shmem->databases[i].active = false;
-            ulak_shmem->database_count--;
-            elog(LOG, "[ulak] Database OID %u unregistered", dboid);
-            break;
-        }
-    }
-
-    LWLockRelease(ulak_shmem->lock);
 }
 
 /**
@@ -284,47 +246,6 @@ void ulak_set_worker_started(pid_t pid) {
     LWLockRelease(ulak_shmem->lock);
 
     elog(LOG, "[ulak] Worker started with PID %d", pid);
-}
-
-/**
- * @brief Check if a database is registered in the shared memory registry.
- *
- * @param dboid Database OID to check.
- * @return true if the database is registered and active.
- */
-bool ulak_is_database_registered(Oid dboid) {
-    int i;
-    bool found = false;
-
-    if (ulak_shmem == NULL) {
-        elog(DEBUG1, "[ulak] is_database_registered: shmem is NULL");
-        return false;
-    }
-
-    if (ulak_shmem->lock == NULL) {
-        elog(DEBUG1, "[ulak] is_database_registered: lock is NULL");
-        return false;
-    }
-
-    LWLockAcquire(ulak_shmem->lock, LW_SHARED);
-
-    elog(DEBUG1, "[ulak] is_database_registered: checking for dboid=%u, database_count=%d", dboid,
-         ulak_shmem->database_count);
-
-    for (i = 0; i < ULAK_MAX_DATABASES; i++) {
-        if (ulak_shmem->databases[i].active) {
-            elog(DEBUG1, "[ulak] is_database_registered: slot %d has active db oid=%u name=%s", i,
-                 ulak_shmem->databases[i].dboid, ulak_shmem->databases[i].dbname);
-        }
-        if (ulak_shmem->databases[i].active && ulak_shmem->databases[i].dboid == dboid) {
-            found = true;
-            break;
-        }
-    }
-
-    LWLockRelease(ulak_shmem->lock);
-    elog(DEBUG1, "[ulak] is_database_registered: result=%s", found ? "true" : "false");
-    return found;
 }
 
 /**
@@ -361,8 +282,7 @@ int ulak_get_registered_databases(UlakDatabaseEntry *entries, int max_entries) {
 /**
  * @brief Add a worker PID to a specific slot for a database.
  *
- * Called when a worker starts processing a database. Increments
- * the generation counter for ABA protection.
+ * Called when a worker starts processing a database.
  *
  * @param dboid     Database OID.
  * @param pid       Worker process ID.
@@ -392,15 +312,11 @@ int ulak_add_worker_pid(Oid dboid, pid_t pid, int worker_id) {
                      worker_id, ulak_shmem->databases[i].worker_pids[worker_id], dboid);
             } else {
                 ulak_shmem->databases[i].worker_pids[worker_id] = pid;
-                ulak_shmem->databases[i].generation[worker_id]++;
                 ulak_shmem->databases[i].worker_started_at[worker_id] = GetCurrentTimestamp();
                 ulak_shmem->databases[i].active_workers++;
                 result = 0;
-                elog(LOG,
-                     "[ulak] Worker %d (PID %d) added for database OID %u, "
-                     "active_workers=%d, generation=%u",
-                     worker_id, pid, dboid, ulak_shmem->databases[i].active_workers,
-                     ulak_shmem->databases[i].generation[worker_id]);
+                elog(LOG, "[ulak] Worker %d (PID %d) added for database OID %u, active_workers=%d",
+                     worker_id, pid, dboid, ulak_shmem->databases[i].active_workers);
             }
             break;
         }
@@ -413,7 +329,10 @@ int ulak_add_worker_pid(Oid dboid, pid_t pid, int worker_id) {
 /**
  * @brief Remove a worker PID from a database.
  *
- * Called when a worker terminates. Decrements active_workers count.
+ * Called when a worker terminates. Decrements active_workers and releases
+ * the registry slot once the last worker for that database is gone, so a
+ * database whose workers were reconfigured away (or whose extension was
+ * dropped) does not pin a slot forever.
  *
  * @param dboid Database OID.
  * @param pid   Worker process ID to remove.
@@ -431,11 +350,18 @@ void ulak_remove_worker_pid(Oid dboid, pid_t pid) {
             for (j = 0; j < ULAK_MAX_WORKERS; j++) {
                 if (ulak_shmem->databases[i].worker_pids[j] == pid) {
                     ulak_shmem->databases[i].worker_pids[j] = 0;
-                    ulak_shmem->databases[i].active_workers--;
+                    if (ulak_shmem->databases[i].active_workers > 0)
+                        ulak_shmem->databases[i].active_workers--;
                     elog(LOG, "[ulak] Worker PID %d removed from slot %d for database OID %u", pid,
                          j, dboid);
                     break;
                 }
+            }
+            if (ulak_shmem->databases[i].active_workers == 0) {
+                ulak_shmem->databases[i].active = false;
+                if (ulak_shmem->database_count > 0)
+                    ulak_shmem->database_count--;
+                elog(LOG, "[ulak] Database OID %u unregistered (no active workers)", dboid);
             }
             break;
         }
@@ -459,67 +385,6 @@ void ulak_clear_worker(void) {
     LWLockRelease(ulak_shmem->lock);
 
     elog(LOG, "[ulak] Worker cleared from shared memory");
-}
-
-/**
- * @brief Get the number of additional workers needed for a database.
- *
- * @param dboid Database OID.
- * @return Difference between target and active workers (0 if none needed).
- */
-int ulak_get_workers_needed(Oid dboid) {
-    int i;
-    int needed = 0;
-
-    if (ulak_shmem == NULL || ulak_shmem->lock == NULL)
-        return 0;
-
-    LWLockAcquire(ulak_shmem->lock, LW_SHARED);
-
-    for (i = 0; i < ULAK_MAX_DATABASES; i++) {
-        if (ulak_shmem->databases[i].active && ulak_shmem->databases[i].dboid == dboid) {
-            int target = ulak_shmem->databases[i].target_workers;
-            int active = ulak_shmem->databases[i].active_workers;
-            needed = (target > active) ? (target - active) : 0;
-            break;
-        }
-    }
-
-    LWLockRelease(ulak_shmem->lock);
-    return needed;
-}
-
-/**
- * @brief Get the next available worker slot for a database.
- *
- * @param dboid Database OID.
- * @return Slot index (0 to ULAK_MAX_WORKERS-1) or -1 if no slot available.
- */
-int ulak_get_next_worker_slot(Oid dboid) {
-    int i, j;
-    int slot = -1;
-
-    if (ulak_shmem == NULL || ulak_shmem->lock == NULL)
-        return -1;
-
-    LWLockAcquire(ulak_shmem->lock, LW_SHARED);
-
-    for (i = 0; i < ULAK_MAX_DATABASES; i++) {
-        if (ulak_shmem->databases[i].active && ulak_shmem->databases[i].dboid == dboid) {
-            int target = ulak_shmem->databases[i].target_workers;
-            /* Find first empty slot within target range */
-            for (j = 0; j < target && j < ULAK_MAX_WORKERS; j++) {
-                if (ulak_shmem->databases[i].worker_pids[j] == 0) {
-                    slot = j;
-                    break;
-                }
-            }
-            break;
-        }
-    }
-
-    LWLockRelease(ulak_shmem->lock);
-    return slot;
 }
 
 /**
@@ -557,112 +422,6 @@ void ulak_set_target_workers(Oid dboid, int count) {
 
     LWLockRelease(ulak_shmem->lock);
 }
-
-/**
- * @brief Get the worker_id for a given PID in a database.
- *
- * @param dboid Database OID.
- * @param pid   Worker process ID to look up.
- * @return Worker slot index (0 to ULAK_MAX_WORKERS-1) or -1 if not found.
- */
-int ulak_get_worker_id_for_pid(Oid dboid, pid_t pid) {
-    int i, j;
-    int worker_id = -1;
-
-    if (ulak_shmem == NULL || ulak_shmem->lock == NULL)
-        return -1;
-
-    LWLockAcquire(ulak_shmem->lock, LW_SHARED);
-
-    for (i = 0; i < ULAK_MAX_DATABASES; i++) {
-        if (ulak_shmem->databases[i].active && ulak_shmem->databases[i].dboid == dboid) {
-            for (j = 0; j < ULAK_MAX_WORKERS; j++) {
-                if (ulak_shmem->databases[i].worker_pids[j] == pid) {
-                    worker_id = j;
-                    break;
-                }
-            }
-            break;
-        }
-    }
-
-    LWLockRelease(ulak_shmem->lock);
-    return worker_id;
-}
-
-/**
- * @brief Get the generation counter for a specific worker slot.
- *
- * Returns the slot generation so callers can detect slot reuse (ABA protection).
- *
- * @param dboid     Database OID.
- * @param worker_id Worker slot index.
- * @return Generation counter for the slot, or 0 on error.
- */
-uint32 ulak_get_worker_generation(Oid dboid, int worker_id) {
-    int i;
-    uint32 gen = 0;
-
-    if (ulak_shmem == NULL || ulak_shmem->lock == NULL || worker_id < 0 ||
-        worker_id >= ULAK_MAX_WORKERS)
-        return 0;
-
-    LWLockAcquire(ulak_shmem->lock, LW_SHARED);
-
-    for (i = 0; i < ULAK_MAX_DATABASES; i++) {
-        if (ulak_shmem->databases[i].active && ulak_shmem->databases[i].dboid == dboid) {
-            gen = ulak_shmem->databases[i].generation[worker_id];
-            break;
-        }
-    }
-
-    LWLockRelease(ulak_shmem->lock);
-    return gen;
-}
-
-/** @name Aggregate worker helper functions.
- *  These keep the single-worker shared view in sync with runtime state.
- * @{ */
-
-/**
- * @brief Set the worker PID for a database using slot 0.
- *
- * Prefer ulak_add_worker_pid() for multi-worker paths.
- *
- * @param dboid Database OID.
- * @param pid   Worker process ID.
- */
-void ulak_set_worker_pid(Oid dboid, pid_t pid) { ulak_add_worker_pid(dboid, pid, 0); }
-
-/**
- * @brief Clear the worker PID for a database by clearing slot 0.
- *
- * Prefer ulak_remove_worker_pid() for multi-worker paths.
- *
- * @param dboid Database OID.
- */
-void ulak_clear_worker_pid(Oid dboid) {
-    int i;
-
-    if (ulak_shmem == NULL || ulak_shmem->lock == NULL)
-        return;
-
-    LWLockAcquire(ulak_shmem->lock, LW_EXCLUSIVE);
-
-    for (i = 0; i < ULAK_MAX_DATABASES; i++) {
-        if (ulak_shmem->databases[i].active && ulak_shmem->databases[i].dboid == dboid) {
-            /* Clear slot 0 in the aggregate worker view */
-            ulak_shmem->databases[i].worker_pids[0] = 0;
-            if (ulak_shmem->databases[i].active_workers > 0)
-                ulak_shmem->databases[i].active_workers--;
-            break;
-        }
-    }
-
-    LWLockRelease(ulak_shmem->lock);
-}
-
-/** @} */
 
 /**
  * @brief Update aggregate worker statistics kept for shared monitoring views.
@@ -805,14 +564,6 @@ void ulak_update_activity(void) {
     ulak_shmem->last_activity = GetCurrentTimestamp();
     LWLockRelease(ulak_shmem->lock);
 }
-
-/**
- * @brief Check if a database needs a worker using the aggregate worker view.
- *
- * @param dboid Database OID.
- * @return true if additional workers are needed.
- */
-bool ulak_database_needs_worker(Oid dboid) { return ulak_get_workers_needed(dboid) > 0; }
 
 /**
  * @brief Register static background workers.

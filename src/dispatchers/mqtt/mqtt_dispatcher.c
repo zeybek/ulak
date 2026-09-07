@@ -266,6 +266,8 @@ Dispatcher *mqtt_dispatcher_create(Jsonb *config) {
 
     /* Initialize extended fields */
     mqtt_dispatcher->last_mid = 0;
+    mqtt_dispatcher->sync_wait_mid = 0;
+    mqtt_dispatcher->sync_acked = false;
 
     /* Initialize connection pooling state */
     mqtt_dispatcher->connected = false;
@@ -395,11 +397,18 @@ bool mqtt_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char 
     mqtt_timeout = ulak_mqtt_timeout > 0 ? ulak_mqtt_timeout : 5000;
 
     if (mqtt_dispatcher->qos > 0) {
-        /* For QoS 1/2, loop until PUBACK/PUBCOMP or timeout */
+        /* For QoS 1/2, loop until the broker acknowledges THIS mid
+         * (PUBACK for QoS 1, PUBCOMP for QoS 2) or the timeout expires.
+         * mosquitto_want_write() only tells us the PUBLISH packet left our
+         * buffer, which is not delivery — the publish callback is. */
         struct timespec start, now;
         int elapsed_ms = 0;
+
+        mqtt_dispatcher->sync_wait_mid = mid;
+        mqtt_dispatcher->sync_acked = false;
+
         clock_gettime(CLOCK_MONOTONIC, &start);
-        while (elapsed_ms < mqtt_timeout) {
+        while (!mqtt_dispatcher->sync_acked && elapsed_ms < mqtt_timeout) {
             ret = mosquitto_loop(mqtt_dispatcher->client, 100, 1);
             if (ret != MOSQ_ERR_SUCCESS) {
                 const char *prefix = mqtt_classify_error(ret);
@@ -408,15 +417,25 @@ bool mqtt_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char 
                     *error_msg =
                         psprintf("%s MQTT loop failed: %s", prefix, mosquitto_strerror(ret));
                 }
+                mqtt_dispatcher->sync_wait_mid = 0;
                 mqtt_dispatcher->connected = false;
                 return false;
             }
             clock_gettime(CLOCK_MONOTONIC, &now);
             elapsed_ms =
                 (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
-            /* Check if published message is no longer in flight */
-            if (mosquitto_want_write(mqtt_dispatcher->client) == false)
-                break;
+        }
+        mqtt_dispatcher->sync_wait_mid = 0;
+
+        if (!mqtt_dispatcher->sync_acked) {
+            ulak_log("warning", "MQTT QoS %d publish not acknowledged within %d ms (mid=%d)",
+                     mqtt_dispatcher->qos, mqtt_timeout, mid);
+            if (error_msg) {
+                *error_msg = psprintf(ERROR_PREFIX_RETRYABLE
+                                      " MQTT QoS %d publish not acknowledged within %d ms",
+                                      mqtt_dispatcher->qos, mqtt_timeout);
+            }
+            return false;
         }
     } else {
         /* QoS 0: single non-blocking loop iteration to flush write buffer.
@@ -506,16 +525,14 @@ bool mqtt_dispatcher_produce(Dispatcher *dispatcher, const char *payload, int64 
     if (!mqtt_ensure_connected(mqtt, error_msg))
         return false;
 
-    /* Ensure batch capacity */
+    /* Ensure batch capacity. repalloc() keeps the array in the memory context
+     * that owns it (the dispatcher cache context); a plain palloc() here would
+     * allocate in the per-batch SPI context, which is destroyed after the batch
+     * and would leave pending_messages dangling (use-after-free). */
     if (mqtt->pending_count >= mqtt->pending_capacity) {
         int new_capacity = mqtt->pending_capacity * 2;
-        MqttPendingMessage *new_array = palloc(sizeof(MqttPendingMessage) * new_capacity);
-        if (mqtt->pending_count > 0) {
-            memcpy(new_array, mqtt->pending_messages,
-                   sizeof(MqttPendingMessage) * mqtt->pending_count);
-        }
-        pfree(mqtt->pending_messages);
-        mqtt->pending_messages = new_array;
+        mqtt->pending_messages =
+            repalloc(mqtt->pending_messages, sizeof(MqttPendingMessage) * new_capacity);
         mqtt->pending_capacity = new_capacity;
     }
 

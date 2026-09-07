@@ -23,7 +23,6 @@ SELECT ulak.create_event_type('evt.empty') IS NOT NULL AS et_empty;
 
 SELECT ulak.create_endpoint('pub_ep_1', 'http',
     '{"url": "http://localhost:9999/1"}'::jsonb) IS NOT NULL AS ep1;
-INFO:  [ulak] Created endpoint with ID 23
  ep1 
 -----
  t
@@ -31,7 +30,6 @@ INFO:  [ulak] Created endpoint with ID 23
 
 SELECT ulak.create_endpoint('pub_ep_2', 'http',
     '{"url": "http://localhost:9999/2"}'::jsonb) IS NOT NULL AS ep2;
-INFO:  [ulak] Created endpoint with ID 24
  ep2 
 -----
  t
@@ -39,7 +37,6 @@ INFO:  [ulak] Created endpoint with ID 24
 
 SELECT ulak.create_endpoint('pub_ep_3', 'http',
     '{"url": "http://localhost:9999/3"}'::jsonb) IS NOT NULL AS ep3;
-INFO:  [ulak] Created endpoint with ID 25
  ep3 
 -----
  t
@@ -315,21 +312,18 @@ DELETE FROM ulak.queue;
 DELETE FROM ulak.subscriptions;
 DELETE FROM ulak.event_types;
 SELECT ulak.drop_endpoint('pub_ep_1');
-INFO:  [ulak] Dropped endpoint 'pub_ep_1'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('pub_ep_2');
-INFO:  [ulak] Dropped endpoint 'pub_ep_2'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('pub_ep_3');
-INFO:  [ulak] Dropped endpoint 'pub_ep_3'
  drop_endpoint 
 ---------------
  t

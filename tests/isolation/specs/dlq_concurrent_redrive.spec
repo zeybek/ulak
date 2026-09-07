@@ -1,8 +1,8 @@
 # Test: Concurrent redrive of the same DLQ message
 #
-# Documents a known race condition: redrive_message() lacks locking,
-# so two concurrent calls on the same DLQ message both succeed,
-# creating duplicate queue entries.
+# redrive_message() locks the DLQ row (FOR UPDATE) and only accepts rows in
+# 'failed' state, so a second redrive of the same message is rejected and
+# exactly one queue entry is created.
 
 setup
 {
@@ -71,5 +71,5 @@ step "check_dlq_status"
     FROM ulak.dlq WHERE endpoint_name = 'iso_dlq_ep';
 }
 
-# Sequential redrives: both succeed, creating 2 queue entries (race condition)
+# Sequential redrives: the second one must fail, leaving exactly 1 queue entry
 permutation "w1_redrive" "w2_redrive" "check_queue_count" "check_dlq_status"

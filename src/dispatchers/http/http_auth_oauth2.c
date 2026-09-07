@@ -15,6 +15,7 @@
 
 #include "config/guc.h"
 #include "http_auth.h"
+#include "http_internal.h"
 #include "utils/json_utils.h"
 
 /* Safety buffer: refresh token 60 seconds before expiry */
@@ -117,6 +118,12 @@ static bool oauth2_fetch_token(HttpAuthConfig *auth) {
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L); /* No redirects for security */
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+#if LIBCURL_VERSION_NUM >= 0x071101
+    /* Same connect-time SSRF guard as the dispatch handles: token_url is only
+     * string-checked at endpoint creation, so guard the real resolved address. */
+    if (!ulak_http_allow_internal_urls)
+        curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, ulak_http_opensocket_guard);
+#endif
 
     /* Perform token request */
     res = curl_easy_perform(curl);

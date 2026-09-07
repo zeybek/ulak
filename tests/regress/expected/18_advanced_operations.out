@@ -4,7 +4,6 @@
 -- ============================================================================
 SELECT ulak.create_endpoint('adv_ep', 'http',
     '{"url": "http://localhost:9999/adv"}'::jsonb) IS NOT NULL AS ep_created;
-INFO:  [ulak] Created endpoint with ID 44
  ep_created 
 ------------
  t
@@ -311,7 +310,6 @@ DELETE FROM ulak.archive WHERE endpoint_id = (SELECT endpoint_id FROM adv_ids);
 DELETE FROM ulak.event_log;
 DROP TABLE adv_ids;
 SELECT ulak.drop_endpoint('adv_ep');
-INFO:  [ulak] Dropped endpoint 'adv_ep'
  drop_endpoint 
 ---------------
  t

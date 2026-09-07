@@ -295,6 +295,15 @@ void http_auth_invalidate_token(HttpAuthConfig *auth) {
     }
 }
 
+bool http_auth_handle_unauthorized(HttpAuthConfig *auth) {
+    if (!auth || auth->type != HTTP_AUTH_OAUTH2)
+        return false;
+
+    http_auth_invalidate_token(auth);
+    elog(WARNING, "[ulak] OAuth2: target returned HTTP 401, cached access token invalidated");
+    return true;
+}
+
 /**
  * @private
  * @brief Zero and free a sensitive string.

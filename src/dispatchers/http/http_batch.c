@@ -222,9 +222,17 @@ int http_batch_flush(Dispatcher *dispatcher, int timeout_ms, int64 **failed_ids,
                         /* 410 Gone - permanent failure, signal endpoint disable */
                         snprintf(req->error, HTTP_ERROR_BUFFER_SIZE,
                                  ERROR_PREFIX_PERMANENT " " ERROR_PREFIX_DISABLE " HTTP 410: Gone");
+                    } else if (req->http_code == 401 &&
+                               http_auth_handle_unauthorized(
+                                   (HttpAuthConfig *)http_dispatcher->auth)) {
+                        /* OAuth2 token rejected: cache invalidated, retry with a fresh token */
+                        snprintf(
+                            req->error, HTTP_ERROR_BUFFER_SIZE,
+                            ERROR_PREFIX_RETRYABLE
+                            " HTTP 401: Unauthorized (OAuth2 token invalidated, will refresh)");
                     } else if (req->http_code >= 400 && req->http_code < 500 &&
                                req->http_code != 429) {
-                        /* 4xx (except 429 and 410) are permanent */
+                        /* 4xx (except 429, 410 and OAuth2 401) are permanent */
                         snprintf(req->error, HTTP_ERROR_BUFFER_SIZE,
                                  ERROR_PREFIX_PERMANENT " HTTP %ld", req->http_code);
                     } else {

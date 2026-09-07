@@ -18,3 +18,7 @@ syntaxError:src/ulak.c
 // PG_FUNCTION_INFO_V1 macro creates extern Pg_finfo_* functions that
 // appear unused to cppcheck but are resolved by the PG extension loader.
 unusedFunction
+
+// cppcheck >= 2.17 emits an "information" diagnostic when it truncates branch
+// analysis in large functions; it is not a finding and must not fail the gate.
+normalCheckLevelMaxBranches

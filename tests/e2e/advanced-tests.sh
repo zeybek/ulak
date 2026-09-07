@@ -473,6 +473,53 @@ print('MISMATCH' if actual != expected_b64 else 'MATCH')
 assert_eq "Wrong secret fails verification" "MISMATCH" "$NEG_RESULT"
 
 # ═══════════════════════════════════════════════════
+# TEST 7b: Signing on the synchronous path (capture_response=on)
+#          + Standard Webhooks whsec_ secret + unique webhook-id per message
+# ═══════════════════════════════════════════════════
+header "TEST 7b: Sync-path signing (capture_response) with whsec_ secret"
+
+fresh_env "ulak.workers=1" "ulak.poll_interval=100" "ulak.capture_response=on"
+webhook_clear
+
+# Standard Webhooks: secret is "whsec_" + base64(raw key); the receiver signs with the decoded key
+RAW_KEY="sync-secret-key-42"
+WHSEC="whsec_$(printf '%s' "$RAW_KEY" | base64 | tr -d '\n')"
+create_endpoint "signed_sync" "{\"url\": \"${WEBHOOK_URL}/echo/signed_sync\", \"method\": \"POST\", \"signing_secret\": \"${WHSEC}\"}"
+
+section "Sending 5 signed messages within the same second..."
+psql_quiet "SELECT ulak.send('signed_sync', jsonb_build_object('sig_sync', g)) FROM generate_series(1, 5) g;"
+
+wait_queue_drain 15
+
+DELIVERED_SYNC=$(webhook_count "echo/signed_sync")
+assert_eq "5 sync-signed messages delivered" "5" "$DELIVERED_SYNC"
+
+# webhook-id must be msg_<queue row id>: unique per message even inside one second
+EXPECTED_IDS=$(psql_exec "SELECT string_agg('msg_' || q.id, ',' ORDER BY q.id) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'signed_sync';")
+
+SYNC_RESULT=$(webhook_get "echo/signed_sync" | python3 -c "
+import sys, json, hmac, hashlib, base64
+
+KEY = '${RAW_KEY}'.encode()
+expected_ids = set('${EXPECTED_IDS}'.split(','))
+data = json.load(sys.stdin)['requests']
+ids = [r.get('headers', {}).get('webhook-id', '') for r in data]
+valid = 0
+for r in data:
+    h = r.get('headers', {})
+    sign_content = f\"{h.get('webhook-id','')}.{h.get('webhook-timestamp','')}.{r.get('body','')}\"
+    expected = 'v1,' + base64.b64encode(hmac.new(KEY, sign_content.encode(), hashlib.sha256).digest()).decode()
+    if h.get('webhook-signature', '') == expected:
+        valid += 1
+print(f'unique_ids={len(set(ids))} ids_match_queue={set(ids) == expected_ids} valid={valid}')
+" 2>/dev/null)
+
+echo "  $SYNC_RESULT"
+assert_contains "5 distinct webhook-ids (no time(NULL) collisions)" "unique_ids=5" "$SYNC_RESULT"
+assert_contains "webhook-id equals msg_<queue id>" "ids_match_queue=True" "$SYNC_RESULT"
+assert_contains "All whsec_ signatures verify with decoded key" "valid=5" "$SYNC_RESULT"
+
+# ═══════════════════════════════════════════════════
 # TEST 8: Payload Edge Cases
 # ═══════════════════════════════════════════════════
 header "TEST 8: Payload Edge Cases"

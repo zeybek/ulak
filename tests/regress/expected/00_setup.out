@@ -48,7 +48,6 @@ SELECT ulak.create_endpoint(
     'http',
     '{"url": "http://localhost:9999/webhook", "method": "POST"}'::jsonb
 );
-INFO:  [ulak] Created endpoint with ID 1
  create_endpoint 
 -----------------
                1

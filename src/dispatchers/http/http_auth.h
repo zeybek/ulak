@@ -126,6 +126,18 @@ extern struct curl_slist *http_auth_apply(HttpAuthConfig *auth, CURL *curl,
  * @param auth  Auth configuration with OAuth2 cache.
  */
 extern void http_auth_invalidate_token(HttpAuthConfig *auth);
+
+/**
+ * @brief React to an HTTP 401 from the target.
+ *
+ * For OAuth2 client-credentials auth the cached access token is dropped so the
+ * next attempt fetches a fresh one, and the caller should classify the failure
+ * as retryable. For every other auth type nothing is done.
+ *
+ * @param auth  Parsed auth configuration (may be NULL).
+ * @return true if the token cache was invalidated (retry makes sense).
+ */
+extern bool http_auth_handle_unauthorized(HttpAuthConfig *auth);
 /** @} */
 
 /** @name Lifecycle */

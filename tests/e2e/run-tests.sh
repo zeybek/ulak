@@ -154,6 +154,14 @@ fi
 
 echo -e "${GREEN}Pre-flight OK${NC} — webhook:${WEBHOOK_PORT}, pg:ready, extension:installed"
 
+# The webhook fixture lives on the Docker host (host.docker.internal), which
+# resolves to a private/link-local address and would be refused by the SSRF
+# guard (both at endpoint creation and at connect time). Explicitly enable the
+# bypass instead of relying on leftover cluster state.
+$PSQL -c "ALTER SYSTEM SET ulak.http_allow_internal_urls = true;" > /dev/null 2>&1
+$PSQL -c "SELECT pg_reload_conf();" > /dev/null 2>&1
+sleep 1
+
 # Clean slate
 cleanup
 

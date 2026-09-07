@@ -337,10 +337,10 @@ See the [Configuration Reference](https://github.com/zeybek/ulak/wiki/Configurat
 
 The repository includes:
 
-- **TAP tests** in [`t/`](/Users/ahmet/Code/ulak/t:1) for worker startup, reload, and stale recovery
-- **Regression tests** in [`tests/regress`](/Users/ahmet/Code/ulak/tests/regress:1)
-- **Isolation tests** in [`tests/isolation`](/Users/ahmet/Code/ulak/tests/isolation:1)
-- **End-to-end protocol tests** in [`tests/e2e`](/Users/ahmet/Code/ulak/tests/e2e:1)
+- **TAP tests** in [`t/`](t/) for worker startup, reload, and stale recovery
+- **Regression tests** in [`tests/regress`](tests/regress/)
+- **Isolation tests** in [`tests/isolation`](tests/isolation/)
+- **End-to-end protocol tests** in [`tests/e2e`](tests/e2e/)
 
 Run the core regression suite:
 

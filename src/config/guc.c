@@ -204,10 +204,12 @@ void config_init_guc_variables(void) {
                              LOG_LEVEL_WARNING, ulak_log_level_options, PGC_SIGHUP,
                              GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
+    /* Workers read ulak.database once, when they connect; a reload cannot
+     * move a live worker to another database, so this is PGC_POSTMASTER. */
     DefineCustomStringVariable("ulak.database", "Database for worker connection",
                                "The database name that the background worker connects to. "
                                "Must be set to the database where CREATE EXTENSION ulak was run.",
-                               &ulak_database, "postgres", PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL,
+                               &ulak_database, "postgres", PGC_POSTMASTER, GUC_NOT_IN_SAMPLE, NULL,
                                NULL, NULL);
 
     DefineCustomIntVariable(
@@ -596,46 +598,6 @@ int config_get_default_max_retries(void) { return ulak_default_max_retries; }
  * @return Timeout in seconds
  */
 int config_get_stale_recovery_timeout(void) { return ulak_stale_recovery_timeout; }
-
-/**
- * @brief Set the poll interval if valid.
- * @param interval New interval in milliseconds
- */
-void config_set_poll_interval(int interval) {
-    if (config_is_valid_poll_interval(interval)) {
-        ulak_poll_interval = interval;
-    }
-}
-
-/**
- * @brief Set the batch size if valid.
- * @param batch_size New batch size
- */
-void config_set_batch_size(int batch_size) {
-    if (config_is_valid_batch_size(batch_size)) {
-        ulak_batch_size = batch_size;
-    }
-}
-
-/**
- * @brief Set the log level if valid.
- * @param log_level New log level
- */
-void config_set_log_level(LogLevel log_level) {
-    if (config_is_valid_log_level(log_level)) {
-        ulak_log_level = log_level;
-    }
-}
-
-/**
- * @brief Set the default max retries if valid.
- * @param max_retries New max retries count
- */
-void config_set_default_max_retries(int max_retries) {
-    if (config_is_valid_max_retries(max_retries)) {
-        ulak_default_max_retries = max_retries;
-    }
-}
 
 /**
  * @brief Get whether response capture is enabled.

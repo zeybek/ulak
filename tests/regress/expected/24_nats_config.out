@@ -10,7 +10,6 @@ SELECT ulak.create_endpoint(
     'nats',
     '{"url": "nats://localhost:4222", "subject": "orders.created"}'::jsonb
 ) IS NOT NULL AS minimal_created;
-INFO:  [ulak] Created endpoint with ID 64
  minimal_created 
 -----------------
  t
@@ -22,7 +21,6 @@ SELECT ulak.create_endpoint(
     'nats',
     '{"url": "nats://localhost:4222", "subject": "events.raw", "jetstream": false}'::jsonb
 ) IS NOT NULL AS core_created;
-INFO:  [ulak] Created endpoint with ID 65
  core_created 
 --------------
  t
@@ -34,7 +32,6 @@ SELECT ulak.create_endpoint(
     'nats',
     '{"url": "nats://nats:4222", "subject": "orders.new", "jetstream": true, "stream": "ORDERS", "username": "user", "password": "pass", "headers": {"X-Source": "ulak", "X-Version": "1"}}'::jsonb
 ) IS NOT NULL AS full_created;
-INFO:  [ulak] Created endpoint with ID 66
  full_created 
 --------------
  t
@@ -46,7 +43,6 @@ SELECT ulak.create_endpoint(
     'nats',
     '{"url": "nats://s1:4222,nats://s2:4222,nats://s3:4222", "subject": "cluster.test"}'::jsonb
 ) IS NOT NULL AS cluster_created;
-INFO:  [ulak] Created endpoint with ID 67
  cluster_created 
 -----------------
  t
@@ -295,7 +291,6 @@ SELECT ulak.alter_endpoint(
     'nats_minimal',
     '{"url": "nats://newhost:4222", "subject": "orders.updated"}'::jsonb
 ) AS altered;
-INFO:  [ulak] Altered endpoint 'nats_minimal'
  altered 
 ---------
  t
@@ -356,28 +351,24 @@ DELETE FROM ulak.queue WHERE endpoint_id IN (
     SELECT id FROM ulak.endpoints WHERE name LIKE 'nats_%'
 );
 SELECT ulak.drop_endpoint('nats_minimal') AS drop1;
-INFO:  [ulak] Dropped endpoint 'nats_minimal'
  drop1 
 -------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('nats_core') AS drop2;
-INFO:  [ulak] Dropped endpoint 'nats_core'
  drop2 
 -------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('nats_full') AS drop3;
-INFO:  [ulak] Dropped endpoint 'nats_full'
  drop3 
 -------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('nats_cluster') AS drop4;
-INFO:  [ulak] Dropped endpoint 'nats_cluster'
  drop4 
 -------
  t

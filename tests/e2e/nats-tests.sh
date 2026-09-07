@@ -231,9 +231,42 @@ else
 fi
 
 # ═══════════════════════════════════════════════════
-# TEST 6: Error Classification
+# TEST 6: JetStream Missing Stream Does Not Complete
 # ═══════════════════════════════════════════════════
-header "TEST 6: Error Classification"
+header "TEST 6: JetStream Missing Stream Does Not Complete"
+
+psql_quiet "DELETE FROM ulak.queue;"
+psql_quiet "DELETE FROM ulak.dlq;"
+nats_purge_stream "NTTEST"
+
+create_endpoint "nt-js-missing-stream" "{\"url\": \"nats://${NATS_HOST}:${NATS_PORT}\", \"subject\": \"missing.stream\", \"jetstream\": true}" "nats"
+
+psql_quiet "
+DO \$\$ DECLARE a jsonb[];
+BEGIN
+  a := ARRAY(SELECT jsonb_build_object('missing_stream', g) FROM generate_series(1, 5) g);
+  PERFORM ulak.send_batch('nt-js-missing-stream', a);
+END; \$\$;"
+
+for i in $(seq 1 30); do
+  ATTEMPTED=$(psql_exec "SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'nt-js-missing-stream' AND (q.status = 'completed' OR q.status = 'failed' OR q.retry_count > 0 OR q.last_error IS NOT NULL);")
+  [ "$ATTEMPTED" = "5" ] && break
+  sleep 0.5
+done
+
+COMPLETED=$(psql_exec "SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE q.status = 'completed' AND e.name = 'nt-js-missing-stream';")
+NOT_COMPLETED=$(psql_exec "SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE q.status IN ('pending','failed') AND e.name = 'nt-js-missing-stream';")
+MSGS=$(nats_stream_msgs "NTTEST")
+
+assert_eq "Missing-stream messages attempted" "5" "$ATTEMPTED"
+assert_eq "Missing-stream messages not completed" "0" "$COMPLETED"
+assert_eq "Missing-stream messages remain retry/failed" "5" "$NOT_COMPLETED"
+assert_eq "No messages persisted to unrelated stream" "0" "$MSGS"
+
+# ═══════════════════════════════════════════════════
+# TEST 7: Error Classification
+# ═══════════════════════════════════════════════════
+header "TEST 7: Error Classification"
 
 psql_quiet "DELETE FROM ulak.queue;"
 psql_quiet "DELETE FROM ulak.dlq;"

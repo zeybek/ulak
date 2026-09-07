@@ -17,10 +17,7 @@ ORDER BY metric_name;
 --------------------------+-------------
  errors_total             | counter
  messages_processed_total | counter
- restarts_total           | counter
- spawn_failures_total     | counter
- spawns_total             | counter
-(5 rows)
+(2 rows)
 
 -- 3. metrics() returns rows without error
 SELECT count(*) > 0 AS has_metrics FROM ulak.metrics();
@@ -32,17 +29,13 @@ SELECT count(*) > 0 AS has_metrics FROM ulak.metrics();
 -- 4. Verify expected metric names from shmem
 SELECT DISTINCT metric_name
 FROM ulak.metrics()
-WHERE metric_name IN ('messages_processed_total', 'errors_total',
-                       'spawns_total', 'spawn_failures_total', 'restarts_total')
+WHERE metric_name IN ('messages_processed_total', 'errors_total')
 ORDER BY metric_name;
        metric_name        
 --------------------------
  errors_total
  messages_processed_total
- restarts_total
- spawn_failures_total
- spawns_total
-(5 rows)
+(2 rows)
 
 -- 5. Create endpoint and queue messages to verify SQL-sourced metrics
 -- Use direct INSERT to avoid non-deterministic endpoint ID in elog(INFO) output

@@ -40,10 +40,11 @@ typedef struct {
     int32 circuit_failure_count;
     TimestampTz circuit_opened_at;
     TimestampTz circuit_half_open_at;
-    DispatchResult *result; /* Dispatch result for response capture */
-    Jsonb *headers;         /* Per-message headers */
-    Jsonb *metadata;        /* Per-message metadata */
-    bool rate_limited;      /* Deferred by rate limiter — skip dispatch */
+    DispatchResult *result;    /* Dispatch result for response capture */
+    Jsonb *headers;            /* Per-message headers */
+    Jsonb *metadata;           /* Per-message metadata */
+    bool rate_limited;         /* Deferred by rate limiter — skip dispatch */
+    int32 rate_limit_defer_ms; /* How long to defer a rate-limited message (next_retry_at) */
 } MessageBatchInfo;
 
 #endif /* ULAK_WORKER_BATCH_TYPES_H */

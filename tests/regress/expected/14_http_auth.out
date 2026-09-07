@@ -7,7 +7,6 @@ SELECT ulak.create_endpoint('auth_bearer', 'http', '{
     "url": "http://localhost:9999/bearer",
     "auth": {"type": "bearer", "token": "eyJhbGciOiJSUzI1NiJ9.test"}
 }'::jsonb) IS NOT NULL AS bearer_ok;
-INFO:  [ulak] Created endpoint with ID 27
  bearer_ok 
 -----------
  t
@@ -20,7 +19,6 @@ SELECT ulak.create_endpoint('auth_basic', 'http', '{
     "url": "http://localhost:9999/basic",
     "auth": {"type": "basic", "username": "admin", "password": "secret123"}
 }'::jsonb) IS NOT NULL AS basic_ok;
-INFO:  [ulak] Created endpoint with ID 28
  basic_ok 
 ----------
  t
@@ -39,7 +37,6 @@ SELECT ulak.create_endpoint('auth_oauth2', 'http', '{
         "scope": "messages:write"
     }
 }'::jsonb) IS NOT NULL AS oauth2_ok;
-INFO:  [ulak] Created endpoint with ID 29
  oauth2_ok 
 -----------
  t
@@ -58,7 +55,6 @@ SELECT ulak.create_endpoint('auth_sigv4', 'http', '{
         "service": "sqs"
     }
 }'::jsonb) IS NOT NULL AS sigv4_ok;
-INFO:  [ulak] Created endpoint with ID 30
  sigv4_ok 
 ----------
  t
@@ -78,7 +74,6 @@ SELECT ulak.create_endpoint('auth_sigv4_sts', 'http', '{
         "session_token": "FwoGZXIv..."
     }
 }'::jsonb) IS NOT NULL AS sigv4_sts_ok;
-INFO:  [ulak] Created endpoint with ID 31
  sigv4_sts_ok 
 --------------
  t
@@ -169,7 +164,6 @@ WARNING:  [ulak] ERROR: Invalid HTTP auth configuration
 SELECT ulak.create_endpoint('no_auth_ep', 'http', '{
     "url": "http://localhost:9999/noauth"
 }'::jsonb) IS NOT NULL AS no_auth_ok;
-INFO:  [ulak] Created endpoint with ID 32
  no_auth_ok 
 ------------
  t
@@ -180,10 +174,9 @@ INFO:  [ulak] Created endpoint with ID 32
 -- ============================================================================
 SELECT ulak.create_endpoint('auth_plus_signing', 'http', '{
     "url": "http://localhost:9999/both",
-    "signing_secret": "whsec_test123",
+    "signing_secret": "whsec_dGVzdDEyMw==",
     "auth": {"type": "bearer", "token": "my-token"}
 }'::jsonb) IS NOT NULL AS auth_plus_signing_ok;
-INFO:  [ulak] Created endpoint with ID 33
  auth_plus_signing_ok 
 ----------------------
  t
@@ -199,7 +192,6 @@ SELECT ulak.create_endpoint('auth_all_features', 'http', '{
     "cloudevents_mode": "binary",
     "rate_limit": {"limit": 10, "interval": "second", "burst": 20}
 }'::jsonb) IS NOT NULL AS all_features_ok;
-INFO:  [ulak] Created endpoint with ID 34
  all_features_ok 
 -----------------
  t
@@ -209,56 +201,48 @@ INFO:  [ulak] Created endpoint with ID 34
 -- CLEANUP
 -- ============================================================================
 SELECT ulak.drop_endpoint('auth_bearer');
-INFO:  [ulak] Dropped endpoint 'auth_bearer'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('auth_basic');
-INFO:  [ulak] Dropped endpoint 'auth_basic'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('auth_oauth2');
-INFO:  [ulak] Dropped endpoint 'auth_oauth2'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('auth_sigv4');
-INFO:  [ulak] Dropped endpoint 'auth_sigv4'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('auth_sigv4_sts');
-INFO:  [ulak] Dropped endpoint 'auth_sigv4_sts'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('no_auth_ep');
-INFO:  [ulak] Dropped endpoint 'no_auth_ep'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('auth_plus_signing');
-INFO:  [ulak] Dropped endpoint 'auth_plus_signing'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('auth_all_features');
-INFO:  [ulak] Dropped endpoint 'auth_all_features'
  drop_endpoint 
 ---------------
  t

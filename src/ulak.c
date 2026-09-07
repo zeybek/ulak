@@ -26,31 +26,14 @@ PG_MODULE_MAGIC;
 #include "config/guc.h"
 #include "core/entities.h"
 #include "dispatchers/dispatcher.h"
-#include "queue/queue_manager.h"
 #include "shmem.h"
 #include "utils/json_utils.h"
 #include "utils/logging.h"
 
 /* SRF and system includes */
+#include "catalog/pg_type.h"
 #include "funcapi.h"   /* For SRF (Set Returning Functions) */
-#include "miscadmin.h" /* For max_worker_processes */
-
-/* PostgreSQL includes for database name */
-#include "catalog/pg_database.h"
-#include "commands/dbcommands.h"
-#include "utils/syscache.h"
-
-/* External libraries - HTTP always enabled */
-#include <curl/curl.h>
-
-/* Conditional protocol libraries */
-#ifdef ENABLE_KAFKA
-#include <librdkafka/rdkafka.h>
-#endif
-
-#ifdef ENABLE_MQTT
-#include <mosquitto.h>
-#endif
+#include "miscadmin.h" /* For max_worker_processes, MyDatabaseId */
 
 typedef struct WorkerStatusContext {
     int row_count;
@@ -110,13 +93,100 @@ void _PG_init(void) {
  *
  * NOTE: External library cleanup is done in the worker process.
  */
-void _PG_fini(void) { elog(INFO, "[ulak] extension unloaded successfully"); }
+void _PG_fini(void) { elog(LOG, "[ulak] extension unloaded successfully"); }
+
+/**
+ * @brief Return the number of pending/processing messages for backpressure.
+ *
+ * The queue is only counted once per ULAK_BACKPRESSURE_CACHE_USEC per
+ * database; in between, callers get the cached value from shared memory.
+ * Counting on every send() was O(queue size) per insert.
+ *
+ * @param reserve Rows the caller is about to insert. They are added to the
+ *                cached count after it is read, so back-to-back sends within
+ *                the cache window still see each other and a burst cannot
+ *                blow through the limit. The next real count replaces the
+ *                reservation, so a rejected send over-counts for at most one
+ *                cache window.
+ *
+ * Must be called with SPI connected.
+ */
+static int64 ulak_backpressure_active_count(int64 reserve) {
+    TimestampTz now = GetCurrentTimestamp();
+    int64 count = 0;
+    bool isnull = true;
+    int ret;
+
+    if (reserve < 0)
+        reserve = 0;
+
+    if (ulak_shmem != NULL && ulak_shmem->lock != NULL) {
+        LWLockAcquire(ulak_shmem->lock, LW_EXCLUSIVE);
+        if (ulak_shmem->active_count_dboid == MyDatabaseId &&
+            ulak_shmem->active_count_checked_at != 0 &&
+            now - ulak_shmem->active_count_checked_at < ULAK_BACKPRESSURE_CACHE_USEC) {
+            count = ulak_shmem->active_count_cache;
+            ulak_shmem->active_count_cache = count + reserve;
+            LWLockRelease(ulak_shmem->lock);
+            return count;
+        }
+        LWLockRelease(ulak_shmem->lock);
+    }
+
+    ret = SPI_execute("SELECT count(*) FROM ulak.queue WHERE status IN ('pending', 'processing')",
+                      true, 1);
+    if (ret != SPI_OK_SELECT || SPI_processed == 0 || SPI_tuptable == NULL)
+        ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+                        errmsg("[ulak] failed to count active queue messages: %s",
+                               SPI_result_code_string(ret))));
+
+    count = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+    if (isnull)
+        count = 0;
+
+    if (ulak_shmem != NULL && ulak_shmem->lock != NULL) {
+        LWLockAcquire(ulak_shmem->lock, LW_EXCLUSIVE);
+        ulak_shmem->active_count_dboid = MyDatabaseId;
+        ulak_shmem->active_count_cache = count + reserve;
+        ulak_shmem->active_count_checked_at = now;
+        LWLockRelease(ulak_shmem->lock);
+    }
+
+    return count;
+}
+
+/**
+ * @brief SQL-callable wrapper: ulak._active_queue_count(p_reserve bigint).
+ *
+ * Used by ulak._check_backpressure() (PL/pgSQL) so the SQL API shares the
+ * same cached count (and reservation) as the C send() path.
+ */
+PG_FUNCTION_INFO_V1(ulak_active_queue_count);
+Datum ulak_active_queue_count(PG_FUNCTION_ARGS) {
+    int64 reserve = PG_ARGISNULL(0) ? 0 : PG_GETARG_INT64(0);
+    int64 count;
+    int ret;
+
+    ret = SPI_connect();
+    if (ret != SPI_OK_CONNECT)
+        ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+                        errmsg("SPI_connect failed: %s", SPI_result_code_string(ret))));
+
+    count = ulak_backpressure_active_count(reserve);
+
+    SPI_finish();
+    PG_RETURN_INT64(count);
+}
 
 /**
  * @brief Main function to send messages.
  *
  * Interface Adapter -- enqueues a message for async delivery.
  * Usage: SELECT ulak.send('endpoint_name', '{"key": "value"}'::jsonb);
+ *
+ * Runs backpressure check, endpoint lookup and INSERT in one SPI session.
+ * Errors raised via ereport(ERROR) abort the transaction, which also releases
+ * SPI state, so no manual cleanup is needed on the error paths.
  *
  * @param fcinfo Function call info (endpoint_name text, payload jsonb).
  * @return Boolean true on success.
@@ -125,16 +195,11 @@ PG_FUNCTION_INFO_V1(ulak_send);
 Datum ulak_send(PG_FUNCTION_ARGS) {
     text *endpoint_name_text;
     Jsonb *payload_jsonb;
-    char *endpoint_name;
     int ret;
-    StringInfoData query;
-    TupleDesc tupdesc;
-    HeapTuple tuple;
-    bool isnull;
+    bool isnull = true;
     int64 endpoint_id;
-    Message *message;
-    QueueManager *queue_manager;
-    QueueOperationResult *result;
+    size_t payload_size;
+    size_t max_payload;
 
     /* Validate arguments */
     if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
@@ -143,99 +208,57 @@ Datum ulak_send(PG_FUNCTION_ARGS) {
 
     endpoint_name_text = PG_GETARG_TEXT_PP(0);
     payload_jsonb = PG_GETARG_JSONB_P(1);
-    endpoint_name = text_to_cstring(endpoint_name_text);
 
-    /* Validate endpoint exists using queue manager */
-    initStringInfo(&query);
-    appendStringInfo(&query, "SELECT id FROM ulak.endpoints WHERE name = $1 AND enabled = true");
+    /* Payload size guard (ulak.max_payload_size) */
+    payload_size = VARSIZE(payload_jsonb);
+    max_payload = ulak_max_payload_size > 0 ? (size_t)ulak_max_payload_size : (1024 * 1024);
+    if (payload_size > max_payload)
+        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                        errmsg("payload size %zu bytes exceeds ulak.max_payload_size (%zu bytes)",
+                               payload_size, max_payload)));
 
     ret = SPI_connect();
-    if (ret != SPI_OK_CONNECT) {
-        pfree(query.data);
-        pfree(endpoint_name);
+    if (ret != SPI_OK_CONNECT)
         ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
                         errmsg("SPI_connect failed: %s", SPI_result_code_string(ret))));
-    }
 
-    /* Backpressure check */
+    /* Backpressure check (cached count, see ulak_backpressure_active_count) */
     if (ulak_max_queue_size > 0) {
-        int64 threshold_offset = ulak_max_queue_size - 1;
+        int64 active = ulak_backpressure_active_count(1);
 
-        ret = SPI_execute_with_args("SELECT 1 FROM ulak.queue "
-                                    "WHERE status IN ('pending', 'processing') "
-                                    "OFFSET $1 LIMIT 1",
-                                    1, (Oid[]){INT8OID}, (Datum[]){Int64GetDatum(threshold_offset)},
-                                    NULL, true, 1);
-        if (ret == SPI_OK_SELECT && SPI_processed > 0) {
-            SPI_finish();
-            pfree(query.data);
-            pfree(endpoint_name);
+        if (active + 1 > (int64)ulak_max_queue_size)
             ereport(ERROR,
                     (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
                      errmsg("[ulak] Queue backpressure: pending/processing queue is at or above "
                             "limit %d",
                             ulak_max_queue_size)));
-        }
     }
 
-    ret = SPI_execute_with_args(query.data, 1, (Oid[]){TEXTOID},
-                                (Datum[]){PointerGetDatum(endpoint_name_text)}, NULL, true, 0);
-
-    if (ret != SPI_OK_SELECT || SPI_processed == 0 || SPI_tuptable == NULL) {
-        SPI_finish();
-        pfree(query.data);
-        pfree(endpoint_name);
+    /* Validate endpoint exists and is enabled */
+    ret = SPI_execute_with_args("SELECT id FROM ulak.endpoints WHERE name = $1 AND enabled = true",
+                                1, (Oid[]){TEXTOID}, (Datum[]){PointerGetDatum(endpoint_name_text)},
+                                NULL, true, 1);
+    if (ret != SPI_OK_SELECT || SPI_processed == 0 || SPI_tuptable == NULL)
         ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
-                        errmsg("endpoint '%s' does not exist or is disabled", endpoint_name)));
-    }
+                        errmsg("endpoint '%s' does not exist or is disabled",
+                               text_to_cstring(endpoint_name_text))));
 
-    /* Get endpoint ID */
-    tupdesc = SPI_tuptable->tupdesc;
-    tuple = SPI_tuptable->vals[0];
-    endpoint_id = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 1, &isnull));
+    endpoint_id =
+        DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+
+    /* Insert message into queue (fully parameterized) */
+    ret = SPI_execute_with_args(
+        "INSERT INTO ulak.queue "
+        "(endpoint_id, payload, status, retry_count, next_retry_at) "
+        "VALUES ($1, $2, 'pending', 0, NOW())",
+        2, (Oid[]){INT8OID, JSONBOID},
+        (Datum[]){Int64GetDatum(endpoint_id), JsonbPGetDatum(payload_jsonb)}, NULL, false, 0);
+    if (ret != SPI_OK_INSERT)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("failed to insert message into queue: %s", SPI_result_code_string(ret))));
 
     SPI_finish();
-    pfree(query.data);
-
-    /* Create message entity */
-    message = message_create(endpoint_id, payload_jsonb);
-    if (!message) {
-        pfree(endpoint_name);
-        ereport(ERROR,
-                (errcode(ERRCODE_INTERNAL_ERROR), errmsg("failed to create message entity")));
-    }
-
-    /* Insert message into queue using queue manager */
-    queue_manager = queue_manager_create();
-    if (!queue_manager) {
-        message_free(message);
-        pfree(endpoint_name);
-        ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg("failed to create queue manager")));
-    }
-
-    result = queue_insert_message(queue_manager, message);
-    if (!result || !result->success) {
-        /* Copy error message before freeing result (ereport never returns) */
-        const char *err_msg =
-            (result && result->error_message) ? result->error_message : "Unknown error";
-        char *err_copy = pstrdup(err_msg);
-
-        /* Cleanup before error - ereport(ERROR) uses longjmp, never returns */
-        queue_operation_result_free(result);
-        queue_manager_free(queue_manager);
-        message_free(message);
-        pfree(endpoint_name);
-        ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-                        errmsg("failed to insert message into queue: %s", err_copy)));
-    }
-
-    /* Cleanup */
-    queue_manager_free(queue_manager);
-    message_free(message);
-    pfree(endpoint_name);
-
-    /* Free result to avoid memory leak */
-    queue_operation_result_free(result);
 
     /* Note: pg_notify will be called by the trigger after commit */
     elog(DEBUG1, "[ulak] Message queued successfully for endpoint_id: %lld",
@@ -247,10 +270,10 @@ Datum ulak_send(PG_FUNCTION_ARGS) {
 /**
  * @brief Create a new message endpoint.
  *
- * Interface Adapter -- validates protocol/config and inserts into ulak.endpoints.
+ * Interface Adapter -- validates name, protocol and config, then inserts
+ * into ulak.endpoints. Protocols that were not compiled in are rejected.
  *
- * @param fcinfo Function call info (name text, protocol text, config jsonb,
- *               optional retry_policy jsonb).
+ * @param fcinfo Function call info (name text, protocol text, config jsonb).
  * @return The new endpoint's ID (int64).
  */
 PG_FUNCTION_INFO_V1(ulak_create_endpoint);
@@ -258,15 +281,12 @@ Datum ulak_create_endpoint(PG_FUNCTION_ARGS) {
     text *endpoint_name_text;
     text *protocol_text;
     Jsonb *config_jsonb;
-    Jsonb *retry_policy_jsonb = NULL;
     char *endpoint_name;
     char *protocol_str;
-    ProtocolType protocol = PROTOCOL_TYPE_HTTP; /* Initialize to suppress cppcheck warning */
+    ProtocolType protocol = PROTOCOL_TYPE_HTTP;
     int64 endpoint_id;
+    bool isnull = true;
     int ret;
-    StringInfoData query;
-    RetryPolicy *retry_policy = NULL;
-    Endpoint *endpoint;
 
     /* Validate arguments */
     if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
@@ -279,17 +299,8 @@ Datum ulak_create_endpoint(PG_FUNCTION_ARGS) {
     endpoint_name = text_to_cstring(endpoint_name_text);
     protocol_str = text_to_cstring(protocol_text);
 
-    /* Note: SQL function has 3 args (name, protocol, config).
-     * retry_policy_jsonb support is reserved for a future 4-arg overload.
-     * Only access PG_NARGS()-checked arg slots to avoid reading garbage memory. */
-    if (PG_NARGS() > 3 && !PG_ARGISNULL(3))
-        retry_policy_jsonb = PG_GETARG_JSONB_P(3);
-
     /* Validate endpoint name */
     if (!endpoint_validate_name(endpoint_name)) {
-        /* Note: No pfree() before ereport(ERROR) - it never returns (longjmp),
-         * and the memory context will be cleaned up on error anyway.
-         * Calling pfree() before ereport() causes use-after-free bugs. */
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                         errmsg("Invalid endpoint name: %s", endpoint_name)));
     }
@@ -360,95 +371,31 @@ Datum ulak_create_endpoint(PG_FUNCTION_ARGS) {
                         errmsg("Invalid configuration for protocol %s", protocol_str)));
     }
 
-    /* Create retry policy if provided */
-    if (retry_policy_jsonb) {
-        retry_policy =
-            retry_policy_create(config_get_default_max_retries(), BACKOFF_STRATEGY_EXPONENTIAL);
-        if (!retry_policy) {
-            pfree(endpoint_name);
-            pfree(protocol_str);
-            ereport(ERROR,
-                    (errcode(ERRCODE_INTERNAL_ERROR), errmsg("Failed to create retry policy")));
-        }
-    }
-
-    /* Create endpoint entity */
-    endpoint = endpoint_create(endpoint_name, protocol, config_jsonb, retry_policy);
-    if (!endpoint) {
-        if (retry_policy)
-            retry_policy_free(retry_policy);
-        pfree(endpoint_name);
-        pfree(protocol_str);
-        ereport(ERROR,
-                (errcode(ERRCODE_INTERNAL_ERROR), errmsg("Failed to create endpoint entity")));
-    }
-
-    /* Insert endpoint into database */
-    initStringInfo(&query);
-    if (retry_policy_jsonb) {
-        appendStringInfo(&query, "INSERT INTO ulak.endpoints (name, protocol, "
-                                 "config, retry_policy) "
-                                 "VALUES ($1, $2, $3, $4) RETURNING id");
-    } else {
-        appendStringInfo(&query, "INSERT INTO ulak.endpoints (name, protocol, config) "
-                                 "VALUES ($1, $2, $3) RETURNING id");
-    }
-
     ret = SPI_connect();
-    if (ret != SPI_OK_CONNECT) {
-        pfree(query.data);
-        endpoint_free(endpoint);
-        pfree(endpoint_name);
-        pfree(protocol_str);
+    if (ret != SPI_OK_CONNECT)
         ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
                         errmsg("SPI_connect failed: %s", SPI_result_code_string(ret))));
-    }
 
-    if (retry_policy_jsonb) {
-        ret = SPI_execute_with_args(
-            query.data, 4, (Oid[]){TEXTOID, TEXTOID, JSONBOID, JSONBOID},
-            (Datum[]){PointerGetDatum(endpoint_name_text), PointerGetDatum(protocol_text),
-                      JsonbPGetDatum(config_jsonb), JsonbPGetDatum(retry_policy_jsonb)},
-            NULL, false, 0);
-    } else {
-        ret = SPI_execute_with_args(query.data, 3, (Oid[]){TEXTOID, TEXTOID, JSONBOID},
-                                    (Datum[]){PointerGetDatum(endpoint_name_text),
-                                              PointerGetDatum(protocol_text),
-                                              JsonbPGetDatum(config_jsonb)},
-                                    NULL, false, 0);
-    }
+    ret = SPI_execute_with_args("INSERT INTO ulak.endpoints (name, protocol, config) "
+                                "VALUES ($1, $2, $3) RETURNING id",
+                                3, (Oid[]){TEXTOID, TEXTOID, JSONBOID},
+                                (Datum[]){PointerGetDatum(endpoint_name_text),
+                                          PointerGetDatum(protocol_text),
+                                          JsonbPGetDatum(config_jsonb)},
+                                NULL, false, 0);
 
-    if (ret != SPI_OK_INSERT_RETURNING) {
-        SPI_finish();
-        pfree(query.data);
-        endpoint_free(endpoint);
-        pfree(endpoint_name);
-        pfree(protocol_str);
+    if (ret != SPI_OK_INSERT_RETURNING || SPI_processed == 0 || SPI_tuptable == NULL)
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR), errmsg("Failed to create endpoint in database")));
-    }
 
-    if (SPI_processed > 0 && SPI_tuptable != NULL) {
-        TupleDesc tupdesc = SPI_tuptable->tupdesc;
-        HeapTuple tuple = SPI_tuptable->vals[0];
-        bool isnull;
-        endpoint_id = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 1, &isnull));
-    } else {
-        SPI_finish();
-        pfree(query.data);
-        endpoint_free(endpoint);
-        pfree(endpoint_name);
-        pfree(protocol_str);
-        ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg("Failed to get endpoint ID")));
-    }
+    endpoint_id =
+        DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
 
     SPI_finish();
-    pfree(query.data);
-    endpoint_free(endpoint);
     pfree(endpoint_name);
     pfree(protocol_str);
 
-    elog(INFO, "[ulak] Created endpoint with ID %lld", (long long)endpoint_id);
+    elog(LOG, "[ulak] Created endpoint with ID %lld", (long long)endpoint_id);
     PG_RETURN_INT64(endpoint_id);
 }
 
@@ -501,7 +448,7 @@ Datum ulak_drop_endpoint(PG_FUNCTION_ARGS) {
     pfree(query.data);
 
     if (rows_affected > 0) {
-        elog(INFO, "[ulak] Dropped endpoint '%s'", text_to_cstring(endpoint_name));
+        elog(LOG, "[ulak] Dropped endpoint '%s'", text_to_cstring(endpoint_name));
         PG_RETURN_BOOL(true);
     } else {
         ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -643,7 +590,7 @@ Datum ulak_alter_endpoint(PG_FUNCTION_ARGS) {
     pfree(query.data);
 
     if (rows_affected > 0) {
-        elog(INFO, "[ulak] Altered endpoint '%s'", text_to_cstring(endpoint_name));
+        elog(LOG, "[ulak] Altered endpoint '%s'", text_to_cstring(endpoint_name));
         pfree(protocol_str);
         PG_RETURN_BOOL(true);
     } else {
@@ -1074,33 +1021,6 @@ Datum ulak_shmem_metrics(PG_FUNCTION_ARGS) {
                 ctx->rows[ctx->row_count].type = "counter";
                 ctx->row_count++;
             }
-
-            /* Global launcher metrics */
-            LWLockAcquire(ulak_shmem->lock, LW_SHARED);
-
-            if (ctx->row_count < 250) {
-                ctx->rows[ctx->row_count].name = "spawns_total";
-                ctx->rows[ctx->row_count].value = (double)ulak_shmem->total_spawns;
-                snprintf(ctx->rows[ctx->row_count].labels, sizeof(ctx->rows[0].labels), "{}");
-                ctx->rows[ctx->row_count].type = "counter";
-                ctx->row_count++;
-            }
-            if (ctx->row_count < 250) {
-                ctx->rows[ctx->row_count].name = "spawn_failures_total";
-                ctx->rows[ctx->row_count].value = (double)ulak_shmem->total_spawn_failures;
-                snprintf(ctx->rows[ctx->row_count].labels, sizeof(ctx->rows[0].labels), "{}");
-                ctx->rows[ctx->row_count].type = "counter";
-                ctx->row_count++;
-            }
-            if (ctx->row_count < 250) {
-                ctx->rows[ctx->row_count].name = "restarts_total";
-                ctx->rows[ctx->row_count].value = (double)ulak_shmem->total_restarts;
-                snprintf(ctx->rows[ctx->row_count].labels, sizeof(ctx->rows[0].labels), "{}");
-                ctx->rows[ctx->row_count].type = "counter";
-                ctx->row_count++;
-            }
-
-            LWLockRelease(ulak_shmem->lock);
         }
 
         funcctx->user_fctx = ctx;

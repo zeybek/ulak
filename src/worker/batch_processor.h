@@ -23,7 +23,8 @@
  * @param worker_dboid  Database OID for shmem metric updates.
  * @param worker_id     This worker's ID (0 to total_workers-1).
  * @param total_workers Total number of workers for this database.
- * @return Number of messages successfully processed in this batch.
+ * @return Number of messages fetched (claimed) in this batch, so the caller can
+ *         tell whether the batch was full and another cycle should run immediately.
  */
 extern int64 batch_processor_run(Oid worker_dboid, int worker_id, int total_workers);
 

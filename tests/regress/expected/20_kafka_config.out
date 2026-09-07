@@ -10,7 +10,6 @@ SELECT ulak.create_endpoint(
     'kafka',
     '{"broker": "localhost:9092", "topic": "test-topic"}'::jsonb
 ) IS NOT NULL AS minimal_created;
-INFO:  [ulak] Created endpoint with ID 51
  minimal_created 
 -----------------
  t
@@ -22,7 +21,6 @@ SELECT ulak.create_endpoint(
     'kafka',
     '{"broker": "broker1:9092,broker2:9092", "topic": "events", "key": "static-key", "partition": 0, "headers": {"ce_type": "test.event", "x-source": "ulak"}}'::jsonb
 ) IS NOT NULL AS full_created;
-INFO:  [ulak] Created endpoint with ID 52
  full_created 
 --------------
  t
@@ -34,7 +32,6 @@ SELECT ulak.create_endpoint(
     'kafka',
     '{"broker": "localhost:9092", "topic": "opts-topic", "options": {"compression.codec": "lz4", "linger.ms": "10", "batch.num.messages": "1000"}}'::jsonb
 ) IS NOT NULL AS options_created;
-INFO:  [ulak] Created endpoint with ID 53
  options_created 
 -----------------
  t
@@ -147,7 +144,6 @@ SELECT ulak.alter_endpoint(
     'kafka_minimal',
     '{"broker": "new-broker:9092", "topic": "new-topic"}'::jsonb
 ) AS altered;
-INFO:  [ulak] Altered endpoint 'kafka_minimal'
  altered 
 ---------
  t
@@ -226,21 +222,18 @@ DELETE FROM ulak.queue WHERE endpoint_id IN (
     SELECT id FROM ulak.endpoints WHERE name LIKE 'kafka_%'
 );
 SELECT ulak.drop_endpoint('kafka_minimal');
-INFO:  [ulak] Dropped endpoint 'kafka_minimal'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('kafka_full');
-INFO:  [ulak] Dropped endpoint 'kafka_full'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('kafka_options');
-INFO:  [ulak] Dropped endpoint 'kafka_options'
  drop_endpoint 
 ---------------
  t

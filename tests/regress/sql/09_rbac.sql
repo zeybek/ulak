@@ -30,6 +30,10 @@ DELETE FROM ulak.queue WHERE payload @> '{"rbac":"admin_msg"}'::jsonb;
 -- Admin can delete endpoints
 DELETE FROM ulak.endpoints WHERE name = 'rbac_admin_ep';
 
+-- Admin can call endpoint health and fast mode helpers
+SELECT count(*) >= 0 AS admin_can_call_endpoint_health FROM ulak.get_endpoint_health();
+SELECT ulak.enable_fast_mode() AS admin_can_enable_fast_mode;
+
 -- Archive maintenance functions are executable as admin via SECURITY DEFINER
 SELECT proname, prosecdef
 FROM pg_proc
@@ -45,8 +49,13 @@ RESET ROLE;
 
 SET ROLE ulak_application;
 
--- Application can read endpoints
+-- Application CANNOT read endpoints directly (config holds credentials)
 SELECT count(*) >= 0 AS app_can_read_endpoints FROM ulak.endpoints;
+
+-- Application reads endpoint state through the view / health function instead
+SELECT count(*) >= 0 AS app_can_read_endpoint_status FROM ulak.endpoint_status;
+SELECT count(*) >= 0 AS app_can_call_endpoint_health FROM ulak.get_endpoint_health();
+SELECT ulak.enable_fast_mode() AS app_can_enable_fast_mode;
 
 -- Application can read queue
 SELECT count(*) >= 0 AS app_can_read_queue FROM ulak.queue;
@@ -79,8 +88,13 @@ RESET ROLE;
 
 SET ROLE ulak_monitor;
 
--- Monitor can read endpoints
+-- Monitor CANNOT read endpoints directly (config holds credentials)
 SELECT count(*) >= 0 AS monitor_can_read_endpoints FROM ulak.endpoints;
+
+-- Monitor reads endpoint state through the view / health function / metrics
+SELECT count(*) >= 0 AS monitor_can_read_endpoint_status FROM ulak.endpoint_status;
+SELECT count(*) >= 0 AS monitor_can_call_endpoint_health FROM ulak.get_endpoint_health();
+SELECT count(*) >= 0 AS monitor_can_call_metrics FROM ulak.metrics();
 
 -- Monitor can read queue
 SELECT count(*) >= 0 AS monitor_can_read_queue FROM ulak.queue;

@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <string.h>
+#include <sys/socket.h>
 #include "config/guc.h"
 #include "http_internal.h"
 #include "postgres.h"
@@ -71,6 +72,40 @@ bool http_validate_proxy_url_scheme(const char *url, size_t url_len) {
     if (url_len >= 9 && pg_strncasecmp(url, "socks5://", 9) == 0)
         return true;
 
+    return false;
+}
+
+/**
+ * @brief Check whether a URL carries userinfo ("user:pass@host") in its authority.
+ *
+ * Userinfo is rejected outright: it lets "http://trusted.example:80@10.0.0.1/"
+ * fool naive host parsing (the part before ':' looks like a public host while
+ * curl connects to 10.0.0.1), and credentials belong in the auth config, not
+ * the URL.
+ *
+ * @param url      URL string.
+ * @param url_len  Length of the URL string.
+ * @return true if an '@' appears inside the authority component.
+ */
+bool http_url_has_userinfo(const char *url, size_t url_len) {
+    const char *p;
+    const char *end;
+
+    if (url == NULL || url_len == 0)
+        return false;
+
+    p = strstr(url, "://");
+    if (p == NULL)
+        return false;
+    p += 3;
+    end = url + url_len;
+
+    for (; p < end && *p; p++) {
+        if (*p == '/' || *p == '?' || *p == '#')
+            return false;
+        if (*p == '@')
+            return true;
+    }
     return false;
 }
 
@@ -162,6 +197,15 @@ bool http_is_internal_url(const char *url, size_t url_len) {
         return true;
     }
 
+    /* 100.64.0.0/10 (carrier-grade NAT / shared address space) */
+    if (strncmp(hostname, "100.", 4) == 0) {
+        int second_octet = -1;
+        if (sscanf(hostname + 4, "%d", &second_octet) == 1 && second_octet >= 64 &&
+            second_octet <= 127) {
+            return true;
+        }
+    }
+
     /* IPv6 link-local and site-local */
     if (pg_strncasecmp(hostname, "fe80:", 5) == 0 || pg_strncasecmp(hostname, "fc00:", 5) == 0 ||
         pg_strncasecmp(hostname, "fd00:", 5) == 0) {
@@ -229,10 +273,18 @@ bool http_is_internal_url(const char *url, size_t url_len) {
                          hostname);
                     return true;
                 }
-                /* 0.0.0.0 */
-                if (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0) {
+                /* 100.64.0.0/10 (CGNAT shared address space) */
+                if (ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127) {
                     freeaddrinfo(result);
-                    elog(WARNING, "[ulak] DNS rebinding blocked: '%s' resolves to 0.0.0.0",
+                    elog(WARNING, "[ulak] DNS rebinding blocked: '%s' resolves to 100.64.0.0/10",
+                         hostname);
+                    return true;
+                }
+                /* 0.0.0.0/8 ("this network"; Linux treats it as local) — same
+                 * range the connect-time guard refuses, so reject early. */
+                if (ip[0] == 0) {
+                    freeaddrinfo(result);
+                    elog(WARNING, "[ulak] DNS rebinding blocked: '%s' resolves to 0.0.0.0/8",
                          hostname);
                     return true;
                 }
@@ -294,4 +346,96 @@ bool http_is_valid_method(const char *method, size_t len) {
     }
 
     return false;
+}
+
+/**
+ * @brief Check whether a resolved socket address is internal/private.
+ *
+ * Operates on the actual sockaddr curl is about to connect to (IPv4, IPv6,
+ * and IPv4-mapped IPv6), covering loopback, RFC 1918 private ranges, the
+ * link-local / cloud-metadata range (169.254.0.0/16), 0.0.0.0/8, IPv6
+ * loopback/link-local, and unique-local fc00::/7.
+ *
+ * NOTE: keep the blocked ranges in sync with the string/getaddrinfo checks in
+ * http_is_internal_url(); this is the connect-time counterpart that closes the
+ * DNS-rebinding TOCTOU (curl re-resolves independently at transfer time).
+ *
+ * @param sa  Resolved socket address.
+ * @return true if the address is internal/private (should be blocked).
+ */
+static bool ulak_sockaddr_is_internal(const struct sockaddr *sa) {
+    if (sa == NULL) {
+        return false;
+    }
+
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)sa;
+        const unsigned char *ip = (const unsigned char *)&ipv4->sin_addr;
+
+        if (ip[0] == 127) /* 127.0.0.0/8 loopback */
+            return true;
+        if (ip[0] == 10) /* 10.0.0.0/8 private */
+            return true;
+        if (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) /* 172.16.0.0/12 */
+            return true;
+        if (ip[0] == 192 && ip[1] == 168) /* 192.168.0.0/16 */
+            return true;
+        if (ip[0] == 169 && ip[1] == 254) /* 169.254.0.0/16 link-local / metadata */
+            return true;
+        if (ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127) /* 100.64.0.0/10 CGNAT */
+            return true;
+        if (ip[0] == 0) /* 0.0.0.0/8 */
+            return true;
+    } else if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *ipv6 = (const struct sockaddr_in6 *)sa;
+        const unsigned char *ip6 = ipv6->sin6_addr.s6_addr;
+
+        if (IN6_IS_ADDR_LOOPBACK(&ipv6->sin6_addr)) /* ::1 */
+            return true;
+        if (IN6_IS_ADDR_LINKLOCAL(&ipv6->sin6_addr)) /* fe80::/10 */
+            return true;
+        if (ip6[0] == 0xfc || ip6[0] == 0xfd) /* fc00::/7 unique-local */
+            return true;
+        /* IPv4-mapped IPv6 (::ffff:a.b.c.d) — re-check the embedded IPv4, so a
+         * rebind to ::ffff:169.254.169.254 cannot bypass the IPv4 blocklist. */
+        if (IN6_IS_ADDR_V4MAPPED(&ipv6->sin6_addr)) {
+            const unsigned char *m = &ip6[12];
+            if (m[0] == 127 || m[0] == 10 || m[0] == 0 ||
+                (m[0] == 172 && m[1] >= 16 && m[1] <= 31) || (m[0] == 192 && m[1] == 168) ||
+                (m[0] == 169 && m[1] == 254) || (m[0] == 100 && m[1] >= 64 && m[1] <= 127))
+                return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * @brief curl CURLOPT_OPENSOCKETFUNCTION callback enforcing SSRF protection.
+ *
+ * curl resolves DNS independently at transfer time, so a string/validate-time
+ * check (http_is_internal_url) cannot prevent DNS rebinding: a hostname can
+ * resolve to a public IP at endpoint-create time and to 127.0.0.1 /
+ * 169.254.169.254 at dispatch time. This callback runs for every connection
+ * curl actually makes (including redirects) and inspects the real resolved
+ * address before connecting, aborting the connect when it is internal — closing
+ * the TOCTOU. Honors the ulak.http_allow_internal_urls bypass GUC.
+ *
+ * @param clientp  Unused (CURLOPT_OPENSOCKETDATA not set).
+ * @param purpose  Connection purpose; only IP connections are guarded.
+ * @param address  Resolved address curl is about to connect to.
+ * @return An open socket fd on success, or CURL_SOCKET_BAD to abort the connect.
+ */
+curl_socket_t ulak_http_opensocket_guard(void *clientp, curlsocktype purpose,
+                                         struct curl_sockaddr *address) {
+    (void)clientp;
+
+    if (purpose == CURLSOCKTYPE_IPCXN && !ulak_http_allow_internal_urls &&
+        ulak_sockaddr_is_internal(&address->addr)) {
+        elog(WARNING, "[ulak] SSRF blocked: connection to internal/private address refused "
+                      "(connect-time DNS-rebinding guard)");
+        return CURL_SOCKET_BAD;
+    }
+
+    return socket(address->family, address->socktype, address->protocol);
 }

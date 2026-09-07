@@ -9,7 +9,6 @@ SELECT ulak.create_endpoint(
     'http',
     '{"url": "http://localhost:9999/cb", "method": "POST"}'::jsonb
 ) IS NOT NULL AS created;
-INFO:  [ulak] Created endpoint with ID 15
  created 
 ---------
  t
@@ -192,7 +191,6 @@ ORDER BY payload->>'exp';
 DELETE FROM ulak.queue WHERE endpoint_id = (SELECT endpoint_id FROM test_ids);
 DROP TABLE test_ids;
 SELECT ulak.drop_endpoint('cb_test_endpoint');
-INFO:  [ulak] Dropped endpoint 'cb_test_endpoint'
  drop_endpoint 
 ---------------
  t

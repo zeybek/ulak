@@ -8,7 +8,6 @@ SELECT ulak.create_endpoint('proxy_basic', 'http', '{
     "url": "http://localhost:9999/webhook",
     "proxy": {"url": "http://proxy.corp.com:8080"}
 }'::jsonb) IS NOT NULL AS proxy_basic_ok;
-INFO:  [ulak] Created endpoint with ID 45
  proxy_basic_ok 
 ----------------
  t
@@ -27,7 +26,6 @@ SELECT ulak.create_endpoint('proxy_full', 'http', '{
         "ssl_verify": true
     }
 }'::jsonb) IS NOT NULL AS proxy_full_ok;
-INFO:  [ulak] Created endpoint with ID 46
  proxy_full_ok 
 ---------------
  t
@@ -38,7 +36,6 @@ SELECT ulak.create_endpoint('proxy_socks5', 'http', '{
     "url": "http://localhost:9999/webhook",
     "proxy": {"url": "socks5://socks.corp.com:1080", "type": "socks5"}
 }'::jsonb) IS NOT NULL AS proxy_socks5_ok;
-INFO:  [ulak] Created endpoint with ID 47
  proxy_socks5_ok 
 -----------------
  t
@@ -54,7 +51,6 @@ SELECT ulak.create_endpoint('proxy_https', 'http', '{
         "ssl_verify": true
     }
 }'::jsonb) IS NOT NULL AS proxy_https_ok;
-INFO:  [ulak] Created endpoint with ID 48
  proxy_https_ok 
 ----------------
  t
@@ -65,7 +61,6 @@ SELECT ulak.create_endpoint('proxy_noverify', 'http', '{
     "url": "http://localhost:9999/webhook",
     "proxy": {"url": "https://dev-proxy.local:8080", "ssl_verify": false}
 }'::jsonb) IS NOT NULL AS proxy_noverify_ok;
-INFO:  [ulak] Created endpoint with ID 49
  proxy_noverify_ok 
 -------------------
  t
@@ -79,7 +74,6 @@ SELECT ulak.create_endpoint('proxy_combined', 'http', '{
     "cloudevents": true,
     "cloudevents_mode": "binary"
 }'::jsonb) IS NOT NULL AS proxy_combined_ok;
-INFO:  [ulak] Created endpoint with ID 50
  proxy_combined_ok 
 -------------------
  t
@@ -134,42 +128,36 @@ ERROR:  Invalid configuration for protocol http
 -- CLEANUP
 -- ============================================================================
 SELECT ulak.drop_endpoint('proxy_basic');
-INFO:  [ulak] Dropped endpoint 'proxy_basic'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('proxy_full');
-INFO:  [ulak] Dropped endpoint 'proxy_full'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('proxy_socks5');
-INFO:  [ulak] Dropped endpoint 'proxy_socks5'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('proxy_https');
-INFO:  [ulak] Dropped endpoint 'proxy_https'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('proxy_noverify');
-INFO:  [ulak] Dropped endpoint 'proxy_noverify'
  drop_endpoint 
 ---------------
  t
 (1 row)
 
 SELECT ulak.drop_endpoint('proxy_combined');
-INFO:  [ulak] Dropped endpoint 'proxy_combined'
  drop_endpoint 
 ---------------
  t

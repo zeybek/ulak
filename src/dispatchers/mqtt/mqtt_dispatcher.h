@@ -77,6 +77,8 @@ typedef struct MqttDispatcher {
     /** @{ */
     int last_mid;       /**< Last message ID for dispatch_ex. */
     bool clean_session; /**< Clean session flag. */
+    int sync_wait_mid; /**< mid the synchronous dispatch is waiting a PUBACK/PUBCOMP for (0 = none). */
+    bool sync_acked; /**< Set by the publish callback when sync_wait_mid is acknowledged. */
     /** @} */
 
     /** @name Batch delivery tracking */

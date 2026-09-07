@@ -120,6 +120,7 @@ Dispatcher *kafka_dispatcher_create(Jsonb *config) {
     kafka_dispatcher->pending_messages = palloc(sizeof(KafkaPendingMessage) * batch_capacity);
     kafka_dispatcher->pending_count = 0;
     kafka_dispatcher->pending_capacity = batch_capacity;
+    kafka_dispatcher->batch_generation = 1;
 
     /* Initialize spinlock for thread safety during callback/realloc */
     SpinLockInit(&kafka_dispatcher->pending_lock);

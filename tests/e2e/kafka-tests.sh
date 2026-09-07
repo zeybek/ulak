@@ -173,6 +173,23 @@ fi
 KAFKA_MSG=$(kcat_count "kt-headers")
 assert_eq "Message delivered to Kafka" "1" "$KAFKA_MSG"
 
+# ── Per-message headers (ulak.queue.headers is a flat object; overrides static keys) ──
+section "Per-message headers override static headers..."
+psql_quiet "DELETE FROM ulak.queue;"
+kafka_create_topic "kt-msg-headers"
+create_endpoint "kt-msg-headers" "{\"broker\": \"${KAFKA_BROKER}\", \"topic\": \"kt-msg-headers\", \"headers\": {\"x-source\": \"static\"}}" "kafka"
+
+# ulak.queue.headers is immutable after insert (audit trigger), so set it on the
+# row itself the way an admin/ETL path would (send() has no headers parameter).
+psql_quiet "INSERT INTO ulak.queue (endpoint_id, payload, headers) SELECT id, '{\"order_id\": 43}'::jsonb, '{\"x-trace\": \"trace-43\", \"x-source\": \"per-message\"}'::jsonb FROM ulak.endpoints WHERE name = 'kt-msg-headers';"
+
+wait_queue_drain 20
+sleep 2
+
+MSG_HEADERS=$(docker exec ulak-postgres-1 timeout 5 kcat -b "$KAFKA_BROKER" -t kt-msg-headers -C -e -o beginning -f '%h\n' 2>/dev/null | head -1)
+assert_contains "Per-message header forwarded" "x-trace=trace-43" "$MSG_HEADERS"
+assert_contains "Per-message header overrides static" "x-source=per-message" "$MSG_HEADERS"
+
 # ═══════════════════════════════════════════════════
 # TEST 5: Throughput (1K messages)
 # ═══════════════════════════════════════════════════
@@ -281,6 +298,7 @@ sleep 20
 # Should be in pending/retry state (retryable error)
 STATUS=$(psql_exec "SELECT status FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'kt-err') LIMIT 1;")
 ERROR=$(psql_exec "SELECT left(last_error, 12) FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'kt-err') LIMIT 1;")
+echo "  last_error: $(psql_exec "SELECT left(last_error, 120) FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'kt-err') LIMIT 1;")"
 
 assert_eq "Failed message still pending (retryable)" "pending" "$STATUS"
 assert_contains "Error has RETRYABLE prefix" "RETRYABLE" "$ERROR"

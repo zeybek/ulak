@@ -1,6 +1,6 @@
 -- ulak extension - Authoritative SQL installation script
--- Native transactional ulak with multi-protocol async dispatch
--- Version: 0.0.1
+-- Native transactional outbox with multi-protocol async dispatch
+-- (version comes from version.txt / ulak.control; see sql/ulak--X--Y.sql for upgrades)
 
 -- ============================================================================
 -- SCHEMA NOTE
@@ -147,10 +147,9 @@ WHERE status = 'processing';
 CREATE INDEX idx_queue_endpoint_terminal ON ulak.queue(endpoint_id)
 WHERE status IN ('completed', 'failed');
 
-CREATE INDEX idx_queue_next_retry ON ulak.queue(next_retry_at)
-WHERE next_retry_at IS NOT NULL;
-
-CREATE INDEX idx_queue_created_at ON ulak.queue(created_at);
+-- TTL expiry scan (mark_expired_messages): only pending rows with a deadline
+CREATE INDEX idx_queue_expires_pending ON ulak.queue(expires_at)
+WHERE status = 'pending' AND expires_at IS NOT NULL;
 
 CREATE INDEX idx_queue_processing ON ulak.queue(processing_started_at)
 WHERE status = 'processing';
@@ -416,8 +415,25 @@ GRANT USAGE ON SEQUENCE ulak.event_types_id_seq TO ulak_admin;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ulak.subscriptions TO ulak_admin;
 GRANT USAGE ON SEQUENCE ulak.subscriptions_id_seq TO ulak_admin;
 
+-- Endpoint status without the config/retry_policy columns.
+-- ulak.endpoints.config holds credentials (signing secrets, bearer tokens,
+-- broker passwords, ...); only ulak_admin may read the table itself. Monitoring
+-- and application roles get this view instead.
+CREATE VIEW ulak.endpoint_status AS
+SELECT id, name, protocol, enabled, description,
+       circuit_state, circuit_failure_count, circuit_opened_at, circuit_half_open_at,
+       last_success_at, last_failure_at, created_at, updated_at
+FROM ulak.endpoints;
+
+COMMENT ON VIEW ulak.endpoint_status IS
+'Endpoint identity and health without the config column (which holds credentials).
+Readable by ulak_admin, ulak_application and ulak_monitor.';
+
+GRANT SELECT ON ulak.endpoint_status TO ulak_admin, ulak_application, ulak_monitor;
+
 -- Application role: Send messages and read queue
-GRANT SELECT ON ulak.endpoints TO ulak_application;
+-- NOTE: No SELECT on ulak.endpoints (config holds credentials); use
+-- ulak.endpoint_status or ulak.get_endpoint_health() instead.
 GRANT SELECT ON ulak.queue TO ulak_application;
 -- NOTE: No INSERT on ulak.queue — applications must use the send()/publish()
 -- SECURITY DEFINER API which enforces endpoint validation and backpressure.
@@ -427,8 +443,7 @@ GRANT SELECT ON ulak.event_log TO ulak_application;
 GRANT SELECT ON ulak.event_types TO ulak_application;
 GRANT SELECT ON ulak.subscriptions TO ulak_application;
 
--- Monitor role: Read-only access
-GRANT SELECT ON ulak.endpoints TO ulak_monitor;
+-- Monitor role: Read-only access (endpoints via ulak.endpoint_status view)
 GRANT SELECT ON ulak.queue TO ulak_monitor;
 GRANT SELECT ON ulak.dlq TO ulak_monitor;
 GRANT SELECT ON ulak.archive TO ulak_monitor;
@@ -450,10 +465,6 @@ $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER update_endpoints_updated_at
     BEFORE UPDATE ON ulak.endpoints
-    FOR EACH ROW EXECUTE FUNCTION ulak.update_updated_at();
-
-CREATE TRIGGER update_queue_updated_at
-    BEFORE UPDATE ON ulak.queue
     FOR EACH ROW EXECUTE FUNCTION ulak.update_updated_at();
 
 CREATE TRIGGER update_event_types_updated_at
@@ -483,13 +494,16 @@ CREATE TRIGGER notify_new_message_trigger
     FOR EACH STATEMENT EXECUTE FUNCTION ulak.notify_new_message();
 
 -- ============================================================================
--- PAYLOAD IMMUTABILITY (TRD-01: Security Hardening)
+-- QUEUE ROW TRIGGER: updated_at + PAYLOAD IMMUTABILITY (TRD-01)
 -- ============================================================================
 
--- Prevent modification of payload and headers after message creation.
--- Status, retry_count, last_error etc. can still be updated by workers.
--- This ensures message integrity for audit/compliance.
-CREATE OR REPLACE FUNCTION ulak.prevent_payload_modification()
+-- ulak.queue is the hottest table (every worker status change is an UPDATE),
+-- so it gets exactly ONE row trigger that does both jobs:
+--   * maintain updated_at
+--   * prevent modification of payload and headers after message creation
+--     (status, retry_count, last_error etc. can still be updated by workers;
+--     this keeps message integrity for audit/compliance).
+CREATE OR REPLACE FUNCTION ulak.queue_before_update()
 RETURNS TRIGGER AS $$
 BEGIN
     IF OLD.payload IS DISTINCT FROM NEW.payload THEN
@@ -500,13 +514,14 @@ BEGIN
         RAISE EXCEPTION 'headers modification not allowed after creation'
             USING HINT = 'Message headers are immutable for audit integrity';
     END IF;
+    NEW.updated_at = NOW();
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER enforce_payload_immutability
+CREATE TRIGGER queue_before_update
     BEFORE UPDATE ON ulak.queue
-    FOR EACH ROW EXECUTE FUNCTION ulak.prevent_payload_modification();
+    FOR EACH ROW EXECUTE FUNCTION ulak.queue_before_update();
 
 -- ============================================================================
 -- SQL FUNCTIONS (called by worker via SPI)
@@ -625,7 +640,24 @@ COMMENT ON FUNCTION ulak._shmem_metrics() IS
 'Internal: returns per-worker and global counters from shared memory.
 Called by ulak.metrics() to combine with SQL-derived metrics.';
 
+-- Active queue count for backpressure (C, cached in shared memory for ~1s)
+CREATE OR REPLACE FUNCTION ulak._active_queue_count(
+    p_reserve bigint DEFAULT 0
+)
+RETURNS bigint
+LANGUAGE c VOLATILE
+AS 'ulak', 'ulak_active_queue_count';
+
+COMMENT ON FUNCTION ulak._active_queue_count(bigint) IS
+'Internal: number of pending/processing messages, cached in shared memory for
+about one second so backpressure checks do not scan the queue on every send().
+p_reserve rows are added to the cached count after it is read, so back-to-back
+sends within the cache window still count against the limit.';
+
 -- Unified Metrics Function (PL/pgSQL wrapper)
+-- SECURITY DEFINER: ulak_monitor/ulak_application no longer have SELECT on
+-- ulak.endpoints (its config column holds credentials), but they may read the
+-- endpoint names/states this function exposes.
 CREATE OR REPLACE FUNCTION ulak.metrics()
 RETURNS TABLE (
     metric_name text,
@@ -634,6 +666,8 @@ RETURNS TABLE (
     metric_type text
 )
 LANGUAGE plpgsql STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, ulak
 AS $$
 BEGIN
     -- Queue depth by status (global)
@@ -1057,6 +1091,8 @@ COMMENT ON FUNCTION ulak.reset_circuit_breaker(text) IS
 Clears failure count and allows message processing to resume normally.';
 
 -- Get endpoint health information
+-- SECURITY DEFINER so monitor/application roles can read endpoint state
+-- without SELECT on ulak.endpoints (whose config column holds credentials).
 CREATE OR REPLACE FUNCTION ulak.get_endpoint_health(
     p_endpoint_name text DEFAULT NULL
 ) RETURNS TABLE (
@@ -1072,6 +1108,8 @@ CREATE OR REPLACE FUNCTION ulak.get_endpoint_health(
 )
 LANGUAGE plpgsql
 STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, ulak
 AS $$
 BEGIN
     RETURN QUERY
@@ -1119,11 +1157,12 @@ DECLARE
     v_old_state text;
 BEGIN
     -- Get current circuit breaker configuration from GUC (defaults)
+    -- Fallbacks mirror the GUC defaults in src/config/guc.c (10 failures, 30s)
     v_threshold := current_setting('ulak.circuit_breaker_threshold', true)::int;
-    IF v_threshold IS NULL THEN v_threshold := 5; END IF;
+    IF v_threshold IS NULL THEN v_threshold := 10; END IF;
 
     v_cooldown := current_setting('ulak.circuit_breaker_cooldown', true)::int;
-    IF v_cooldown IS NULL THEN v_cooldown := 60; END IF;
+    IF v_cooldown IS NULL THEN v_cooldown := 30; END IF;
 
     -- Use advisory lock to serialize circuit breaker updates per endpoint.
     -- This prevents deadlocks when multiple workers concurrently update the same
@@ -1399,7 +1438,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     v_max_size integer;
-    v_threshold_offset bigint;
+    v_active bigint;
     v_projected bigint;
 BEGIN
     v_max_size := current_setting('ulak.max_queue_size', true)::int;
@@ -1415,17 +1454,15 @@ BEGIN
         USING ERRCODE = '53400';
     END IF;
 
-    v_threshold_offset := v_max_size - GREATEST(v_projected, 1);
+    -- Cached count (refreshed at most once per second in shared memory), so
+    -- this is O(1) per call instead of a queue scan per send(). The rows we
+    -- are about to insert are reserved in the cache so a burst of sends
+    -- within the cache window still counts against the limit.
+    v_active := ulak._active_queue_count(GREATEST(v_projected, 1));
 
-    PERFORM 1
-    FROM ulak.queue
-    WHERE status IN ('pending', 'processing')
-    OFFSET v_threshold_offset
-    LIMIT 1;
-
-    IF FOUND THEN
-        RAISE EXCEPTION '[ulak] Queue backpressure: pending/processing queue at current workload would exceed limit % with % projected additional messages. Increase ulak.max_queue_size or wait for messages to be processed.',
-            v_max_size, v_projected
+    IF v_active + GREATEST(v_projected, 1) > v_max_size THEN
+        RAISE EXCEPTION '[ulak] Queue backpressure: pending/processing queue (%) plus % projected additional messages would exceed limit %. Increase ulak.max_queue_size or wait for messages to be processed.',
+            v_active, v_projected, v_max_size
         USING ERRCODE = '53400'; -- configuration_limit_exceeded
     END IF;
 END;
@@ -1433,7 +1470,8 @@ $$;
 
 COMMENT ON FUNCTION ulak._check_backpressure(bigint) IS
 'Internal: Check queue size against ulak.max_queue_size limit, including optional projected additional rows.
-Uses a threshold probe instead of COUNT(*) to detect when the current queue or projected total would exceed the limit.
+Uses the shared-memory cached active count (ulak._active_queue_count, refreshed about once per second,
+with the rows being inserted reserved in the cache in between).
 Raises exception with SQLSTATE 53400 if the current queue or the projected total would exceed the limit.
 Set max_queue_size=0 to disable.';
 
@@ -1945,26 +1983,33 @@ DECLARE
     v_new_id bigint;
     v_original_id bigint;
     v_endpoint_name text;
+    v_status text;
 BEGIN
-    -- Get DLQ message info
-    SELECT original_message_id, endpoint_name
-    INTO v_original_id, v_endpoint_name
-    FROM ulak.dlq WHERE id = p_dlq_id;
+    -- Lock the DLQ row so two concurrent redrives of the same message cannot
+    -- both insert a copy into the queue; the second caller sees 'redriven'.
+    SELECT original_message_id, endpoint_name, status
+    INTO v_original_id, v_endpoint_name, v_status
+    FROM ulak.dlq WHERE id = p_dlq_id
+    FOR UPDATE;
 
     IF v_original_id IS NULL THEN
         RAISE EXCEPTION 'DLQ message % not found', p_dlq_id;
+    END IF;
+
+    IF v_status <> 'failed' THEN
+        RAISE EXCEPTION 'DLQ message % is not in failed state (status: %)', p_dlq_id, v_status;
     END IF;
 
     -- Insert back into queue as pending with reset retry count
     INSERT INTO ulak.queue (
         endpoint_id, payload, status, retry_count, priority,
         scheduled_at, idempotency_key, correlation_id, expires_at,
-        payload_hash, headers, metadata
+        payload_hash, ordering_key, headers, metadata
     )
     SELECT
         endpoint_id, payload, 'pending', 0, priority,
         NULL, NULL, correlation_id, NULL,
-        payload_hash, headers, metadata
+        payload_hash, ordering_key, headers, metadata
     FROM ulak.dlq
     WHERE id = p_dlq_id
     RETURNING id INTO v_new_id;
@@ -1993,7 +2038,8 @@ $$;
 
 COMMENT ON FUNCTION ulak.redrive_message(bigint) IS
 'Redrive a single message from DLQ back to queue.
-Retry count is reset to 0. DLQ entry is marked as redriven (not deleted).
+Retry count is reset to 0 and ordering_key is preserved. DLQ entry is marked as redriven (not deleted).
+The DLQ row is locked for the duration of the call; a message that is not in failed state raises an error.
 Returns the new message ID.';
 
 -- Redrive all DLQ messages for a specific endpoint
@@ -2129,8 +2175,9 @@ GRANT EXECUTE ON FUNCTION ulak.maintain_archive_partitions(integer) TO ulak_admi
 GRANT EXECUTE ON FUNCTION ulak.cleanup_event_log() TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.cleanup_dlq() TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak._check_backpressure(bigint) TO ulak_admin;
--- NOTE: _check_backpressure is an internal function called by SECURITY DEFINER
--- send/publish APIs. No direct GRANT to ulak_application needed.
+GRANT EXECUTE ON FUNCTION ulak._active_queue_count(bigint) TO ulak_admin;
+-- NOTE: _check_backpressure/_active_queue_count are internal functions called
+-- by the SECURITY DEFINER send/publish APIs. No direct GRANT to ulak_application needed.
 GRANT EXECUTE ON FUNCTION ulak.archive_single_to_dlq(bigint) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.archive_completed_messages(integer, integer) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.cleanup_old_archive_partitions(integer) TO ulak_admin;
@@ -2152,6 +2199,8 @@ GRANT EXECUTE ON FUNCTION ulak.publish_batch(jsonb) TO ulak_admin;
 -- Admin functions: monitoring
 GRANT EXECUTE ON FUNCTION ulak.get_worker_status() TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.health_check() TO ulak_admin;
+GRANT EXECUTE ON FUNCTION ulak.get_endpoint_health(text) TO ulak_admin;
+GRANT EXECUTE ON FUNCTION ulak.enable_fast_mode() TO ulak_admin;
 
 -- Application functions
 GRANT EXECUTE ON FUNCTION ulak.send(text, jsonb) TO ulak_application;
@@ -2161,6 +2210,8 @@ GRANT EXECUTE ON FUNCTION ulak.send_batch_with_priority(text, jsonb[], smallint)
 GRANT EXECUTE ON FUNCTION ulak.publish(text, jsonb) TO ulak_application;
 GRANT EXECUTE ON FUNCTION ulak.publish_batch(jsonb) TO ulak_application;
 GRANT EXECUTE ON FUNCTION ulak.get_worker_status() TO ulak_application;
+GRANT EXECUTE ON FUNCTION ulak.get_endpoint_health(text) TO ulak_application;
+GRANT EXECUTE ON FUNCTION ulak.enable_fast_mode() TO ulak_application;
 
 -- Monitor functions: read-only monitoring
 GRANT EXECUTE ON FUNCTION ulak.get_worker_status() TO ulak_monitor;

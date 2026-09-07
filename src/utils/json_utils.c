@@ -277,55 +277,6 @@ Jsonb *jsonb_get_nested(Jsonb *jsonb, const char *key) {
 }
 
 /**
- * @brief Create a JSONB iterator for the given object.
- * @param jsonb JSONB value to iterate
- * @return Iterator, or NULL if jsonb is NULL
- */
-JsonbIterator *jsonb_iterator_create(Jsonb *jsonb) {
-    if (!jsonb) {
-        return NULL;
-    }
-
-    return JsonbIteratorInit(&jsonb->root);
-}
-
-/**
- * @brief Free a JSONB iterator.
- * @param it Iterator to free (PostgreSQL manages memory automatically)
- */
-void jsonb_iterator_free(JsonbIterator *it) {
-    /* PostgreSQL manages iterator memory automatically */
-    return;
-}
-
-/**
- * @brief Advance a JSONB iterator to the next token.
- * @param it Iterator to advance
- * @param value Output value populated on success
- * @return true if a token was read, false at end
- */
-bool jsonb_iterator_next(JsonbIterator *it, JsonbValue *value) {
-    if (!it || !value) {
-        return false;
-    }
-
-    return JsonbIteratorNext(&it, value, false) != WJB_DONE;
-}
-
-/**
- * @brief Check if a JSONB iterator has more tokens.
- * @param it Iterator to check
- * @return true if iterator is non-NULL (always true until exhausted)
- */
-bool jsonb_iterator_has_next(JsonbIterator *it) {
-    if (!it) {
-        return false;
-    }
-
-    return true;
-}
-
-/**
  * @brief Validate that all top-level keys in a JSONB object are in an allowed list.
  * @param jsonb JSONB object to validate
  * @param allowed_keys NULL-terminated array of allowed key strings
