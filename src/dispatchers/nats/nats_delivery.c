@@ -366,10 +366,15 @@ bool nats_dispatcher_dispatch_ex(Dispatcher *self, const char *payload, Jsonb *h
 
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    /* Use dispatch with headers support. The queue row id (when the caller set
-     * result->message_id) becomes Nats-Msg-Id so JetStream de-duplicates
-     * retries of the same message on the synchronous path too. */
-    msg = nats_build_msg(nats, payload, result ? result->message_id : 0, headers);
+    /* result is a required out-parameter (the batch processor always passes
+     * one); the queue row id it carries becomes Nats-Msg-Id so JetStream
+     * de-duplicates retries of the same message on the synchronous path too. */
+    if (result == NULL) {
+        elog(WARNING, "[ulak] NATS dispatch_ex called without a result buffer");
+        return false;
+    }
+
+    msg = nats_build_msg(nats, payload, result->message_id, headers);
     if (msg == NULL) {
         result->success = false;
         result->error_msg = pstrdup("[RETRYABLE] Failed to create NATS message");
