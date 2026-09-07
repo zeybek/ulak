@@ -105,6 +105,35 @@ wait $SUB_PID 2>/dev/null
 RECEIVED=$(cat /tmp/mqtt-sub-2.txt 2>/dev/null)
 assert_contains "QoS 1 payload received" "mqtt-qos1" "$RECEIVED"
 
+# ── QoS 1 on the synchronous path (capture_response forces dispatch_ex):
+#    the worker must wait for the broker's PUBACK, not just flush its buffer,
+#    and the acknowledged mid is captured on the row. ──
+section "QoS 1 synchronous dispatch waits for PUBACK (capture_response=on)..."
+psql_quiet "ALTER SYSTEM SET ulak.capture_response = on;"
+psql_quiet "SELECT pg_reload_conf();"
+sleep 1
+psql_quiet "DELETE FROM ulak.queue;"
+
+docker exec ulak-postgres-1 timeout 15 mosquitto_sub -h "$MQTT_BROKER" -p "$MQTT_PORT" -t "mt/qos1" -q 1 -C 1 -W 15 > /tmp/mqtt-sub-2b.txt 2>/dev/null &
+SUB_PID=$!
+sleep 1
+
+send_msg "mt-qos1" "{\"test\": \"mqtt-qos1-sync\"}"
+wait_queue_drain 15
+
+SYNC_COMPLETED=$(psql_exec "SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE q.status = 'completed' AND e.name = 'mt-qos1';")
+assert_eq "QoS 1 sync message completed" "1" "$SYNC_COMPLETED"
+SYNC_MID=$(psql_exec "SELECT coalesce((response->>'mqtt_mid')::int > 0, false) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'mt-qos1' LIMIT 1;")
+assert_eq "Acknowledged mid captured in response" "t" "$SYNC_MID"
+
+wait $SUB_PID 2>/dev/null
+RECEIVED=$(cat /tmp/mqtt-sub-2b.txt 2>/dev/null)
+assert_contains "QoS 1 sync payload received" "mqtt-qos1-sync" "$RECEIVED"
+
+psql_quiet "ALTER SYSTEM SET ulak.capture_response = off;"
+psql_quiet "SELECT pg_reload_conf();"
+sleep 1
+
 # ═══════════════════════════════════════════════════
 # TEST 3: Batch Publish (50 messages)
 # ═══════════════════════════════════════════════════

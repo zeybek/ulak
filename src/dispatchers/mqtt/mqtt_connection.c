@@ -88,7 +88,17 @@ void mqtt_publish_callback(struct mosquitto *mosq, void *obj, int mid) {
     MqttDispatcher *mqtt = (MqttDispatcher *)obj;
     int i;
 
-    if (!mqtt || !mqtt->pending_messages)
+    if (!mqtt)
+        return;
+
+    /* Synchronous dispatch waiting for its own PUBACK/PUBCOMP (QoS 1/2) */
+    if (mqtt->sync_wait_mid != 0 && mid == mqtt->sync_wait_mid) {
+        mqtt->sync_acked = true;
+        ulak_log("debug", "MQTT PUBACK received for sync mid=%d", mid);
+        return;
+    }
+
+    if (!mqtt->pending_messages)
         return;
 
     /* Find the pending message with this mid and mark it as delivered */
