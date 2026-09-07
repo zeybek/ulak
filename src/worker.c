@@ -33,9 +33,6 @@ static volatile sig_atomic_t got_sighup = false;
 /* Database name from GUC */
 static char worker_dbname[NAMEDATALEN] = "";
 
-/* Cached database index in shared memory for fast counter updates */
-static int cached_db_index = -1;
-
 /* Multi-worker partitioning info (set at startup from DSM params) */
 static Oid worker_dboid = InvalidOid;
 static int worker_id = 0;     /* This worker's ID (0 to total_workers-1) */
@@ -112,6 +109,10 @@ PGDLLEXPORT void ulak_worker_main(Datum main_arg) {
 
     /* We're now ready to receive signals */
     BackgroundWorkerUnblockSignals();
+
+    /* Guaranteed dispatcher cache teardown (curl/broker handles) even when the
+     * worker exits through FATAL/proc_exit paths that skip the loop epilogue. */
+    before_shmem_exit(dispatcher_cache_exit_callback, (Datum)0);
 
     /* Mark worker as started in shared memory */
     ulak_set_worker_started(MyProcPid);
@@ -194,9 +195,16 @@ static void ulak_worker_loop(void) {
         ResetLatch(MyLatch);
         CHECK_FOR_INTERRUPTS();
 
-#if PG_VERSION_NUM < 150000
-        ProcessCompletedNotifies();
-#endif
+        /*
+         * Drain our LISTEN queue. Regular backends consume notifications in
+         * ProcessClientReadInterrupt(); a background worker never gets there,
+         * so without this call the worker's queue position never advances,
+         * pg_notification_queue_usage() grows without bound and NOTIFY
+         * eventually fails for every sender in the cluster. Must run outside
+         * a transaction (ProcessNotifyInterrupt starts its own).
+         */
+        if (listener_registered && notifyInterruptPending)
+            ProcessNotifyInterrupt(false);
 
         if (rc & WL_POSTMASTER_DEATH) {
             ulak_log("info", "Postmaster died, exiting");
@@ -319,7 +327,16 @@ static void ulak_worker_loop(void) {
                  * lock contention and potential crashes under high concurrency).
                  */
                 if (worker_id == 0) {
-                    mark_expired_messages();
+                    /* TTL expiry: every ~10 polls (5s at the default interval) is
+                     * plenty; running it on every poll was a full pending scan. */
+                    {
+                        static int expire_counter = 0;
+                        expire_counter++;
+                        if (expire_counter >= 10) {
+                            mark_expired_messages();
+                            expire_counter = 0;
+                        }
+                    }
 
                     /* Periodically archive completed messages to prevent queue bloat */
                     {
@@ -342,8 +359,15 @@ static void ulak_worker_loop(void) {
                     }
                 }
 
-                /* All workers process pending messages (modulo partitioned) */
-                (void)batch_processor_run(worker_dboid, worker_id, total_workers);
+                /* All workers process pending messages (hash/modulo partitioned).
+                 * If the batch came back full there is more backlog waiting:
+                 * set our own latch so the next WaitLatch() returns at once
+                 * instead of capping drain rate at batch_size / poll_interval. */
+                {
+                    int64 fetched = batch_processor_run(worker_dboid, worker_id, total_workers);
+                    if (fetched >= (int64)ulak_batch_size)
+                        SetLatch(MyLatch);
+                }
             }
 
             /* Reset error counter on successful iteration */
@@ -414,111 +438,4 @@ static void ulak_worker_loop(void) {
         ulak_log("info", "Worker loop exiting (database: %s)",
                  worker_dbname[0] ? worker_dbname : "(default)");
     }
-}
-
-/**
- * @brief Entry point for dynamically spawned workers.
- *
- * This function is used by the dynamic database-worker path. The current
- * production runtime primarily uses statically registered workers that
- * connect to ulak.database directly.
- *
- * IMPORTANT: Must be exported with PGDLLEXPORT for background worker to find it.
- *
- * @param main_arg DSM segment handle containing UlakWorkerParams.
- */
-PGDLLEXPORT void ulak_database_worker_main(Datum main_arg) {
-    dsm_segment *seg;
-    UlakWorkerParams *params;
-    dsm_handle handle;
-
-    elog(DEBUG1, "[ulak] Database worker starting, main_arg=%u", DatumGetUInt32(main_arg));
-
-    /* Initialize external libraries */
-    ulak_worker_init_libs();
-
-    elog(DEBUG1, "[ulak] Database worker: libs initialized");
-
-    /* Attach to DSM segment to get database info */
-    handle = DatumGetUInt32(main_arg);
-    elog(DEBUG1, "[ulak] Database worker: attaching to DSM handle %u", handle);
-
-    seg = dsm_attach(handle);
-    if (seg == NULL) {
-        elog(ERROR, "[ulak] Failed to attach to DSM segment handle %u", handle);
-    }
-
-    elog(DEBUG1, "[ulak] Database worker: DSM attached");
-    params = dsm_segment_address(seg);
-
-    /* Copy database info before detaching DSM */
-    worker_dboid = params->dboid;
-    strlcpy(worker_dbname, params->dbname, NAMEDATALEN);
-    worker_id = params->worker_id;
-    total_workers = params->total_workers;
-
-    elog(DEBUG1,
-         "[ulak] Database worker: got dbname='%s', dboid=%u, worker_id=%d, "
-         "total_workers=%d",
-         worker_dbname, worker_dboid, worker_id, total_workers);
-
-    /*
-     * Unpin and detach DSM segment - we've copied the data.
-     * The segment was pinned by the parent process to survive transaction boundaries.
-     */
-    dsm_unpin_segment(dsm_segment_handle(seg));
-    dsm_detach(seg);
-
-    /*
-     * Connect to the assigned database.
-     * This must happen BEFORE setting up signal handlers.
-     */
-    BackgroundWorkerInitializeConnection(worker_dbname, NULL, 0);
-
-    /* Set up signal handlers - MyLatch is now initialized */
-    ulak_pqsignal(SIGTERM, ulak_sigterm_handler);
-    ulak_pqsignal(SIGHUP, ulak_sighup_handler);
-
-    /* We're now ready to receive signals */
-    BackgroundWorkerUnblockSignals();
-
-    /*
-     * Note: In the dynamic worker path the parent process may have already
-     * populated the worker slot before this worker begins its main loop.
-     */
-
-    /* Cache our database index in shared memory for fast counter updates */
-    if (ulak_shmem != NULL && ulak_shmem->lock != NULL) {
-        int idx;
-        LWLockAcquire(ulak_shmem->lock, LW_SHARED);
-        for (idx = 0; idx < ULAK_MAX_DATABASES; idx++) {
-            if (ulak_shmem->databases[idx].active &&
-                ulak_shmem->databases[idx].dboid == worker_dboid) {
-                cached_db_index = idx;
-                break;
-            }
-        }
-        LWLockRelease(ulak_shmem->lock);
-    }
-
-    if (total_workers > 1) {
-        elog(LOG, "[ulak] Database worker %d/%d started for '%s' (OID %u, PID %d)", worker_id + 1,
-             total_workers, worker_dbname, worker_dboid, MyProcPid);
-    } else {
-        elog(LOG, "[ulak] Database worker started for '%s' (OID %u, PID %d)", worker_dbname,
-             worker_dboid, MyProcPid);
-    }
-
-    /* Register exit callback for guaranteed dispatcher cache cleanup.
-     * before_shmem_exit runs even on proc_exit — system still operational. */
-    before_shmem_exit(dispatcher_cache_exit_callback, (Datum)0);
-
-    /* Run the main worker loop */
-    ulak_worker_loop();
-
-    /* Cleanup */
-    ulak_remove_worker_pid(worker_dboid, MyProcPid);
-    ulak_worker_cleanup_libs();
-
-    proc_exit(0);
 }
