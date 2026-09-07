@@ -26,6 +26,13 @@ typedef struct DispatchResult DispatchResult;
  * Memory is managed by the caller (worker) -- the dispatcher fills values.
  */
 typedef struct DispatchResult {
+    /** @name Request context (set by the caller BEFORE dispatch_ex)
+     * @{ */
+    int64 message_id; /**< ulak.queue row id of the message being dispatched (0 = unknown).
+                           Used for webhook-id / ce-id / Nats-Msg-Id so every message gets a
+                           stable, unique identity in the synchronous dispatch path. */
+    /** @} */
+
     /** @name Common fields
      * @{ */
     bool success;           /**< Dispatch succeeded */

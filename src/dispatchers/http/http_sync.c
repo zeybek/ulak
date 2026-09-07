@@ -28,6 +28,51 @@ typedef struct {
 
 /**
  * @private
+ * @brief Process-unique fallback message id for callers that do not know the
+ * queue row id (legacy dispatch() path, or DispatchResult.message_id == 0).
+ *
+ * Never use wall-clock seconds here: every message dispatched in the same
+ * second would share one webhook-id / ce-id and receivers that de-duplicate on
+ * that id would silently drop them.
+ */
+static int64 http_fallback_msg_id(void) {
+    static uint32 counter = 0;
+
+    counter++;
+    return ((int64)MyProcPid << 32) | (int64)counter;
+}
+
+/**
+ * @private
+ * @brief Classify a 4xx response into an error message (sync paths).
+ *
+ * 401 with OAuth2 auth invalidates the cached token and is retryable so the
+ * next attempt fetches a fresh token; every other 401/403/4xx is permanent.
+ */
+static char *http_classify_4xx(HttpDispatcher *http_dispatcher, long response_code,
+                               bool *should_disable) {
+    if (should_disable)
+        *should_disable = false;
+
+    if (response_code == 429)
+        return psprintf(ERROR_PREFIX_RETRYABLE " HTTP %ld: Rate limited", response_code);
+
+    if (response_code == 410) {
+        if (should_disable)
+            *should_disable = true;
+        return psprintf(ERROR_PREFIX_PERMANENT " " ERROR_PREFIX_DISABLE " HTTP 410: Gone");
+    }
+
+    if (response_code == 401 &&
+        http_auth_handle_unauthorized((HttpAuthConfig *)http_dispatcher->auth))
+        return psprintf(ERROR_PREFIX_RETRYABLE
+                        " HTTP 401: Unauthorized (OAuth2 token invalidated, will refresh)");
+
+    return psprintf(ERROR_PREFIX_PERMANENT " HTTP %ld: Client error", response_code);
+}
+
+/**
+ * @private
  * @brief Parse Retry-After header value from HTTP response.
  *
  * Handles delay-seconds (integer) format per RFC 7231 Section 7.1.3.
@@ -116,7 +161,7 @@ bool http_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char 
     /* CloudEvents + Webhook signing integration.
      * Order: wrap payload first (structured mode), then sign the final payload. */
     {
-        int64 fallback_id = (int64)time(NULL);
+        int64 fallback_id = http_fallback_msg_id();
 
         /* CloudEvents wrapping must happen before signing */
         if (http_dispatcher->cloudevents_mode == CE_MODE_BINARY) {
@@ -156,30 +201,15 @@ bool http_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char 
                     psprintf(ERROR_PREFIX_RETRYABLE " HTTP %ld: Server error", response_code);
             }
         } else if (response_code >= 400 && response_code < 500) {
-            /* 4xx Client Errors */
-            if (response_code == 429) {
-                /* Rate limited - retryable */
-                ulak_log("warning", "HTTP request rate limited: %ld (retryable)", response_code);
-                if (error_msg) {
-                    *error_msg =
-                        psprintf(ERROR_PREFIX_RETRYABLE " HTTP %ld: Rate limited", response_code);
-                }
-            } else if (response_code == 410) {
-                /* 410 Gone - permanent failure, signal endpoint disable */
-                ulak_log("warning", "HTTP 410 Gone: endpoint permanently unavailable");
-                if (error_msg) {
-                    *error_msg =
-                        psprintf(ERROR_PREFIX_PERMANENT " " ERROR_PREFIX_DISABLE " HTTP 410: Gone");
-                }
-            } else {
-                /* Other 4xx - permanent failure */
-                ulak_log("warning", "HTTP request failed with client error: %ld (permanent)",
-                         response_code);
-                if (error_msg) {
-                    *error_msg =
-                        psprintf(ERROR_PREFIX_PERMANENT " HTTP %ld: Client error", response_code);
-                }
-            }
+            /* 4xx Client Errors (429 retryable, 410 permanent+disable,
+             * 401 retryable for OAuth2 after token invalidation, rest permanent) */
+            char *classified = http_classify_4xx(http_dispatcher, response_code, NULL);
+            ulak_log("warning", "HTTP request failed with client error %ld: %s", response_code,
+                     classified);
+            if (error_msg)
+                *error_msg = classified;
+            else
+                pfree(classified);
         } else {
             /* Other status codes */
             ulak_log("warning", "HTTP request returned unexpected status: %ld", response_code);
@@ -344,10 +374,13 @@ bool http_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, Js
     }
 
     /* CloudEvents + Webhook signing for dispatch_ex.
-     * Order: wrap payload (structured mode), then sign the final payload. */
+     * Order: wrap payload (structured mode), then sign the final payload.
+     * The id is the ulak.queue row id (unique, stable across retries) when the
+     * caller provided it; the fallback is process-unique, never wall-clock. */
     final_payload_ex = payload;
     {
-        int64 ex_id = (int64)time(NULL);
+        int64 ex_id =
+            (result && result->message_id > 0) ? result->message_id : http_fallback_msg_id();
 
         if (http_dispatcher->cloudevents_mode == CE_MODE_BINARY) {
             curl_headers = cloudevents_add_binary_headers(
@@ -371,11 +404,14 @@ bool http_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, Js
     if (metadata) {
         JsonbValue val;
 
-        /* Timeout override */
+        /* Timeout override — clamped to the same 1..300s range the endpoint
+         * config allows, so a single message cannot stall the worker. */
         if (extract_jsonb_value(metadata, "timeout", &val) && val.type == jbvNumeric) {
             timeout_override =
                 DatumGetInt32(DirectFunctionCall1(numeric_int4, NumericGetDatum(val.val.numeric)));
             if (timeout_override > 0) {
+                if (timeout_override > 300)
+                    timeout_override = 300;
                 curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout_override);
             }
         }
@@ -387,8 +423,22 @@ bool http_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, Js
             char *suffix = pnstrdup(val.val.string.val, val.val.string.len);
 
             if (strstr(suffix, "://") != NULL || strchr(suffix, '@') != NULL) {
+                /* SECURITY/CORRECTNESS: do NOT fall through to curl_easy_perform().
+                 * curl is still configured with the base URL, so continuing would
+                 * silently misdeliver this message to {base} instead of
+                 * {base}{suffix} (false success on 2xx, false-permanent DLQ on 404).
+                 * Reject the dispatch permanently — a retry would reproduce the
+                 * same deterministic rejection. */
                 ulak_log("warning", "Rejected url_suffix containing '://' or '@': SSRF risk");
                 pfree(suffix);
+                if (result) {
+                    result->success = false;
+                    result->error_msg = pstrdup(
+                        ERROR_PREFIX_PERMANENT
+                        " Rejected url_suffix ('://' or '@'): would misdeliver to base URL");
+                }
+                success = false;
+                goto cleanup;
             } else {
                 StringInfoData full_url;
                 initStringInfo(&full_url);
@@ -397,8 +447,18 @@ bool http_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, Js
                 /* Validate concatenated URL against internal IP blocklist */
                 if (!ulak_http_allow_internal_urls &&
                     http_is_internal_url(full_url.data, full_url.len)) {
+                    /* SECURITY/CORRECTNESS: same as the '://'/'@' branch above —
+                     * reject the dispatch instead of falling through to the base URL. */
                     ulak_log("warning", "Rejected url_suffix leading to internal URL");
                     pfree(full_url.data);
+                    pfree(suffix);
+                    if (result) {
+                        result->success = false;
+                        result->error_msg = pstrdup(ERROR_PREFIX_PERMANENT
+                                                    " Rejected url_suffix leading to internal URL");
+                    }
+                    success = false;
+                    goto cleanup;
                 } else {
                     curl_easy_setopt(curl, CURLOPT_URL, full_url.data);
                     /* NOTE: full_url.data must survive until after curl_easy_perform().
@@ -460,36 +520,22 @@ bool http_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, Js
 #endif
             }
         } else if (response_code >= 400 && response_code < 500) {
-            /* 4xx Client Errors */
-            if (response_code == 429) {
-                /* Rate limited - retryable */
-                ulak_log("warning", "HTTP request rate limited: %ld (retryable)", response_code);
-                if (result) {
-                    result->success = false;
-                    result->error_msg =
-                        psprintf(ERROR_PREFIX_RETRYABLE " HTTP %ld: Rate limited", response_code);
+            /* 4xx Client Errors (429 retryable, 410 permanent+disable,
+             * 401 retryable for OAuth2 after token invalidation, rest permanent) */
+            bool should_disable = false;
+            char *classified = http_classify_4xx(http_dispatcher, response_code, &should_disable);
+            ulak_log("warning", "HTTP request failed with client error %ld: %s", response_code,
+                     classified);
+            if (result) {
+                result->success = false;
+                result->error_msg = classified;
+                result->should_disable_endpoint = should_disable;
 #if LIBCURL_VERSION_NUM >= 0x075400
+                if (response_code == 429)
                     result->retry_after_seconds = parse_retry_after(curl);
 #endif
-                }
-            } else if (response_code == 410) {
-                /* 410 Gone - permanent, signal endpoint disable */
-                ulak_log("warning", "HTTP 410 Gone: endpoint permanently unavailable");
-                if (result) {
-                    result->success = false;
-                    result->error_msg =
-                        psprintf(ERROR_PREFIX_PERMANENT " " ERROR_PREFIX_DISABLE " HTTP 410: Gone");
-                    result->should_disable_endpoint = true;
-                }
             } else {
-                /* Other 4xx - permanent failure */
-                ulak_log("warning", "HTTP request failed with client error: %ld (permanent)",
-                         response_code);
-                if (result) {
-                    result->success = false;
-                    result->error_msg =
-                        psprintf(ERROR_PREFIX_PERMANENT " HTTP %ld: Client error", response_code);
-                }
+                pfree(classified);
             }
         } else {
             /* Other status codes */
@@ -532,7 +578,10 @@ bool http_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, Js
         }
     }
 
-    /* Cleanup — free AFTER curl_easy_perform() since CURLOPT_POSTFIELDS/URL store pointers */
+cleanup:
+    /* Cleanup — free AFTER curl_easy_perform() since CURLOPT_POSTFIELDS/URL store pointers.
+     * Also reached early via `goto cleanup` from the url_suffix rejection branches,
+     * where url_suffix_buf is NULL and curl_easy_perform() was never called. */
     if (wrapped_payload_ex)
         pfree(wrapped_payload_ex);
     if (url_suffix_buf)

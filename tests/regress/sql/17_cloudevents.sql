@@ -77,7 +77,7 @@ SELECT ulak.create_endpoint('ce_all', 'http', '{
     "cloudevents": true,
     "cloudevents_mode": "binary",
     "cloudevents_type": "com.myapp.event",
-    "signing_secret": "whsec_all",
+    "signing_secret": "whsec_YWxs",
     "auth": {"type": "basic", "username": "user", "password": "pass"}
 }'::jsonb) IS NOT NULL AS ce_all_ok;
 

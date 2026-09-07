@@ -125,7 +125,7 @@ SELECT ulak.create_endpoint('no_auth_ep', 'http', '{
 
 SELECT ulak.create_endpoint('auth_plus_signing', 'http', '{
     "url": "http://localhost:9999/both",
-    "signing_secret": "whsec_test123",
+    "signing_secret": "whsec_dGVzdDEyMw==",
     "auth": {"type": "bearer", "token": "my-token"}
 }'::jsonb) IS NOT NULL AS auth_plus_signing_ok;
 

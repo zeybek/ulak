@@ -264,6 +264,16 @@ void http_configure_curl(CURL *curl, HttpDispatcher *http_dispatcher, const char
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
 #endif
 
+    /* SSRF connect-time guard: inspect the IP curl actually resolves at transfer
+     * time (not just the validate-time URL), closing the DNS-rebinding TOCTOU and
+     * also covering redirect targets. Re-applied here on every configure (sync
+     * handles are curl_easy_reset() before reuse). Skipped when internal URLs are
+     * explicitly allowed via GUC. */
+#if LIBCURL_VERSION_NUM >= 0x071101 /* 7.17.1: CURLOPT_OPENSOCKETFUNCTION */
+    if (!ulak_http_allow_internal_urls)
+        curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, ulak_http_opensocket_guard);
+#endif
+
     /* SSL/TLS verification - configurable via GUC */
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, ulak_http_ssl_verify_peer ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, ulak_http_ssl_verify_host ? 2L : 0L);

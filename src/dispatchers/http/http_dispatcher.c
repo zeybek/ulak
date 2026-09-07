@@ -22,6 +22,56 @@
 #include "utils/json_utils.h"
 #include "utils/logging.h"
 
+#include "common/base64.h"
+
+/** @brief Standard Webhooks secret prefix: the remainder is base64 of the raw key. */
+#define WEBHOOK_SECRET_PREFIX "whsec_"
+#define WEBHOOK_SECRET_PREFIX_LEN 6
+
+/**
+ * @private
+ * @brief Decode a signing secret into raw HMAC key bytes.
+ *
+ * Standard Webhooks secrets are "whsec_" + base64(key); the receiver's
+ * verification library base64-decodes that part, so we must sign with the
+ * decoded bytes or signatures never verify. A secret without the prefix is
+ * used as-is (raw key) for backward compatibility.
+ *
+ * @param secret       Secret string from the endpoint config.
+ * @param secret_len   Length of secret.
+ * @param out_len      OUT - length of the returned key.
+ * @return palloc'd key bytes, or NULL if a whsec_ secret is not valid base64.
+ */
+static char *http_decode_signing_secret(const char *secret, int secret_len, int *out_len) {
+    if (secret_len > WEBHOOK_SECRET_PREFIX_LEN &&
+        strncmp(secret, WEBHOOK_SECRET_PREFIX, WEBHOOK_SECRET_PREFIX_LEN) == 0) {
+        const char *b64 = secret + WEBHOOK_SECRET_PREFIX_LEN;
+        int b64_len = secret_len - WEBHOOK_SECRET_PREFIX_LEN;
+        int dst_len = pg_b64_dec_len(b64_len);
+        char *key = palloc(dst_len + 1);
+        int n;
+
+        /* pg_b64_decode() takes uint8 *dst on PG18+, char *dst before. */
+#if PG_VERSION_NUM >= 180000
+        n = pg_b64_decode(b64, b64_len, (uint8 *)key, dst_len);
+#else
+        n = pg_b64_decode(b64, b64_len, key, dst_len);
+#endif
+
+        if (n <= 0) {
+            explicit_bzero(key, dst_len + 1);
+            pfree(key);
+            return NULL;
+        }
+        key[n] = '\0';
+        *out_len = n;
+        return key;
+    }
+
+    *out_len = secret_len;
+    return pnstrdup(secret, secret_len);
+}
+
 /** @brief HTTP Dispatcher Operations - with batch support and dispatch_ex. */
 static DispatcherOperations http_dispatcher_ops = {.dispatch = http_dispatcher_dispatch,
                                                    .validate_config =
@@ -98,10 +148,21 @@ Dispatcher *http_dispatcher_create(Jsonb *config) {
         JsonbValue secret_val;
         if (extract_jsonb_value(config, HTTP_CONFIG_KEY_SIGNING_SECRET, &secret_val) &&
             secret_val.type == jbvString && secret_val.val.string.len > 0) {
-            char *raw_secret = pnstrdup(secret_val.val.string.val, secret_val.val.string.len);
-            /* Store raw secret — the signing function handles encoding */
-            http_dispatcher->signing_secret = raw_secret;
-            http_dispatcher->signing_secret_len = strlen(raw_secret);
+            int key_len = 0;
+            char *key = http_decode_signing_secret(secret_val.val.string.val,
+                                                   secret_val.val.string.len, &key_len);
+            if (key == NULL) {
+                /* validate_config rejects this, so it can only happen for rows
+                 * written before that check existed. Fail loudly rather than
+                 * sign with a key nobody can verify. */
+                ulak_log("error", "signing_secret has whsec_ prefix but is not valid base64");
+                pfree(http_dispatcher->url);
+                pfree(http_dispatcher->method);
+                pfree(http_dispatcher);
+                return NULL;
+            }
+            http_dispatcher->signing_secret = key;
+            http_dispatcher->signing_secret_len = key_len;
             ulak_log("info", "Standard Webhooks signing enabled for %s", http_dispatcher->url);
         }
     }
@@ -336,6 +397,15 @@ bool http_dispatcher_validate_config(Jsonb *config) {
         return false;
     }
 
+    /* SSRF Protection: reject userinfo in the URL. "http://public:80@10.0.0.1/"
+     * would pass a naive host check while curl connects to 10.0.0.1, and
+     * credentials belong in the "auth" config, not the URL. */
+    if (http_url_has_userinfo(url_val.val.string.val, url_val.val.string.len)) {
+        ulak_log("error", "HTTP config URL must not contain userinfo (user:pass@host); "
+                          "use the 'auth' config instead (SSRF protection)");
+        return false;
+    }
+
     /* SSRF Protection: Block internal/private IP addresses
      * Prevents requests to localhost, private networks, and cloud metadata endpoints
      */
@@ -458,6 +528,29 @@ bool http_dispatcher_validate_config(Jsonb *config) {
             }
 
             pfree(proxy_check);
+        }
+    }
+
+    /* Validate signing_secret: a whsec_-prefixed secret must be valid base64 */
+    {
+        JsonbValue secret_val;
+        if (extract_jsonb_value(config, HTTP_CONFIG_KEY_SIGNING_SECRET, &secret_val)) {
+            int key_len = 0;
+            char *key;
+
+            if (secret_val.type != jbvString || secret_val.val.string.len == 0) {
+                ulak_log("error", "HTTP config signing_secret must be a non-empty string");
+                return false;
+            }
+            key = http_decode_signing_secret(secret_val.val.string.val, secret_val.val.string.len,
+                                             &key_len);
+            if (key == NULL) {
+                ulak_log("error", "HTTP config signing_secret has whsec_ prefix but is not valid "
+                                  "base64 (Standard Webhooks: whsec_ + base64(key))");
+                return false;
+            }
+            explicit_bzero(key, key_len);
+            pfree(key);
         }
     }
 
