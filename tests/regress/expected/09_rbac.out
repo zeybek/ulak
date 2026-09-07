@@ -30,6 +30,19 @@ SELECT id, '{"rbac":"admin_msg"}'::jsonb FROM ulak.endpoints WHERE name = 'rbac_
 DELETE FROM ulak.queue WHERE payload @> '{"rbac":"admin_msg"}'::jsonb;
 -- Admin can delete endpoints
 DELETE FROM ulak.endpoints WHERE name = 'rbac_admin_ep';
+-- Admin can call endpoint health and fast mode helpers
+SELECT count(*) >= 0 AS admin_can_call_endpoint_health FROM ulak.get_endpoint_health();
+ admin_can_call_endpoint_health 
+--------------------------------
+ t
+(1 row)
+
+SELECT ulak.enable_fast_mode() AS admin_can_enable_fast_mode;
+ admin_can_enable_fast_mode 
+----------------------------
+ 
+(1 row)
+
 -- Archive maintenance functions are executable as admin via SECURITY DEFINER
 SELECT proname, prosecdef
 FROM pg_proc
@@ -47,11 +60,26 @@ RESET ROLE;
 -- APPLICATION ROLE PERMISSIONS
 -- ============================================================================
 SET ROLE ulak_application;
--- Application can read endpoints
+-- Application CANNOT read endpoints directly (config holds credentials)
 SELECT count(*) >= 0 AS app_can_read_endpoints FROM ulak.endpoints;
- app_can_read_endpoints 
-------------------------
+ERROR:  permission denied for table endpoints
+-- Application reads endpoint state through the view / health function instead
+SELECT count(*) >= 0 AS app_can_read_endpoint_status FROM ulak.endpoint_status;
+ app_can_read_endpoint_status 
+------------------------------
  t
+(1 row)
+
+SELECT count(*) >= 0 AS app_can_call_endpoint_health FROM ulak.get_endpoint_health();
+ app_can_call_endpoint_health 
+------------------------------
+ t
+(1 row)
+
+SELECT ulak.enable_fast_mode() AS app_can_enable_fast_mode;
+ app_can_enable_fast_mode 
+--------------------------
+ 
 (1 row)
 
 -- Application can read queue
@@ -86,10 +114,25 @@ RESET ROLE;
 -- MONITOR ROLE PERMISSIONS
 -- ============================================================================
 SET ROLE ulak_monitor;
--- Monitor can read endpoints
+-- Monitor CANNOT read endpoints directly (config holds credentials)
 SELECT count(*) >= 0 AS monitor_can_read_endpoints FROM ulak.endpoints;
- monitor_can_read_endpoints 
-----------------------------
+ERROR:  permission denied for table endpoints
+-- Monitor reads endpoint state through the view / health function / metrics
+SELECT count(*) >= 0 AS monitor_can_read_endpoint_status FROM ulak.endpoint_status;
+ monitor_can_read_endpoint_status 
+----------------------------------
+ t
+(1 row)
+
+SELECT count(*) >= 0 AS monitor_can_call_endpoint_health FROM ulak.get_endpoint_health();
+ monitor_can_call_endpoint_health 
+----------------------------------
+ t
+(1 row)
+
+SELECT count(*) >= 0 AS monitor_can_call_metrics FROM ulak.metrics();
+ monitor_can_call_metrics 
+--------------------------
  t
 (1 row)
 

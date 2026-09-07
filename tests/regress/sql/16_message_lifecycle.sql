@@ -46,9 +46,11 @@ DELETE FROM ulak.queue WHERE endpoint_id = (SELECT endpoint_id FROM lc_ids);
 -- MAX RETRIES → DLQ: archive_single_to_dlq
 -- ============================================================================
 
-INSERT INTO ulak.queue (endpoint_id, payload, status, retry_count, last_error, failed_at)
+INSERT INTO ulak.queue (
+    endpoint_id, payload, status, retry_count, last_error, failed_at, ordering_key
+)
 SELECT endpoint_id, '{"dlq_test": "max_retries"}'::jsonb, 'failed', 10,
-       'max retries exceeded', NOW()
+       'max retries exceeded', NOW(), 'order-redrive-001'
 FROM lc_ids;
 
 CREATE TEMP TABLE dlq_msg AS
@@ -124,7 +126,10 @@ RESET client_min_messages;
 SELECT status = 'redriven' AS dlq_redriven
 FROM ulak.dlq WHERE id = (SELECT id FROM redrive_dlq);
 
-SELECT status = 'pending' AS requeue_pending, retry_count = 0 AS retries_reset
+SELECT
+    status = 'pending' AS requeue_pending,
+    retry_count = 0 AS retries_reset,
+    ordering_key = 'order-redrive-001' AS redrive_keeps_ordering_key
 FROM ulak.queue WHERE payload @> '{"dlq_test": "max_retries"}'::jsonb AND status = 'pending';
 
 DROP TABLE redrive_dlq;

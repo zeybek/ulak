@@ -69,18 +69,17 @@ ORDER BY indexname;
            indexname           
 -------------------------------
  idx_queue_cleanup
- idx_queue_created_at
  idx_queue_endpoint_pending
  idx_queue_endpoint_processing
  idx_queue_endpoint_terminal
+ idx_queue_expires_pending
  idx_queue_idempotency_key
- idx_queue_next_retry
  idx_queue_ordering_pending
  idx_queue_ordering_processing
  idx_queue_processing
  idx_queue_worker_fetch
  queue_pkey
-(12 rows)
+(11 rows)
 
 -- Verify indexes exist on endpoints table
 SELECT indexname
@@ -105,6 +104,7 @@ WHERE n.nspname = 'ulak'
 ORDER BY p.proname;
             proname             |                                                                                                                                                                              args                                                                                                                                                                               
 --------------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ _active_queue_count            | p_reserve bigint DEFAULT 0
  _check_backpressure            | p_projected_additional bigint DEFAULT 0
  _shmem_metrics                 | 
  alter_endpoint                 | endpoint_name text, new_config jsonb
@@ -128,9 +128,9 @@ ORDER BY p.proname;
  mark_expired_messages          | 
  metrics                        | 
  notify_new_message             | 
- prevent_payload_modification   | 
  publish                        | p_event_type text, p_payload jsonb
  publish_batch                  | p_events jsonb
+ queue_before_update            | 
  redrive_all                    | 
  redrive_endpoint               | p_endpoint_name text
  redrive_message                | p_dlq_id bigint
@@ -146,7 +146,7 @@ ORDER BY p.proname;
  update_circuit_breaker         | p_endpoint_id bigint, p_success boolean
  update_updated_at              | 
  validate_endpoint_config       | protocol text, config jsonb
-(41 rows)
+(42 rows)
 
 -- ============================================================================
 -- TRIGGERS
@@ -168,12 +168,11 @@ FROM pg_trigger
 WHERE tgrelid = 'ulak.queue'::regclass
   AND NOT tgisinternal
 ORDER BY tgname;
-            tgname            
-------------------------------
- enforce_payload_immutability
+           tgname           
+----------------------------
  notify_new_message_trigger
- update_queue_updated_at
-(3 rows)
+ queue_before_update
+(2 rows)
 
 -- ============================================================================
 -- ROLES

@@ -16,11 +16,7 @@ step w2_redrive:
         (SELECT id FROM ulak.dlq WHERE endpoint_name = 'iso_dlq_ep' LIMIT 1)
     ) IS NOT NULL) AS redrove;
 
-redrove
--------
-t      
-(1 row)
-
+ERROR:  DLQ message 1 is not in failed state (status: redriven)
 step check_queue_count: 
     SELECT count(*) AS queue_messages
     FROM ulak.queue q
@@ -29,7 +25,7 @@ step check_queue_count:
 
 queue_messages
 --------------
-             2
+             1
 (1 row)
 
 step check_dlq_status: 
