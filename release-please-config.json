@@ -66,23 +66,28 @@
         },
         {
           "type": "docs",
-          "section": "Documentation"
+          "section": "Documentation",
+          "hidden": true
         },
         {
           "type": "ci",
-          "section": "Continuous Integration"
+          "section": "Continuous Integration",
+          "hidden": true
         },
         {
           "type": "build",
-          "section": "Build System"
+          "section": "Build System",
+          "hidden": true
         },
         {
           "type": "test",
-          "section": "Tests"
+          "section": "Tests",
+          "hidden": true
         },
         {
           "type": "chore",
-          "section": "Miscellaneous"
+          "section": "Miscellaneous",
+          "hidden": true
         }
       ]
     }

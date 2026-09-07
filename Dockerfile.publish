@@ -30,12 +30,19 @@ FROM postgres:${PG_MAJOR}
 
 ARG PG_MAJOR=18
 
+# Runtime libraries for every dispatcher. hiredis, nats and OpenSSL carry the
+# soversion in the Debian package name (libhiredis1.1.0, libnats3.10,
+# libssl3t64 ...), so resolve those names from the base image's apt index
+# instead of pinning them; apt then pulls their own dependencies
+# (libprotobuf-c, libsodium for cnats) that a bare COPY would miss.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libcurl4 \
     librdkafka1 \
     libmosquitto1 \
     librabbitmq4 \
-    libssl3t64 \
+    "$(apt-cache search --names-only '^libssl[0-9]+(t64)?$' | awk '{print $1}' | sort | tail -1)" \
+    "$(apt-cache search --names-only '^libhiredis[0-9.]+$' | awk '{print $1}' | sort | tail -1)" \
+    "$(apt-cache search --names-only '^libnats[0-9.]+$' | awk '{print $1}' | sort | tail -1)" \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy compiled extension from builder
@@ -46,9 +53,10 @@ COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/ulak.control \
 COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/ulak--*.sql \
      /usr/share/postgresql/${PG_MAJOR}/extension/
 
-# libnats and libhiredis have no stable Debian package names — copy from builder
-COPY --from=builder /usr/lib/*/libnats.so* /usr/lib/
-COPY --from=builder /usr/lib/*/libhiredis.so* /usr/lib/
+# Fail the build if any shared library ulak.so needs is missing: the library
+# is in shared_preload_libraries, so a missing dependency means the server
+# does not start at all (this is what broke the 0.0.3 images).
+RUN ! ldd /usr/lib/postgresql/${PG_MAJOR}/lib/ulak.so | grep 'not found'
 
 # Auto-load extension via shared_preload_libraries
 RUN echo "shared_preload_libraries = 'ulak'" >> /usr/share/postgresql/postgresql.conf.sample

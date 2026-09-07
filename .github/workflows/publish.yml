@@ -9,6 +9,10 @@ on:
       tag:
         description: "Release tag (e.g. v0.0.1) — used for backfill/manual publish"
         required: true
+      floating_tags:
+        description: "Also move the pg<N> and latest tags to this release (set by release-please for new releases; leave off for backfills)"
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -84,8 +88,8 @@ jobs:
           tags: |
             type=raw,value=${{ steps.version.outputs.version }}-pg${{ matrix.pg }}
             type=raw,value=${{ steps.shortver.outputs.value }}-pg${{ matrix.pg }}
-            type=raw,value=pg${{ matrix.pg }},enable=${{ github.event_name == 'push' }}
-            type=raw,value=latest,enable=${{ matrix.pg == 18 && github.event_name == 'push' }}
+            type=raw,value=pg${{ matrix.pg }},enable=${{ github.event_name == 'push' || inputs.floating_tags == true }}
+            type=raw,value=latest,enable=${{ matrix.pg == 18 && (github.event_name == 'push' || inputs.floating_tags == true) }}
           labels: |
             org.opencontainers.image.title=ulak
             org.opencontainers.image.description=PostgreSQL ${{ matrix.pg }} with ulak extension
