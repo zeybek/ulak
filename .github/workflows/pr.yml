@@ -120,14 +120,21 @@ jobs:
         run: bear -- make ${{ env.MAKE_FLAGS }}
 
       - name: Run clang-tidy
+        shell: bash
         run: |
+          # pipefail + captured exit code: without this the trailing `tee` (which
+          # always exits 0) masks clang-tidy's --warnings-as-errors failure, making
+          # this gate decorative. `|| rc=$?` lets the notice line still run.
+          set -o pipefail
+          rc=0
           find src -name "*.c" | \
             xargs clang-tidy-22 -p . \
               --warnings-as-errors='clang-analyzer-core.*,bugprone-null-dereference' \
-              2>&1 | tee clang-tidy-output.txt
+              2>&1 | tee clang-tidy-output.txt || rc=$?
           echo ""
           WARNS=$(grep -c "warning:" clang-tidy-output.txt || echo 0)
           echo "::notice::clang-tidy: $WARNS warning(s)"
+          exit "$rc"
 
       - name: Upload clang-tidy report
         if: always()
