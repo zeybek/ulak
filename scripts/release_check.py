@@ -70,8 +70,9 @@ def check_upgrade_chain(version: str, errors: list[str]) -> None:
     if current != version:
         errors.append(
             f"no upgrade path from {start} to version.txt={version}: "
-            f"the chain stops at {current} (expected a sql/ulak--{current}--<next>.sql "
-            f"step that eventually reaches {version})"
+            f"the chain stops at {current}. Add sql/ulak--{current}--{version}.sql "
+            f"(SELECT 1; when the schema did not change) to main before merging the "
+            f"release PR; PostgreSQL cannot ALTER EXTENSION ulak UPDATE without it"
         )
 
     for src, targets in steps.items():

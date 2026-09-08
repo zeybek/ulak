@@ -29,6 +29,16 @@ env:
     libssl-dev
 
 jobs:
+  # Catches a release PR whose version.txt has no upgrade script reaching it
+  # (and any other version/metadata mismatch) before the tag is cut, since
+  # release.yml would otherwise fail after the release already exists.
+  release-metadata:
+    name: Release metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/release_check.py
+
   static-analysis:
     if: ${{ !github.event.pull_request.draft }}
     name: Static Analysis
