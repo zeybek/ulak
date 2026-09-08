@@ -62,12 +62,18 @@ jobs:
           name: pgxn-release-archive
           path: ${{ steps.archive.outputs.path }}
 
-      - name: Create or update GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          files: ${{ steps.archive.outputs.path }}
-          generate_release_notes: true
+      # release-please already created the GitHub release for the tag; only
+      # attach the archive. softprops/action-gh-release tried to update the
+      # release object as well, which the workflow token is not allowed to do
+      # for older releases (backfills failed with "Resource not accessible").
+      - name: Attach archive to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --generate-notes --verify-tag
+          fi
+          gh release upload "$RELEASE_TAG" "${{ steps.archive.outputs.path }}" --repo "$GITHUB_REPOSITORY" --clobber
 
   pgxn-publish:
     name: Publish to PGXN
