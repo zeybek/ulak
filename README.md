@@ -321,6 +321,7 @@ All settings use the `ulak.` prefix.
 | `ulak.workers` | `4` | Number of background workers |
 | `ulak.database` | unset | Database workers connect to |
 | `ulak.poll_interval` | `500ms` | Queue polling interval |
+| `ulak.wake_notify` | `off` | Also `NOTIFY ulak_new_msg` for external workers that `LISTEN`; in-database workers are woken through shared memory |
 | `ulak.batch_size` | `200` | Messages claimed per cycle |
 | `ulak.default_max_retries` | `10` | Default retry budget |
 | `ulak.retry_base_delay` | `10s` | Retry backoff base |

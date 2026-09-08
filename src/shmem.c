@@ -207,6 +207,7 @@ void ulak_register_database(const char *dbname, Oid dboid) {
             SpinLockInit(&ulak_shmem->databases[i].metrics_mutex);
             for (j = 0; j < ULAK_MAX_WORKERS; j++) {
                 ulak_shmem->databases[i].worker_pids[j] = 0;
+                ulak_shmem->databases[i].worker_latches[j] = NULL;
                 ulak_shmem->databases[i].worker_started_at[j] = 0;
                 ulak_shmem->databases[i].messages_processed[j] = 0;
                 ulak_shmem->databases[i].error_count[j] = 0;
@@ -287,9 +288,10 @@ int ulak_get_registered_databases(UlakDatabaseEntry *entries, int max_entries) {
  * @param dboid     Database OID.
  * @param pid       Worker process ID.
  * @param worker_id Slot index (0 to ULAK_MAX_WORKERS-1).
+ * @param latch     The worker's process latch (MyLatch), set by senders at commit.
  * @return 0 on success, -1 on error.
  */
-int ulak_add_worker_pid(Oid dboid, pid_t pid, int worker_id) {
+int ulak_add_worker_pid(Oid dboid, pid_t pid, int worker_id, Latch *latch) {
     int i;
     int result = -1;
 
@@ -312,6 +314,7 @@ int ulak_add_worker_pid(Oid dboid, pid_t pid, int worker_id) {
                      worker_id, ulak_shmem->databases[i].worker_pids[worker_id], dboid);
             } else {
                 ulak_shmem->databases[i].worker_pids[worker_id] = pid;
+                ulak_shmem->databases[i].worker_latches[worker_id] = latch;
                 ulak_shmem->databases[i].worker_started_at[worker_id] = GetCurrentTimestamp();
                 ulak_shmem->databases[i].active_workers++;
                 result = 0;
@@ -350,6 +353,7 @@ void ulak_remove_worker_pid(Oid dboid, pid_t pid) {
             for (j = 0; j < ULAK_MAX_WORKERS; j++) {
                 if (ulak_shmem->databases[i].worker_pids[j] == pid) {
                     ulak_shmem->databases[i].worker_pids[j] = 0;
+                    ulak_shmem->databases[i].worker_latches[j] = NULL;
                     if (ulak_shmem->databases[i].active_workers > 0)
                         ulak_shmem->databases[i].active_workers--;
                     elog(LOG, "[ulak] Worker PID %d removed from slot %d for database OID %u", pid,
@@ -368,6 +372,42 @@ void ulak_remove_worker_pid(Oid dboid, pid_t pid) {
     }
 
     LWLockRelease(ulak_shmem->lock);
+}
+
+/**
+ * @brief Set the latches of the workers named in @p mask (bit = worker_id).
+ *
+ * Runs from a transaction-commit callback in every sending backend, so it
+ * deliberately takes no lock: the fields it reads are pointer/int sized and
+ * a stale value only costs a spurious SetLatch, which is harmless — PGPROC
+ * latches live in shared memory for the life of the cluster.
+ *
+ * @param dboid Database whose workers to wake.
+ * @param mask  Worker slots to wake (bit i = worker_id i).
+ */
+void ulak_wake_workers(Oid dboid, uint32 mask) {
+    int i, j;
+
+    if (ulak_shmem == NULL || mask == 0)
+        return;
+
+    for (i = 0; i < ULAK_MAX_DATABASES; i++) {
+        UlakDatabaseEntry *entry = &ulak_shmem->databases[i];
+
+        if (!entry->active || entry->dboid != dboid)
+            continue;
+
+        for (j = 0; j < ULAK_MAX_WORKERS && j < 32; j++) {
+            Latch *latch;
+
+            if ((mask & (1u << j)) == 0)
+                continue;
+            latch = entry->worker_latches[j];
+            if (latch != NULL && entry->worker_pids[j] != 0)
+                SetLatch(latch);
+        }
+        return;
+    }
 }
 
 /**

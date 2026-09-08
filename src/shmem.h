@@ -12,6 +12,7 @@
 #define ULAK_SHMEM_H
 
 #include "postgres.h"
+#include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/spin.h"
 #include "utils/timestamp.h"
@@ -47,13 +48,14 @@ typedef struct RateLimitShmemBucket {
  * The entry is deactivated automatically when its last worker exits.
  */
 typedef struct UlakDatabaseEntry {
-    Oid dboid;                                       /* Database OID */
-    char dbname[NAMEDATALEN];                        /* Database name */
-    bool active;                                     /* Is this entry in use? */
-    int target_workers;                              /* Target worker count from GUC */
-    int active_workers;                              /* Number of currently running workers */
-    pid_t worker_pids[ULAK_MAX_WORKERS];             /* PIDs of workers (0 if slot empty) */
-    TimestampTz registered_at;                       /* When database was registered */
+    Oid dboid;                               /* Database OID */
+    char dbname[NAMEDATALEN];                /* Database name */
+    bool active;                             /* Is this entry in use? */
+    int target_workers;                      /* Target worker count from GUC */
+    int active_workers;                      /* Number of currently running workers */
+    pid_t worker_pids[ULAK_MAX_WORKERS];     /* PIDs of workers (0 if slot empty) */
+    Latch *worker_latches[ULAK_MAX_WORKERS]; /* &MyProc->procLatch of each worker (NULL if empty) */
+    TimestampTz registered_at;               /* When database was registered */
     TimestampTz worker_started_at[ULAK_MAX_WORKERS]; /* When each worker started */
 
     /* Worker metrics and error tracking (protected by metrics_mutex) */
@@ -117,9 +119,10 @@ extern Size ulak_shmem_size(void);
 /*
  * Worker tracking functions.
  */
-extern int ulak_add_worker_pid(Oid dboid, pid_t pid, int worker_id);
+extern int ulak_add_worker_pid(Oid dboid, pid_t pid, int worker_id, Latch *latch);
 extern void ulak_remove_worker_pid(Oid dboid, pid_t pid);
 extern void ulak_set_target_workers(Oid dboid, int count);
+extern void ulak_wake_workers(Oid dboid, uint32 mask);
 extern void ulak_update_worker_metrics(Oid dboid, int worker_id, int64 processed, int32 errors,
                                        const char *error_msg);
 extern void ulak_update_worker_activity(Oid dboid, int worker_id);
