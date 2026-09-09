@@ -66,7 +66,7 @@ ifdef ENABLE_REDIS
     OBJS += src/dispatchers/redis/redis_connection.o
     OBJS += src/dispatchers/redis/redis_tls.o
     PG_CPPFLAGS += -DENABLE_REDIS
-    SHLIB_LINK += -lhiredis -lhiredis_ssl -lssl -lcrypto
+    SHLIB_LINK += -lhiredis -lhiredis_ssl -lssl -lcrypto -lpthread
 endif
 
 ifdef ENABLE_AMQP

@@ -97,6 +97,8 @@ typedef struct {
     /** @name Runtime connection state */
     /** @{ */
     redisContext *context;        /**< Active hiredis connection (NULL if disconnected). */
+    char resolved_ip[64];         /**< Cached numeric address of host ('' = not resolved). */
+    time_t resolved_at;           /**< When resolved_ip was obtained (60 s TTL). */
     redisSSLContext *ssl_context; /**< TLS context (NULL if TLS disabled). */
     /** @} */
 
