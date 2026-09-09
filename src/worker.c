@@ -398,7 +398,11 @@ static void ulak_worker_loop(void) {
             if (IsTransactionState())
                 AbortCurrentTransaction();
 
-            /* Clean up orphaned batch context + reset local stats (batch not committed) */
+            /* Rows claimed by the interrupted batch go back to pending now
+             * rather than after stale_recovery_timeout */
+            batch_processor_release_claimed();
+
+            /* Clean up orphaned batch context + reset local stats */
             batch_processor_cleanup_on_error();
 
             /* Error recovery: flush dispatcher cache to avoid reusing

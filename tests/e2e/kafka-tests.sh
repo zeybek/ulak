@@ -293,11 +293,19 @@ psql_quiet "DELETE FROM ulak.dlq;"
 create_endpoint "kt-err" "{\"broker\": \"nonexistent:9092\", \"topic\": \"kt-err\"}" "kafka"
 
 send_msg "kt-err" "{\"should_fail\": true}"
-sleep 20
 
-# Should be in pending/retry state (retryable error)
+# The row is claimed ('processing') at once and stays so until librdkafka gives
+# up after ulak.kafka_delivery_timeout (30 s by default); wait for the retry to
+# be recorded instead of sampling at a fixed moment.
+ERROR=""
+for _ in $(seq 1 50); do
+  ERROR=$(psql_exec "SELECT left(last_error, 12) FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'kt-err') LIMIT 1;")
+  [ -n "$ERROR" ] && break
+  sleep 1
+done
+
+# Should be back in pending with a retry scheduled (retryable error)
 STATUS=$(psql_exec "SELECT status FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'kt-err') LIMIT 1;")
-ERROR=$(psql_exec "SELECT left(last_error, 12) FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'kt-err') LIMIT 1;")
 echo "  last_error: $(psql_exec "SELECT left(last_error, 120) FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'kt-err') LIMIT 1;")"
 
 assert_eq "Failed message still pending (retryable)" "pending" "$STATUS"

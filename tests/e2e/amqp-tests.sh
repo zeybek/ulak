@@ -22,8 +22,10 @@ rabbit_cmd() {
 rabbit_declare_queue() {
   local queue="$1"
   # Declare queue via rabbitmqadmin (management plugin)
-  docker exec ulak-rabbitmq-1 rabbitmqadmin declare queue name="$queue" durable=false 2>/dev/null || \
-    rabbit_cmd eval "rabbit_amqqueue:declare(rabbit_misc:r(<<\"/\">>, queue, <<\"$queue\">>), false, false, [], none, <<\"guest\">>)." 2>/dev/null || true
+  # durable=true: RabbitMQ 4 refuses transient non-exclusive queues by default
+  # (deprecated feature transient_nonexcl_queues); ulak itself declares no queues.
+  docker exec ulak-rabbitmq-1 rabbitmqadmin declare queue name="$queue" durable=true 2>/dev/null || \
+    rabbit_cmd eval "rabbit_amqqueue:declare(rabbit_misc:r(<<\"/\">>, queue, <<\"$queue\">>), true, false, [], none, <<\"guest\">>)." 2>/dev/null || true
 }
 
 rabbit_queue_messages() {
@@ -219,10 +221,16 @@ psql_quiet "DELETE FROM ulak.dlq;"
 create_endpoint "at-err" "{\"host\": \"nonexistent-host\", \"exchange\": \"e\", \"routing_key\": \"r\", \"username\": \"guest\", \"password\": \"guest\"}" "amqp"
 send_msg "at-err" "{\"should_fail\": true}"
 
-sleep 20
+# The row is claimed ('processing') at once; wait for the retry to be
+# recorded instead of sampling at a fixed moment.
+ERROR=""
+for _ in $(seq 1 45); do
+  ERROR=$(psql_exec "SELECT left(last_error, 12) FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'at-err') LIMIT 1;")
+  [ -n "$ERROR" ] && break
+  sleep 1
+done
 
 STATUS=$(psql_exec "SELECT status FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'at-err') LIMIT 1;")
-ERROR=$(psql_exec "SELECT left(last_error, 12) FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'at-err') LIMIT 1;")
 
 assert_eq "Failed message pending (retryable)" "pending" "$STATUS"
 assert_contains "Error has RETRYABLE prefix" "RETRYABLE" "$ERROR"

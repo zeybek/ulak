@@ -37,4 +37,15 @@ extern int64 batch_processor_run(Oid worker_dboid, int worker_id, int total_work
  */
 extern void batch_processor_cleanup_on_error(void);
 
+/**
+ * @brief Return the rows claimed by an interrupted batch to 'pending'.
+ *
+ * The claim transaction commits before delivery starts, so an error raised
+ * during delivery or while writing results leaves the rows 'processing'.
+ * Call from the worker's PG_CATCH after the failed transaction has been
+ * aborted and before batch_processor_cleanup_on_error(); it runs its own
+ * short transaction and is a no-op when no batch is in flight.
+ */
+extern void batch_processor_release_claimed(void);
+
 #endif /* ULAK_WORKER_BATCH_PROCESSOR_H */
