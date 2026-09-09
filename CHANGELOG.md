@@ -5,6 +5,23 @@ All notable changes to ulak will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0](https://github.com/zeybek/ulak/compare/v0.1.2...v0.2.0) (2026-09-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* **worker:** the queue trigger and the send_batch/publish functions no longer issue NOTIFY 'ulak_new_msg'. External processes that LISTEN on that channel to learn about new messages must set ulak.wake_notify = on (the NOTIFY is then throttled per session by ulak.notify_throttle_ms) or fall back to polling.
+
+### Features
+
+* **worker:** wake workers through shared memory at commit instead of NOTIFY ([27c2e26](https://github.com/zeybek/ulak/commit/27c2e26c6b702cd28caa7924b3305ccd24b83e21))
+
+
+### Bug Fixes
+
+* **redis:** bound host name resolution by connect_timeout ([9e92878](https://github.com/zeybek/ulak/commit/9e92878a73f4bccceb9f48d33ba7243af4eaab30))
+* **worker:** claim in one transaction, deliver, then write results in another ([a089c8e](https://github.com/zeybek/ulak/commit/a089c8e181bd53f589a537337817a948f5b58ae8))
+
 ## [0.1.2](https://github.com/zeybek/ulak/compare/v0.1.1...v0.1.2) (2026-09-08)
 
 
