@@ -146,8 +146,10 @@ jobs:
           # this gate decorative. `|| rc=$?` lets the notice line still run.
           set -o pipefail
           rc=0
+          # One clang-tidy process per core (xargs -P), a few files each; xargs
+          # exits 123 when any invocation fails, so the gate still trips.
           find src -name "*.c" | \
-            xargs clang-tidy-22 -p . \
+            xargs -P "$(nproc)" -n 4 clang-tidy-22 -p . \
               --warnings-as-errors='clang-analyzer-core.*,bugprone-null-dereference' \
               2>&1 | tee clang-tidy-output.txt || rc=$?
           echo ""
