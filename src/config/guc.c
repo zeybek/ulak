@@ -25,6 +25,8 @@ int ulak_batch_size = 200;
 int ulak_log_level = LOG_LEVEL_WARNING;
 int ulak_default_max_retries = 10;
 int ulak_stale_recovery_timeout = 300;
+bool ulak_wake_notify = false;
+int ulak_notify_throttle_ms = 100;
 
 /** Retry Configuration */
 int ulak_retry_base_delay = 10;
@@ -198,6 +200,19 @@ void config_init_guc_variables(void) {
     DefineCustomIntVariable("ulak.batch_size", "Number of messages to process per batch",
                             "Number of messages to process in each batch", &ulak_batch_size, 200, 1,
                             1000, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+
+    /* Workers are woken through shared memory at commit (wake.c); NOTIFY is
+     * only for external worker processes that share the queue and LISTEN. */
+    DefineCustomBoolVariable(
+        "ulak.wake_notify", "Also NOTIFY ulak_new_msg when messages are queued",
+        "Enable when external worker processes share the queue via LISTEN; "
+        "in-database workers are woken through shared memory.",
+        &ulak_wake_notify, false, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "ulak.notify_throttle_ms", "Minimum gap between NOTIFYs from one session (ms)",
+        "Applies when ulak.wake_notify is on; 0 notifies on every commit", &ulak_notify_throttle_ms,
+        100, 0, 60000, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
     DefineCustomEnumVariable("ulak.log_level", "Log level for ulak extension",
                              "Logging level: error, warning, info, debug", &ulak_log_level,

@@ -238,10 +238,16 @@ psql_quiet "DELETE FROM ulak.dlq;"
 create_endpoint "rt-err" "{\"host\": \"nonexistent-host\", \"stream_key\": \"rt-err\"}" "redis"
 send_msg "rt-err" "{\"should_fail\": true}"
 
-sleep 10
+# Name resolution is bounded by connect_timeout (5 s default); wait for the
+# retry to be recorded rather than sampling at a fixed moment.
+ERROR=""
+for _ in $(seq 1 30); do
+  ERROR=$(psql_exec "SELECT left(last_error, 12) FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'rt-err') LIMIT 1;")
+  [ -n "$ERROR" ] && break
+  sleep 1
+done
 
 STATUS=$(psql_exec "SELECT status FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'rt-err') LIMIT 1;")
-ERROR=$(psql_exec "SELECT left(last_error, 12) FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'rt-err') LIMIT 1;")
 
 assert_eq "Failed message pending (retryable)" "pending" "$STATUS"
 assert_contains "Error has RETRYABLE prefix" "RETRYABLE" "$ERROR"

@@ -7,6 +7,9 @@ CREATE EXTENSION ulak;
 -- Allow internal URLs for testing (SSRF protection blocks localhost by default)
 ALTER SYSTEM SET ulak.http_allow_internal_urls = true;
 SELECT pg_reload_conf();
+-- The reload reaches this backend asynchronously (SIGHUP relayed by the
+-- postmaster); set it for this session too so the endpoint below never races it.
+SET ulak.http_allow_internal_urls = true;
 
 -- Verify extension is installed
 SELECT extname, extversion IS NOT NULL AS has_version FROM pg_extension WHERE extname = 'ulak';

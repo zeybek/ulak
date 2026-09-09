@@ -29,6 +29,7 @@ PG_MODULE_MAGIC;
 #include "shmem.h"
 #include "utils/json_utils.h"
 #include "utils/logging.h"
+#include "wake.h"
 
 /* SRF and system includes */
 #include "catalog/pg_type.h"
@@ -246,21 +247,35 @@ Datum ulak_send(PG_FUNCTION_ARGS) {
     endpoint_id =
         DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
 
-    /* Insert message into queue (fully parameterized) */
+    /*
+     * Insert message into queue (fully parameterized). The statement trigger
+     * would wake every worker; we know the row id, so skip it and mark the
+     * one partition the row hashes to (wake.c sets its latch at commit).
+     */
+    ulak_wake_set_skip_trigger(true);
     ret = SPI_execute_with_args(
         "INSERT INTO ulak.queue "
         "(endpoint_id, payload, status, retry_count, next_retry_at) "
-        "VALUES ($1, $2, 'pending', 0, NOW())",
+        "VALUES ($1, $2, 'pending', 0, NOW()) RETURNING id",
         2, (Oid[]){INT8OID, JSONBOID},
         (Datum[]){Int64GetDatum(endpoint_id), JsonbPGetDatum(payload_jsonb)}, NULL, false, 0);
-    if (ret != SPI_OK_INSERT)
+    ulak_wake_set_skip_trigger(false);
+    if (ret != SPI_OK_INSERT_RETURNING || SPI_processed != 1 || SPI_tuptable == NULL)
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("failed to insert message into queue: %s", SPI_result_code_string(ret))));
 
+    {
+        bool id_null = true;
+        int64 message_id =
+            DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &id_null));
+
+        if (!id_null)
+            ulak_wake_mark(message_id, NULL, false);
+    }
+
     SPI_finish();
 
-    /* Note: pg_notify will be called by the trigger after commit */
     elog(DEBUG1, "[ulak] Message queued successfully for endpoint_id: %lld",
          (long long)endpoint_id);
 

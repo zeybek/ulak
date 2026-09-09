@@ -475,16 +475,34 @@ CREATE TRIGGER update_subscriptions_updated_at
     BEFORE UPDATE ON ulak.subscriptions
     FOR EACH ROW EXECUTE FUNCTION ulak.update_updated_at();
 
--- Notify trigger for new messages
+-- Wake-up of delivery workers. The extension marks the partition the row
+-- belongs to and sets that worker's latch from a commit callback (src/wake.c);
+-- it does not NOTIFY unless ulak.wake_notify is on (external workers that can
+-- only LISTEN get a NOTIFY 'ulak_new_msg' throttled by ulak.notify_throttle_ms).
+-- p_id NULL means "rows with unknown ids were inserted": wake every worker.
+CREATE OR REPLACE FUNCTION ulak._wake_workers(
+    p_id bigint,
+    p_ordering_key text
+) RETURNS void
+LANGUAGE c
+VOLATILE PARALLEL UNSAFE
+AS 'ulak', 'ulak_wake_workers_sql';
+
+COMMENT ON FUNCTION ulak._wake_workers(bigint, text) IS
+'Internal: wake the delivery worker(s) responsible for a queued row once the current transaction commits.
+The extension sets worker latches through shared memory (no NOTIFY lock); NULL id wakes every worker.';
+
+-- Wake trigger for new messages
 -- Uses current_setting to allow suppression during batch operations
 CREATE OR REPLACE FUNCTION ulak.notify_new_message()
 RETURNS TRIGGER AS $$
 BEGIN
-    -- Skip NOTIFY if suppressed (e.g., during bulk COPY or send_batch)
+    -- Skip if suppressed (bulk COPY, or a caller that wakes the exact partition itself)
     IF current_setting('ulak.suppress_notify', true) = 'on' THEN
         RETURN NULL;
     END IF;
-    PERFORM pg_notify('ulak_new_msg', '');
+    -- Statement-level trigger: the ids are unknown here, wake every worker
+    PERFORM ulak._wake_workers(NULL, NULL);
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
@@ -830,7 +848,9 @@ BEGIN
     v_payload_hash := CASE WHEN p_idempotency_key IS NOT NULL
                           THEN md5(p_payload::text) ELSE NULL END;
 
-    -- Insert message with all options
+    -- Insert message with all options. The statement trigger would wake every
+    -- worker; suppress it and wake the one partition this row hashes to.
+    PERFORM set_config('ulak.suppress_notify', 'on', true);
     INSERT INTO ulak.queue (
         endpoint_id, payload, status, retry_count, next_retry_at,
         priority, scheduled_at, idempotency_key, correlation_id, expires_at,
@@ -843,6 +863,8 @@ BEGIN
         v_payload_hash, p_ordering_key
     )
     RETURNING id INTO v_message_id;
+    PERFORM set_config('ulak.suppress_notify', 'off', true);
+    PERFORM ulak._wake_workers(v_message_id, p_ordering_key);
 
     RETURN v_message_id;
 EXCEPTION
@@ -899,7 +921,7 @@ BEGIN
         RAISE EXCEPTION 'Endpoint ''%'' does not exist or is disabled', p_endpoint_name;
     END IF;
 
-    -- Suppress trigger NOTIFY during bulk insert (we do our own at the end)
+    -- Suppress the trigger during bulk insert (workers are woken once at the end)
     PERFORM set_config('ulak.suppress_notify', 'on', true);
 
     -- Bulk insert all payloads in a single INSERT using unnest
@@ -911,9 +933,9 @@ BEGIN
     )
     SELECT array_agg(id) INTO v_ids FROM inserted;
 
-    -- Re-enable trigger NOTIFY and send single notification for batch
+    -- Re-enable the trigger and wake the workers once for the whole batch
     PERFORM set_config('ulak.suppress_notify', 'off', true);
-    PERFORM pg_notify('ulak_new_msg', '');
+    PERFORM ulak._wake_workers(NULL, NULL);
 
     RETURN v_ids;
 END;
@@ -922,7 +944,7 @@ $$;
 COMMENT ON FUNCTION ulak.send_batch(text, jsonb[]) IS
 'High-throughput batch send: inserts multiple messages in a single SQL statement.
 Uses unnest pattern for 10-15x higher throughput than individual send() calls.
-Single NOTIFY is sent for the entire batch.
+Workers are woken once for the entire batch.
 Example: SELECT ulak.send_batch(''webhook'', ARRAY[''{...}''::jsonb, ''{...}''::jsonb])';
 
 -- Batch send with priority support
@@ -962,7 +984,7 @@ BEGIN
     SELECT array_agg(id) INTO v_ids FROM inserted;
 
     PERFORM set_config('ulak.suppress_notify', 'off', true);
-    PERFORM pg_notify('ulak_new_msg', '');
+    PERFORM ulak._wake_workers(NULL, NULL);
 
     RETURN v_ids;
 END;
@@ -1633,10 +1655,10 @@ BEGIN
     )
     SELECT count(*) INTO v_count FROM inserted;
 
-    -- Re-enable NOTIFY and send single notification for entire fan-out
+    -- Re-enable the trigger and wake the workers once for the entire fan-out
     PERFORM set_config('ulak.suppress_notify', 'off', true);
     IF v_count > 0 THEN
-        PERFORM pg_notify('ulak_new_msg', '');
+        PERFORM ulak._wake_workers(NULL, NULL);
     END IF;
 
     RETURN v_count;
@@ -1716,7 +1738,7 @@ BEGIN
 
     PERFORM set_config('ulak.suppress_notify', 'off', true);
     IF v_total > 0 THEN
-        PERFORM pg_notify('ulak_new_msg', '');
+        PERFORM ulak._wake_workers(NULL, NULL);
     END IF;
 
     RETURN v_total;
@@ -2176,7 +2198,8 @@ GRANT EXECUTE ON FUNCTION ulak.cleanup_event_log() TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.cleanup_dlq() TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak._check_backpressure(bigint) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak._active_queue_count(bigint) TO ulak_admin;
--- NOTE: _check_backpressure/_active_queue_count are internal functions called
+GRANT EXECUTE ON FUNCTION ulak._wake_workers(bigint, text) TO ulak_admin;
+-- NOTE: _check_backpressure/_active_queue_count/_wake_workers are internal functions called
 -- by the SECURITY DEFINER send/publish APIs. No direct GRANT to ulak_application needed.
 GRANT EXECUTE ON FUNCTION ulak.archive_single_to_dlq(bigint) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.archive_completed_messages(integer, integer) TO ulak_admin;

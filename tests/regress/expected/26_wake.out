@@ -1,0 +1,75 @@
+-- ============================================================================
+-- Test: worker wake-up path (ulak._wake_workers) and its GUCs
+-- ============================================================================
+-- 1. Defaults: in-database workers are woken through shared memory, no NOTIFY
+SHOW ulak.wake_notify;
+ ulak.wake_notify 
+------------------
+ off
+(1 row)
+
+SHOW ulak.notify_throttle_ms;
+ ulak.notify_throttle_ms 
+-------------------------
+ 100
+(1 row)
+
+-- 2. Callable with an unknown row (wake all), an unkeyed row and a keyed row
+SELECT ulak._wake_workers(NULL, NULL);
+ _wake_workers 
+---------------
+ 
+(1 row)
+
+SELECT ulak._wake_workers(42, NULL);
+ _wake_workers 
+---------------
+ 
+(1 row)
+
+SELECT ulak._wake_workers(42, 'order-1');
+ _wake_workers 
+---------------
+ 
+(1 row)
+
+-- 3. The queue trigger and the batch/publish APIs route through it
+SELECT pg_get_functiondef('ulak.notify_new_message'::regproc) LIKE '%ulak._wake_workers(NULL, NULL)%' AS trigger_uses_wake;
+ trigger_uses_wake 
+-------------------
+ t
+(1 row)
+
+SELECT count(*) AS functions_calling_pg_notify
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'ulak' AND p.prosrc LIKE '%pg_notify%';
+ functions_calling_pg_notify 
+-----------------------------
+                           0
+(1 row)
+
+-- 4. send() and send_with_options() still enqueue (the wake happens at commit)
+INSERT INTO ulak.endpoints (name, protocol, config, enabled)
+VALUES ('wake_ep', 'http', '{"url": "https://example.com/wake"}'::jsonb, false);
+BEGIN;
+UPDATE ulak.endpoints SET enabled = true WHERE name = 'wake_ep';
+SELECT ulak.send('wake_ep', '{"n": 1}'::jsonb);
+ send 
+------
+ t
+(1 row)
+
+SELECT ulak.send_with_options('wake_ep', '{"n": 2}'::jsonb, 0::smallint, NULL, NULL, NULL, NULL, 'key-1') > 0 AS keyed_send;
+ keyed_send 
+------------
+ t
+(1 row)
+
+SELECT count(*) AS queued FROM ulak.queue q JOIN ulak.endpoints e ON e.id = q.endpoint_id WHERE e.name = 'wake_ep';
+ queued 
+--------
+      2
+(1 row)
+
+ROLLBACK;
+DELETE FROM ulak.endpoints WHERE name = 'wake_ep';

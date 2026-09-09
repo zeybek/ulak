@@ -21,6 +21,8 @@ extern int ulak_batch_size;
 extern int ulak_default_max_retries;
 extern int ulak_log_level;
 extern int ulak_stale_recovery_timeout;
+extern bool ulak_wake_notify;
+extern int ulak_notify_throttle_ms;
 
 /* Worker & Core Configuration */
 extern char *ulak_database;

@@ -107,6 +107,7 @@ ORDER BY p.proname;
  _active_queue_count            | p_reserve bigint DEFAULT 0
  _check_backpressure            | p_projected_additional bigint DEFAULT 0
  _shmem_metrics                 | 
+ _wake_workers                  | p_id bigint, p_ordering_key text
  alter_endpoint                 | endpoint_name text, new_config jsonb
  archive_completed_messages     | p_older_than_seconds integer DEFAULT 3600, p_batch_size integer DEFAULT 1000
  archive_single_to_dlq          | p_message_id bigint
@@ -146,7 +147,7 @@ ORDER BY p.proname;
  update_circuit_breaker         | p_endpoint_id bigint, p_success boolean
  update_updated_at              | 
  validate_endpoint_config       | protocol text, config jsonb
-(42 rows)
+(43 rows)
 
 -- ============================================================================
 -- TRIGGERS

@@ -19,6 +19,7 @@ MODULE_big = $(EXTENSION)
 OBJS = src/ulak.o
 OBJS += src/worker.o
 OBJS += src/shmem.o
+OBJS += src/wake.o
 
 # Modular architecture objects
 OBJS += src/core/entities.o
@@ -65,7 +66,7 @@ ifdef ENABLE_REDIS
     OBJS += src/dispatchers/redis/redis_connection.o
     OBJS += src/dispatchers/redis/redis_tls.o
     PG_CPPFLAGS += -DENABLE_REDIS
-    SHLIB_LINK += -lhiredis -lhiredis_ssl -lssl -lcrypto
+    SHLIB_LINK += -lhiredis -lhiredis_ssl -lssl -lcrypto -lpthread
 endif
 
 ifdef ENABLE_AMQP
@@ -205,7 +206,7 @@ REGRESS = 00_setup 01_schema 02_endpoints_crud 03_endpoints_validation \
           15_production_hardening 16_message_lifecycle 17_cloudevents \
           18_advanced_operations 19_http_proxy 20_kafka_config 21_redis_config \
           22_mqtt_config 23_amqp_config 24_nats_config \
-          25_metrics 99_cleanup
+          25_metrics 26_wake 99_cleanup
 
 # Test options: use tests/regress/ subdirectory for input/output, dedicated test database
 REGRESS_OPTS = --inputdir=tests/regress --outputdir=tests/regress --dbname=ulak_test

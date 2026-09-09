@@ -7,8 +7,8 @@
  * (ulak.endpoints.circuit_state, ulak.update_circuit_breaker()).
  *
  * The in-loop decision logic (skip vs. half-open probe vs. dispatch)
- * still lives inside process_pending_messages_batch() in worker.c and
- * will be migrated with the rest of the batch processor.
+ * lives in batch_claim() in batch_processor.c and runs inside the claim
+ * transaction; cb_update_after_dispatch() runs in the result transaction.
  */
 
 #ifndef ULAK_WORKER_CIRCUIT_BREAKER_H

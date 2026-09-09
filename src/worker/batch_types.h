@@ -43,6 +43,7 @@ typedef struct {
     DispatchResult *result;    /* Dispatch result for response capture */
     Jsonb *headers;            /* Per-message headers */
     Jsonb *metadata;           /* Per-message metadata */
+    bool deferred;             /* Put back to pending by the circuit breaker — skip dispatch */
     bool rate_limited;         /* Deferred by rate limiter — skip dispatch */
     int32 rate_limit_defer_ms; /* How long to defer a rate-limited message (next_retry_at) */
 } MessageBatchInfo;

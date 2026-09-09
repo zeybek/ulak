@@ -1,5 +1,12 @@
 name: Main CI
 
+# Every commit reaches main through a pull request whose full PG 14-18 matrix,
+# sanitizers, static analysis and clang-tidy are required checks, and the
+# ruleset requires the branch to be up to date with main, so the merged tree
+# is exactly the tree that was tested. A push to main therefore only runs a
+# PG 18 smoke pass (regress + isolation + TAP) as a signal for the status
+# line; the full matrix is available on demand through workflow_dispatch.
+
 on:
   push:
     branches: [main]
@@ -21,8 +28,42 @@ env:
     libssl-dev
 
 jobs:
-  # ── Regression + isolation tests across PG 14-18 ──
+  # ── Smoke pass on every push to main: PG 18 only ──
+  smoke-regress:
+    if: github.event_name == 'push'
+    name: PG 18 — Regress (smoke)
+    uses: ./.github/workflows/_reusable-regression.yml
+    with:
+      pg-version: 18
+      make-flags: ENABLE_KAFKA=1 ENABLE_MQTT=1 ENABLE_REDIS=1 ENABLE_AMQP=1 ENABLE_NATS=1
+      protocol-deps: >-
+        libcurl4-openssl-dev
+        librdkafka-dev
+        libhiredis-dev
+        libmosquitto-dev
+        librabbitmq-dev
+        libnats-dev
+        libssl-dev
+
+  smoke-tap:
+    if: github.event_name == 'push'
+    name: PG 18 — TAP (smoke)
+    uses: ./.github/workflows/_reusable-tap.yml
+    with:
+      pg-version: 18
+      make-flags: ENABLE_KAFKA=1 ENABLE_MQTT=1 ENABLE_REDIS=1 ENABLE_AMQP=1 ENABLE_NATS=1
+      protocol-deps: >-
+        libcurl4-openssl-dev
+        librdkafka-dev
+        libhiredis-dev
+        libmosquitto-dev
+        librabbitmq-dev
+        libnats-dev
+        libssl-dev
+
+  # ── Full matrix, on demand (workflow_dispatch) ──
   regress:
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -41,8 +82,8 @@ jobs:
         libnats-dev
         libssl-dev
 
-  # ── TAP lifecycle tests across PG 14-18 ──
   tap:
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -61,14 +102,15 @@ jobs:
         libnats-dev
         libssl-dev
 
-  # ── Static analysis: cppcheck + clang-format ──
   static-analysis:
+    if: github.event_name == 'workflow_dispatch'
     name: Static Analysis
     uses: ./.github/workflows/_reusable-static-analysis.yml
 
   # ── clang-tidy: deep AST-based analysis ──
   clang-tidy:
     name: clang-tidy
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -104,8 +146,10 @@ jobs:
           # this gate decorative. `|| rc=$?` lets the notice line still run.
           set -o pipefail
           rc=0
+          # One clang-tidy process per core (xargs -P), a few files each; xargs
+          # exits 123 when any invocation fails, so the gate still trips.
           find src -name "*.c" | \
-            xargs clang-tidy-22 -p . \
+            xargs -P "$(nproc)" -n 4 clang-tidy-22 -p . \
               --warnings-as-errors='clang-analyzer-core.*,bugprone-null-dereference' \
               2>&1 | tee clang-tidy-output.txt || rc=$?
           echo ""
@@ -120,8 +164,8 @@ jobs:
           name: clang-tidy-report
           path: clang-tidy-output.txt
 
-  # ── AddressSanitizer + UndefinedBehaviorSanitizer ──
   sanitizers:
+    if: github.event_name == 'workflow_dispatch'
     name: ASan + UBSan
     uses: ./.github/workflows/_reusable-sanitizers.yml
     with:

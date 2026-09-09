@@ -101,7 +101,7 @@ PGDLLEXPORT void ulak_worker_main(Datum main_arg) {
     worker_dboid = MyDatabaseId;
     ulak_register_database(worker_dbname, worker_dboid);
     ulak_set_target_workers(worker_dboid, total_workers);
-    (void)ulak_add_worker_pid(worker_dboid, MyProcPid, worker_id);
+    (void)ulak_add_worker_pid(worker_dboid, MyProcPid, worker_id, MyLatch);
 
     /* Set up signal handlers - MyLatch is now initialized */
     ulak_pqsignal(SIGTERM, ulak_sigterm_handler);
@@ -188,7 +188,7 @@ static void ulak_worker_loop(void) {
             }
         }
 
-        /* Wait for notifications or timeout */
+        /* Wait for a latch wake-up (wake.c, or NOTIFY with ulak.wake_notify) or the poll timeout */
         rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
                        (long)ulak_poll_interval, PG_WAIT_EXTENSION);
 
@@ -233,7 +233,9 @@ static void ulak_worker_loop(void) {
             elog(LOG, "[ulak] Extension detected, worker starting");
         }
 
-        /* One-time setup: subscribe to notifications */
+        /* One-time setup: subscribe to notifications. Since the commit-time
+         * latch wake-up (wake.c) this only matters when ulak.wake_notify is on
+         * or the catalog still carries a pre-0.2.0 trigger that NOTIFYs. */
         if (!listener_registered) {
             StartTransactionCommand();
             Async_Listen("ulak_new_msg");
@@ -396,7 +398,11 @@ static void ulak_worker_loop(void) {
             if (IsTransactionState())
                 AbortCurrentTransaction();
 
-            /* Clean up orphaned batch context + reset local stats (batch not committed) */
+            /* Rows claimed by the interrupted batch go back to pending now
+             * rather than after stale_recovery_timeout */
+            batch_processor_release_claimed();
+
+            /* Clean up orphaned batch context + reset local stats */
             batch_processor_cleanup_on_error();
 
             /* Error recovery: flush dispatcher cache to avoid reusing
