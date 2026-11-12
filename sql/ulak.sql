@@ -373,18 +373,31 @@ Filter uses JSONB containment (@>) for payload matching.';
 -- ============================================================================
 
 DO $$
+DECLARE
+    v_role text;
+    v_members text;
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ulak_admin') THEN
-        CREATE ROLE ulak_admin NOLOGIN;
-    END IF;
+    FOREACH v_role IN ARRAY ARRAY['ulak_admin', 'ulak_application', 'ulak_monitor'] LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
+            EXECUTE format('CREATE ROLE %I NOLOGIN', v_role);
+            CONTINUE;
+        END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ulak_application') THEN
-        CREATE ROLE ulak_application NOLOGIN;
-    END IF;
+        -- A role that already exists keeps its members, and they receive every
+        -- privilege granted below (ulak_admin can read endpoint credentials).
+        -- Anyone with CREATEROLE can create the role first, so name them.
+        SELECT string_agg(quote_ident(m.rolname), ', ' ORDER BY m.rolname) INTO v_members
+        FROM pg_auth_members am
+        JOIN pg_roles r ON r.oid = am.roleid
+        JOIN pg_roles m ON m.oid = am.member
+        WHERE r.rolname = v_role;
 
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ulak_monitor') THEN
-        CREATE ROLE ulak_monitor NOLOGIN;
-    END IF;
+        IF v_members IS NOT NULL THEN
+            RAISE WARNING 'role % already exists and has members: %', v_role, v_members
+            USING DETAIL = format('Every privilege ulak grants to %s is also granted to them.', v_role),
+                  HINT = 'Revoke memberships that are not intended.';
+        END IF;
+    END LOOP;
 END
 $$;
 
