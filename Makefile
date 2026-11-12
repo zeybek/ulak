@@ -206,7 +206,7 @@ REGRESS = 00_setup 01_schema 02_endpoints_crud 03_endpoints_validation \
           15_production_hardening 16_message_lifecycle 17_cloudevents \
           18_advanced_operations 19_http_proxy 20_kafka_config 21_redis_config \
           22_mqtt_config 23_amqp_config 24_nats_config \
-          25_metrics 26_wake 99_cleanup
+          25_metrics 26_wake 27_ssrf 99_cleanup
 
 # Test options: use tests/regress/ subdirectory for input/output, dedicated test database
 REGRESS_OPTS = --inputdir=tests/regress --outputdir=tests/regress --dbname=ulak_test

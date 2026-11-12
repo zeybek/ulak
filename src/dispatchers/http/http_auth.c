@@ -203,11 +203,18 @@ bool http_auth_validate(Jsonb *endpoint_config) {
                     valid = false;
                 }
                 /* SSRF protection: block internal/private network token URLs */
-                if (valid && http_is_internal_url(token_url, strlen(token_url))) {
-                    elog(WARNING,
-                         "[ulak] OAuth2 token_url targets internal/private network address "
-                         "(SSRF protection)");
-                    valid = false;
+                if (valid) {
+                    HttpUrlTarget target = http_classify_url_target(token_url, strlen(token_url));
+
+                    if (target == HTTP_URL_TARGET_INTERNAL) {
+                        elog(WARNING,
+                             "[ulak] OAuth2 token_url targets internal/private network address "
+                             "(SSRF protection)");
+                        valid = false;
+                    } else if (target == HTTP_URL_TARGET_UNRESOLVED) {
+                        elog(WARNING, "[ulak] OAuth2 token_url host could not be resolved");
+                        valid = false;
+                    }
                 }
                 pfree(token_url);
             }

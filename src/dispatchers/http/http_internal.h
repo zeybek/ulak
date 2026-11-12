@@ -96,11 +96,32 @@ bool http_validate_url_scheme(const char *url, size_t url_len);
  */
 bool http_url_has_userinfo(const char *url, size_t url_len);
 
+/** Where an http(s) URL points, as seen by the SSRF guard. */
+typedef enum HttpUrlTarget {
+    HTTP_URL_TARGET_PUBLIC,    /**< resolves only to public addresses (or the guard is off) */
+    HTTP_URL_TARGET_INTERNAL,  /**< localhost, an internal literal, or resolves to one */
+    HTTP_URL_TARGET_UNRESOLVED /**< no host, or the host did not resolve */
+} HttpUrlTarget;
+
+/**
+ * @brief Classify the host of an http(s) URL for SSRF protection.
+ *
+ * Internal means loopback, RFC 1918, link-local/metadata, CGNAT, 0.0.0.0/8,
+ * broadcast, IPv6 unspecified/loopback/link-local/unique-local, or an IPv4-
+ * mapped or NAT64 address carrying one of those. Always PUBLIC when the
+ * http_allow_internal_urls GUC is enabled.
+ *
+ * @param url      URL string to check (need not be NUL-terminated).
+ * @param url_len  Length of the URL string.
+ * @return HTTP_URL_TARGET_PUBLIC, HTTP_URL_TARGET_INTERNAL or HTTP_URL_TARGET_UNRESOLVED.
+ */
+HttpUrlTarget http_classify_url_target(const char *url, size_t url_len);
+
 /**
  * @brief Check if URL targets an internal/private IP address (SSRF protection).
  *
- * Blocks RFC 1918, loopback, link-local and CGNAT addresses unless
- * the http_allow_internal_urls GUC is enabled.
+ * Same as http_classify_url_target() == HTTP_URL_TARGET_INTERNAL: a host that
+ * does not resolve is not reported as internal.
  *
  * @param url      URL string to check.
  * @param url_len  Length of the URL string.
