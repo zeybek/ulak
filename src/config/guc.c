@@ -281,9 +281,10 @@ void config_init_guc_variables(void) {
                              &ulak_http_allow_internal_urls, false, PGC_SUSET, GUC_NOT_IN_SAMPLE,
                              NULL, NULL, NULL);
 
-    DefineCustomIntVariable("ulak.http_batch_capacity", "HTTP batch capacity",
-                            "Maximum pending HTTP requests in a batch", &ulak_http_batch_capacity,
-                            200, 1, 1000, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+    DefineCustomIntVariable(
+        "ulak.http_batch_capacity", "HTTP batch capacity",
+        "Initial size of the per-endpoint pending request array (grows as needed)",
+        &ulak_http_batch_capacity, 200, 1, 1000, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
     DefineCustomIntVariable("ulak.http_max_connections_per_host", "Max connections per host",
                             "Maximum concurrent connections per target host",

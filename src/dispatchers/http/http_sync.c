@@ -13,6 +13,7 @@
 #include "config/guc.h"
 #include "core/entities.h"
 #include "http_internal.h"
+#include "mb/pg_wchar.h"
 #include "utils/builtins.h"
 #include "utils/cloudevents.h"
 #include "utils/json_utils.h"
@@ -57,6 +58,10 @@ static char *http_classify_4xx(HttpDispatcher *http_dispatcher, long response_co
     if (response_code == 429)
         return psprintf(ERROR_PREFIX_RETRYABLE " HTTP %ld: Rate limited", response_code);
 
+    if (http_status_is_retryable_4xx(response_code))
+        return psprintf(ERROR_PREFIX_RETRYABLE " HTTP %ld: Client error (transient)",
+                        response_code);
+
     if (response_code == 410) {
         if (should_disable)
             *should_disable = true;
@@ -71,8 +76,11 @@ static char *http_classify_4xx(HttpDispatcher *http_dispatcher, long response_co
     return psprintf(ERROR_PREFIX_PERMANENT " HTTP %ld: Client error", response_code);
 }
 
+bool http_status_is_retryable_4xx(long response_code) {
+    return response_code == 408 || response_code == 425 || response_code == 429;
+}
+
 /**
- * @private
  * @brief Parse Retry-After header value from HTTP response.
  *
  * Handles delay-seconds (integer) format per RFC 7231 Section 7.1.3.
@@ -84,8 +92,8 @@ static char *http_classify_4xx(HttpDispatcher *http_dispatcher, long response_co
  * @param curl CURL handle with completed response.
  * @return Delay in seconds, or 0 if absent/unparseable.
  */
+int32 http_parse_retry_after(CURL *curl) {
 #if LIBCURL_VERSION_NUM >= 0x075400 /* 7.84.0: curl_easy_header */
-static int32 parse_retry_after(CURL *curl) {
     struct curl_header *header = NULL;
 
     if (curl_easy_header(curl, "Retry-After", 0, CURLH_HEADER, -1, &header) == CURLHE_OK &&
@@ -95,9 +103,9 @@ static int32 parse_retry_after(CURL *curl) {
         if (*endptr == '\0' && val > 0 && val <= 86400)
             return (int32)val;
     }
+#endif
     return 0;
 }
-#endif
 
 /**
  * @brief Dispatch HTTP message synchronously (single message).
@@ -298,6 +306,120 @@ static size_t response_write_callback(char *ptr, size_t size, size_t nmemb, void
 }
 
 /**
+ * @private
+ * @brief Join the endpoint URL and a per-message url_suffix.
+ *
+ * Exactly one '/' goes between them, so a suffix such as ".evil.com" or
+ * ":8080/x" lands in the path and can never extend the host or the port.
+ *
+ * @param base Endpoint URL.
+ * @param suffix Non-empty url_suffix.
+ * @return palloc'd joined URL.
+ */
+static char *http_join_url_suffix(const char *base, const char *suffix) {
+    StringInfoData buf;
+    size_t base_len = strlen(base);
+
+    while (base_len > 0 && base[base_len - 1] == '/')
+        base_len--;
+
+    initStringInfo(&buf);
+    appendBinaryStringInfo(&buf, base, (int)base_len);
+    if (suffix[0] != '/')
+        appendStringInfoChar(&buf, '/');
+    appendStringInfoString(&buf, suffix);
+    return buf.data;
+}
+
+/**
+ * @private
+ * @brief Whether a joined URL still points at the endpoint's own origin.
+ *
+ * Both URLs are parsed with libcurl's URL API (the parser curl itself will use
+ * for the request); scheme, host and effective port must match and the joined
+ * URL must carry no userinfo.
+ *
+ * @param base Endpoint URL.
+ * @param url Joined URL.
+ * @return true if both parse and scheme, host and port are those of @p base.
+ */
+static bool http_url_same_origin(const char *base, const char *url) {
+    static const CURLUPart parts[] = {CURLUPART_SCHEME, CURLUPART_HOST, CURLUPART_PORT};
+    CURLU *base_h = curl_url();
+    CURLU *url_h = curl_url();
+    bool same = false;
+    char *user = NULL;
+    int i;
+
+    if (!base_h || !url_h)
+        goto done;
+    if (curl_url_set(base_h, CURLUPART_URL, base, 0) != CURLUE_OK ||
+        curl_url_set(url_h, CURLUPART_URL, url, 0) != CURLUE_OK)
+        goto done;
+    if (curl_url_get(url_h, CURLUPART_USER, &user, 0) != CURLUE_NO_USER)
+        goto done;
+
+    same = true;
+    for (i = 0; i < (int)lengthof(parts) && same; i++) {
+        char *a = NULL;
+        char *b = NULL;
+
+        if (curl_url_get(base_h, parts[i], &a, CURLU_DEFAULT_PORT) != CURLUE_OK ||
+            curl_url_get(url_h, parts[i], &b, CURLU_DEFAULT_PORT) != CURLUE_OK ||
+            pg_strcasecmp(a, b) != 0)
+            same = false;
+        curl_free(a);
+        curl_free(b);
+    }
+
+done:
+    curl_free(user);
+    curl_url_cleanup(base_h);
+    curl_url_cleanup(url_h);
+    return same;
+}
+
+/**
+ * @private
+ * @brief Copy of the part of a server-sent string that is valid text.
+ *
+ * Captured values end up in the jsonb response column, and jsonb input does
+ * not check the encoding: a body that is not text, or one the size cap cut in
+ * the middle of a character, would store bytes that are invalid in the
+ * database encoding. Such a row breaks conversions and makes a dump of the
+ * table unrestorable (COPY FROM rejects it). Keep the valid prefix only.
+ *
+ * @param data Bytes received from the server.
+ * @param len Number of bytes.
+ * @return palloc'd NUL-terminated copy of the longest valid prefix.
+ */
+static char *http_valid_text_prefix(const char *data, size_t len) {
+    int valid = pg_encoding_verifymbstr(GetDatabaseEncoding(), data, (int)len);
+
+    return pnstrdup(data, valid);
+}
+
+/**
+ * @private
+ * @brief metadata.timeout in seconds, clamped to 0..300.
+ *
+ * numeric_int4 would raise an ERROR for a value outside int4 and take the
+ * whole batch down; strtol saturates instead.
+ *
+ * @param num The numeric metadata value.
+ * @return Seconds in 1..300, or 0 when the value is not positive.
+ */
+static int http_metadata_timeout(Numeric num) {
+    char *str = DatumGetCString(DirectFunctionCall1(numeric_out, NumericGetDatum(num)));
+    long secs = strtol(str, NULL, 10);
+
+    pfree(str);
+    if (secs > 300)
+        return 300;
+    return secs > 0 ? (int)secs : 0;
+}
+
+/**
  * @brief Extended HTTP dispatch with per-message headers/metadata and response capture.
  * @param dispatcher Base dispatcher instance.
  * @param payload Message payload string.
@@ -407,19 +529,16 @@ bool http_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, Js
         /* Timeout override — clamped to the same 1..300s range the endpoint
          * config allows, so a single message cannot stall the worker. */
         if (extract_jsonb_value(metadata, "timeout", &val) && val.type == jbvNumeric) {
-            timeout_override =
-                DatumGetInt32(DirectFunctionCall1(numeric_int4, NumericGetDatum(val.val.numeric)));
-            if (timeout_override > 0) {
-                if (timeout_override > 300)
-                    timeout_override = 300;
+            timeout_override = http_metadata_timeout(val.val.numeric);
+            if (timeout_override > 0)
                 curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout_override);
-            }
         }
 
         /* URL suffix override (append to base URL).
          * SECURITY: Reject suffixes containing scheme-changing or credential-injection
          * characters to prevent SSRF (e.g. "@evil.com" changes the destination). */
-        if (extract_jsonb_value(metadata, "url_suffix", &val) && val.type == jbvString) {
+        if (extract_jsonb_value(metadata, "url_suffix", &val) && val.type == jbvString &&
+            val.val.string.len > 0) {
             char *suffix = pnstrdup(val.val.string.val, val.val.string.len);
 
             if (strstr(suffix, "://") != NULL || strchr(suffix, '@') != NULL) {
@@ -440,17 +559,32 @@ bool http_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, Js
                 success = false;
                 goto cleanup;
             } else {
-                StringInfoData full_url;
-                initStringInfo(&full_url);
-                appendStringInfo(&full_url, "%s%s", http_dispatcher->url, suffix);
+                char *full_url = http_join_url_suffix(http_dispatcher->url, suffix);
+
+                if (!http_url_same_origin(http_dispatcher->url, full_url)) {
+                    /* Same as above: never fall through to the base URL */
+                    ulak_log("warning",
+                             "Rejected url_suffix: invalid URL or other scheme, host or port");
+                    pfree(full_url);
+                    pfree(suffix);
+                    if (result) {
+                        result->success = false;
+                        result->error_msg =
+                            pstrdup(ERROR_PREFIX_PERMANENT " Rejected url_suffix: joined URL is "
+                                                           "invalid or leaves the endpoint's "
+                                                           "scheme, host or port");
+                    }
+                    success = false;
+                    goto cleanup;
+                }
 
                 /* Validate concatenated URL against internal IP blocklist */
                 if (!ulak_http_allow_internal_urls &&
-                    http_is_internal_url(full_url.data, full_url.len)) {
+                    http_is_internal_url(full_url, strlen(full_url))) {
                     /* SECURITY/CORRECTNESS: same as the '://'/'@' branch above —
                      * reject the dispatch instead of falling through to the base URL. */
                     ulak_log("warning", "Rejected url_suffix leading to internal URL");
-                    pfree(full_url.data);
+                    pfree(full_url);
                     pfree(suffix);
                     if (result) {
                         result->success = false;
@@ -460,11 +594,11 @@ bool http_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, Js
                     success = false;
                     goto cleanup;
                 } else {
-                    curl_easy_setopt(curl, CURLOPT_URL, full_url.data);
-                    /* NOTE: full_url.data must survive until after curl_easy_perform().
+                    curl_easy_setopt(curl, CURLOPT_URL, full_url);
+                    /* NOTE: full_url must survive until after curl_easy_perform().
                      * CURLOPT_URL does NOT copy the string in all curl versions.
                      * Store pointer for cleanup after perform. */
-                    url_suffix_buf = full_url.data;
+                    url_suffix_buf = full_url;
                 }
                 pfree(suffix);
             }
@@ -491,12 +625,14 @@ bool http_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, Js
             /* Get content type */
             curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &content_type);
             if (content_type) {
-                result->http_content_type = pstrdup(content_type);
+                result->http_content_type =
+                    http_valid_text_prefix(content_type, strlen(content_type));
             }
 
             /* Copy response body (truncated if needed) */
             if (response_buf.size > 0 && ulak_response_body_max_size > 0) {
-                result->http_response_body = pstrdup(response_buf.data);
+                result->http_response_body =
+                    http_valid_text_prefix(response_buf.data, response_buf.size);
             }
         }
 
@@ -513,11 +649,9 @@ bool http_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, Js
                 result->success = false;
                 result->error_msg =
                     psprintf(ERROR_PREFIX_RETRYABLE " HTTP %ld: Server error", response_code);
-#if LIBCURL_VERSION_NUM >= 0x075400
                 if (response_code == 503) {
-                    result->retry_after_seconds = parse_retry_after(curl);
+                    result->retry_after_seconds = http_parse_retry_after(curl);
                 }
-#endif
             }
         } else if (response_code >= 400 && response_code < 500) {
             /* 4xx Client Errors (429 retryable, 410 permanent+disable,
@@ -530,10 +664,8 @@ bool http_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, Js
                 result->success = false;
                 result->error_msg = classified;
                 result->should_disable_endpoint = should_disable;
-#if LIBCURL_VERSION_NUM >= 0x075400
                 if (response_code == 429)
-                    result->retry_after_seconds = parse_retry_after(curl);
-#endif
+                    result->retry_after_seconds = http_parse_retry_after(curl);
             } else {
                 pfree(classified);
             }

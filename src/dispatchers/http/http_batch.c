@@ -40,11 +40,20 @@ bool http_batch_produce(Dispatcher *dispatcher, const char *payload, int64 msg_i
         return false;
     }
 
-    /* Check capacity */
+    /* Grow instead of refusing the row: a refusal costs the message a retry
+     * although nothing was sent (ulak.batch_size may exceed
+     * ulak.http_batch_capacity). Moving the array is safe: requests find their
+     * slot by index (CURLOPT_PRIVATE) and own their payload and headers.
+     * repalloc keeps the array in the context it was created in. */
     if (http_dispatcher->pending_count >= http_dispatcher->pending_capacity) {
-        if (error_msg)
-            *error_msg = pstrdup("HTTP batch capacity reached, flush before producing more");
-        return false;
+        int old_capacity = http_dispatcher->pending_capacity;
+        int new_capacity = old_capacity * 2;
+
+        http_dispatcher->pending_requests =
+            repalloc(http_dispatcher->pending_requests, sizeof(HttpPendingRequest) * new_capacity);
+        memset(&http_dispatcher->pending_requests[old_capacity], 0,
+               sizeof(HttpPendingRequest) * (new_capacity - old_capacity));
+        http_dispatcher->pending_capacity = new_capacity;
     }
 
     /* Create easy handle for this request */
@@ -231,20 +240,28 @@ int http_batch_flush(Dispatcher *dispatcher, int timeout_ms, int64 **failed_ids,
                             ERROR_PREFIX_RETRYABLE
                             " HTTP 401: Unauthorized (OAuth2 token invalidated, will refresh)");
                     } else if (req->http_code >= 400 && req->http_code < 500 &&
-                               req->http_code != 429) {
-                        /* 4xx (except 429, 410 and OAuth2 401) are permanent */
+                               !http_status_is_retryable_4xx(req->http_code)) {
+                        /* 4xx (except 408/425/429, 410 and OAuth2 401) are permanent */
                         snprintf(req->error, HTTP_ERROR_BUFFER_SIZE,
                                  ERROR_PREFIX_PERMANENT " HTTP %ld", req->http_code);
                     } else {
                         /*
-                         * 5xx, 429, 1xx, 3xx are all retryable.
-                         * Note: Retry-After header is intentionally not parsed in batch
-                         * mode. Batch dispatch prioritizes throughput; per-request
-                         * Retry-After overrides are only available in sync mode
-                         * (dispatch_ex with DispatchResult).
+                         * 5xx, 408, 425, 429, 1xx, 3xx are all retryable. The flush
+                         * has no DispatchResult, so a Retry-After on 429/503 travels
+                         * to the worker as a marker in the error string.
                          */
-                        snprintf(req->error, HTTP_ERROR_BUFFER_SIZE,
-                                 ERROR_PREFIX_RETRYABLE " HTTP %ld", req->http_code);
+                        int32 retry_after = 0;
+
+                        if (req->http_code == 429 || req->http_code == 503)
+                            retry_after = http_parse_retry_after(easy);
+                        if (retry_after > 0)
+                            snprintf(req->error, HTTP_ERROR_BUFFER_SIZE,
+                                     ERROR_PREFIX_RETRYABLE " " ERROR_MARKER_RETRY_AFTER
+                                                            "%d] HTTP %ld",
+                                     (int)retry_after, req->http_code);
+                        else
+                            snprintf(req->error, HTTP_ERROR_BUFFER_SIZE,
+                                     ERROR_PREFIX_RETRYABLE " HTTP %ld", req->http_code);
                     }
                 } else {
                     /* Network/connection error - retryable */
@@ -301,6 +318,10 @@ int http_batch_flush(Dispatcher *dispatcher, int timeout_ms, int64 **failed_ids,
     for (i = 0; i < http_dispatcher->pending_count; i++) {
         HttpPendingRequest *req = &http_dispatcher->pending_requests[i];
         if (req->easy_handle) {
+            /* Transfers that did not finish are still in the multi handle;
+             * libcurl wants them removed before the easy handle is freed */
+            if (!req->completed)
+                curl_multi_remove_handle(http_dispatcher->multi_handle, req->easy_handle);
             curl_easy_cleanup(req->easy_handle);
             req->easy_handle = NULL;
         }

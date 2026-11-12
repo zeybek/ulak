@@ -168,6 +168,33 @@ curl_socket_t ulak_http_opensocket_guard(void *clientp, curlsocktype purpose,
                                          struct curl_sockaddr *address);
 
 /* ============================================================================
+ * Response Classification (http_sync.c)
+ * ============================================================================ */
+
+/**
+ * @brief Parse the Retry-After header of a completed transfer.
+ *
+ * Integer delay-seconds only (RFC 9110 §10.2.3), accepted in 1..86400.
+ * Call it before the easy handle is reset or cleaned up.
+ *
+ * @param curl  Easy handle of the finished transfer.
+ * @return Delay in seconds, or 0 if absent, unparseable or libcurl < 7.84.
+ */
+int32 http_parse_retry_after(CURL *curl);
+
+/**
+ * @brief Whether a 4xx status is worth retrying.
+ *
+ * 429 Too Many Requests, 408 Request Timeout and 425 Too Early describe the
+ * moment, not the request; every other 4xx (except 410 and the OAuth2 401,
+ * which have their own handling) is permanent.
+ *
+ * @param response_code  HTTP status code in 400..499.
+ * @return true for 408, 425 and 429.
+ */
+bool http_status_is_retryable_4xx(long response_code);
+
+/* ============================================================================
  * Webhook Signing Functions (http_request.c)
  * ============================================================================ */
 

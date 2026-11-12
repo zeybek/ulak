@@ -13,6 +13,7 @@
 #include "http_internal.h"
 #include "lib/stringinfo.h"
 #include "postgres.h"
+#include "utils/cloudevents.h"
 #include "utils/json_utils.h"
 #include "utils/logging.h"
 
@@ -110,6 +111,24 @@ struct curl_slist *http_add_webhook_signature(struct curl_slist *curl_headers,
 }
 
 /**
+ * @private
+ * @brief Default Content-Type header line for a request of this endpoint.
+ *
+ * A structured-mode CloudEvent is the body itself, and the CloudEvents HTTP
+ * binding requires the event format's media type for it; with
+ * application/json a receiver treats the request as a binary-mode event whose
+ * data is the whole envelope.
+ *
+ * @param http_dispatcher HTTP dispatcher.
+ * @return Static header line.
+ */
+static const char *http_default_content_type(HttpDispatcher *http_dispatcher) {
+    if (http_dispatcher->cloudevents_mode == CE_MODE_STRUCTURED)
+        return "Content-Type: " CE_STRUCTURED_CONTENT_TYPE;
+    return "Content-Type: " DEFAULT_CONTENT_TYPE;
+}
+
+/**
  * @brief Build curl headers from dispatcher configuration.
  * @param http_dispatcher HTTP dispatcher with header configuration.
  * @return curl_slist that must be freed with curl_slist_free_all().
@@ -118,7 +137,7 @@ struct curl_slist *http_build_headers(HttpDispatcher *http_dispatcher) {
     struct curl_slist *curl_headers = NULL;
 
     /* Set default Content-Type header */
-    curl_headers = curl_slist_append(curl_headers, "Content-Type: " DEFAULT_CONTENT_TYPE);
+    curl_headers = curl_slist_append(curl_headers, http_default_content_type(http_dispatcher));
 
     /* Disable Expect: 100-continue — saves a round-trip on every POST */
     curl_headers = curl_slist_append(curl_headers, "Expect:");
@@ -364,7 +383,7 @@ struct curl_slist *http_build_merged_headers(HttpDispatcher *http_dispatcher,
     struct curl_slist *curl_headers = NULL;
 
     /* Set default Content-Type header */
-    curl_headers = curl_slist_append(curl_headers, "Content-Type: " DEFAULT_CONTENT_TYPE);
+    curl_headers = curl_slist_append(curl_headers, http_default_content_type(http_dispatcher));
 
     /* Disable Expect: 100-continue — saves a round-trip on every POST */
     curl_headers = curl_slist_append(curl_headers, "Expect:");

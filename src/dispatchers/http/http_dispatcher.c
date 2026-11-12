@@ -368,7 +368,7 @@ bool http_dispatcher_validate_config(Jsonb *config) {
         ulak_log("error",
                  "HTTP config contains unknown key '%s'. "
                  "Allowed keys: url, method, headers, timeout, connect_timeout, "
-                 "signing_secret, cloudevents, ce_mode, ce_type, rate_limit, "
+                 "signing_secret, cloudevents, cloudevents_mode, cloudevents_type, rate_limit, "
                  "auth, tls_client_cert, tls_client_key, tls_ca_bundle, "
                  "tls_pinned_public_key, proxy, auto_disable_on_gone",
                  unknown_key ? unknown_key : "unknown");

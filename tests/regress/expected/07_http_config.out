@@ -20,7 +20,7 @@ SELECT ulak.create_endpoint(
     'http',
     '{"url": "https://api.example.com/events", "method": "POST", "timeout": 30, "headers": {"Authorization": "Bearer token123"}, "ssl_verify": true}'::jsonb
 ) IS NOT NULL AS full_created;
-WARNING:  [ulak] ERROR: HTTP config contains unknown key 'ssl_verify'. Allowed keys: url, method, headers, timeout, connect_timeout, signing_secret, cloudevents, ce_mode, ce_type, rate_limit, auth, tls_client_cert, tls_client_key, tls_ca_bundle, tls_pinned_public_key, proxy, auto_disable_on_gone
+WARNING:  [ulak] ERROR: HTTP config contains unknown key 'ssl_verify'. Allowed keys: url, method, headers, timeout, connect_timeout, signing_secret, cloudevents, cloudevents_mode, cloudevents_type, rate_limit, auth, tls_client_cert, tls_client_key, tls_ca_bundle, tls_pinned_public_key, proxy, auto_disable_on_gone
 ERROR:  Invalid configuration for protocol http
 -- Verify configs stored correctly
 SELECT name, protocol, config->>'url' AS url, config->>'method' AS method
