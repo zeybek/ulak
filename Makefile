@@ -170,7 +170,7 @@ sql/$(EXTENSION)--$(EXTVERSION).sql: sql/$(EXTENSION).sql version.txt
 
 # Only clean generated install files, NOT future upgrade scripts (--X.Y.Z--A.B.C.sql)
 # Also clean protocol dispatcher object files (always, regardless of build flags)
-EXTRA_CLEAN = sql/$(EXTENSION)--[0-9].[0-9].[0-9].sql
+EXTRA_CLEAN = $(filter-out $(wildcard sql/$(EXTENSION)--*--*.sql),$(wildcard sql/$(EXTENSION)--*.sql))
 EXTRA_CLEAN += src/dispatchers/http/http_security.o src/dispatchers/http/http_security.bc
 EXTRA_CLEAN += src/dispatchers/http/http_request.o src/dispatchers/http/http_request.bc
 EXTRA_CLEAN += src/dispatchers/http/http_sync.o src/dispatchers/http/http_sync.bc
