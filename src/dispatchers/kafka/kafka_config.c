@@ -10,6 +10,7 @@
 #include "config/guc.h"
 #include "kafka_internal.h"
 #include "postgres.h"
+#include "utils/builtins.h"
 #include "utils/json_utils.h"
 #include "utils/logging.h"
 
@@ -27,13 +28,14 @@ static bool kafka_is_sensitive_key(const char *key) {
                                                "credential", "token",  NULL};
     const char **pattern;
     char key_lower[256];
-    size_t i;
+    char *p;
 
-    /* Convert to lowercase for case-insensitive matching */
-    for (i = 0; i < sizeof(key_lower) - 1 && key[i]; i++) {
-        key_lower[i] = (key[i] >= 'A' && key[i] <= 'Z') ? key[i] + 32 : key[i];
+    /* Lowercase a bounded copy for case-insensitive matching (ASCII only,
+     * no locale lookup) */
+    strlcpy(key_lower, key, sizeof(key_lower));
+    for (p = key_lower; *p; p++) {
+        *p = pg_ascii_tolower((unsigned char)*p);
     }
-    key_lower[i] = '\0';
 
     for (pattern = sensitive_patterns; *pattern != NULL; pattern++) {
         if (strstr(key_lower, *pattern) != NULL) {
@@ -44,65 +46,31 @@ static bool kafka_is_sensitive_key(const char *key) {
 }
 
 /**
- * @brief Validate SASL/SSL configuration consistency.
- *
- * Checks that when SASL is configured, required fields are present.
- *
- * @param config JSONB configuration to validate
- * @return true if SASL/SSL configuration is consistent
+ * @private
+ * @brief Set one librdkafka property, logging a rejected value.
+ * @param conf librdkafka configuration object
+ * @param key Property name
+ * @param value Property value
+ * @return true if librdkafka accepted it
  */
-bool kafka_validate_sasl_ssl_config(Jsonb *config) {
-    JsonbValue options_val;
-    JsonbContainer *container;
-    JsonbIterator *it;
-    JsonbValue key_jv, val_jv;
-    JsonbIteratorToken token;
-    bool has_sasl_mechanism = false;
-    bool has_sasl_username = false;
-    bool has_sasl_password = false;
-    bool has_security_protocol = false;
+static bool kafka_conf_set_logged(rd_kafka_conf_t *conf, const char *key, const char *value) {
+    char errstr[512];
 
-    if (!config || !extract_jsonb_value(config, CONFIG_KEY_OPTIONS, &options_val) ||
-        options_val.type != jbvBinary) {
-        return true; /* No options = no SASL config to validate */
-    }
+    if (rd_kafka_conf_set(conf, key, value, errstr, sizeof(errstr)) == RD_KAFKA_CONF_OK)
+        return true;
+    ulak_log("warning", "Failed to set Kafka option %s=%s: %s", key,
+             kafka_is_sensitive_key(key) ? "***" : value, errstr);
+    return false;
+}
 
-    container = options_val.val.binary.data;
-    it = JsonbIteratorInit(container);
-
-    while ((token = JsonbIteratorNext(&it, &key_jv, false)) != WJB_DONE) {
-        if (token == WJB_KEY && key_jv.type == jbvString) {
-            char *key = pnstrdup(key_jv.val.string.val, key_jv.val.string.len);
-
-            if (strcmp(key, "sasl.mechanism") == 0 || strcmp(key, "sasl.mechanisms") == 0)
-                has_sasl_mechanism = true;
-            else if (strcmp(key, "sasl.username") == 0)
-                has_sasl_username = true;
-            else if (strcmp(key, "sasl.password") == 0)
-                has_sasl_password = true;
-            else if (strcmp(key, "security.protocol") == 0)
-                has_security_protocol = true;
-
-            pfree(key);
-
-            /* Consume the value token */
-            token = JsonbIteratorNext(&it, &val_jv, false);
-        }
-    }
-
-    /* If SASL mechanism is set, require username and password for PLAIN/SCRAM */
-    if (has_sasl_mechanism && (!has_sasl_username || !has_sasl_password)) {
-        ulak_log("warning", "Kafka SASL mechanism configured but missing username or password");
-        return false;
-    }
-
-    /* If SASL is configured, security.protocol should be set */
-    if (has_sasl_mechanism && !has_security_protocol) {
-        ulak_log("warning", "Kafka SASL configured but security.protocol not set "
-                            "(should be SASL_PLAINTEXT or SASL_SSL)");
-    }
-
-    return true;
+/**
+ * @private
+ * @brief Whether an acks value is the one the idempotent producer requires.
+ * @param acks acks value
+ * @return true for "all" and "-1"
+ */
+static bool kafka_acks_is_all(const char *acks) {
+    return strcmp(acks, "all") == 0 || strcmp(acks, "-1") == 0;
 }
 
 /**
@@ -116,61 +84,100 @@ bool kafka_validate_sasl_ssl_config(Jsonb *config) {
  */
 void kafka_parse_options(rd_kafka_conf_t *conf, Jsonb *config) {
     JsonbValue options_val;
-    char errstr[512];
     const char *acks;
     const char *compression;
+    char *option_acks = NULL;
+    bool option_idempotence = false;
+    char timeout_str[16];
     JsonbContainer *container;
     JsonbIterator *it;
     JsonbValue key_jv, val_jv;
     JsonbIteratorToken token;
 
     /* Set default configuration from GUC values (or compile-time fallbacks) */
-    acks = ulak_kafka_acks ? ulak_kafka_acks : "all";
+    acks = ulak_kafka_acks && ulak_kafka_acks[0] ? ulak_kafka_acks : "all";
     compression = ulak_kafka_compression ? ulak_kafka_compression : "snappy";
 
-    rd_kafka_conf_set(conf, "acks", acks, errstr, sizeof(errstr));
-    rd_kafka_conf_set(conf, "retries", DEFAULT_RETRIES, errstr, sizeof(errstr));
-    rd_kafka_conf_set(conf, "batch.size", DEFAULT_BATCH_SIZE, errstr, sizeof(errstr));
-    rd_kafka_conf_set(conf, "linger.ms", DEFAULT_LINGER_MS, errstr, sizeof(errstr));
-    rd_kafka_conf_set(conf, "compression.type", compression, errstr, sizeof(errstr));
-    rd_kafka_conf_set(conf, "enable.idempotence", "true", errstr, sizeof(errstr));
+    /* librdkafka keeps an undelivered message for message.timeout.ms (300 s by
+     * default) and may still send it after ulak has given up waiting and
+     * scheduled a retry; give up at the same time instead */
+    snprintf(timeout_str, sizeof(timeout_str), "%d",
+             ulak_kafka_delivery_timeout > 0 ? ulak_kafka_delivery_timeout : 30000);
+
+    kafka_conf_set_logged(conf, "acks", acks);
+    kafka_conf_set_logged(conf, "retries", DEFAULT_RETRIES);
+    kafka_conf_set_logged(conf, "batch.size", DEFAULT_BATCH_SIZE);
+    kafka_conf_set_logged(conf, "linger.ms", DEFAULT_LINGER_MS);
+    kafka_conf_set_logged(conf, "compression.type", compression);
+    kafka_conf_set_logged(conf, "message.timeout.ms", timeout_str);
+    kafka_conf_set_logged(conf, "enable.idempotence", "true");
 
     /* Check if options exist in config */
-    if (!config || !extract_jsonb_value(config, CONFIG_KEY_OPTIONS, &options_val)) {
-        return;
-    }
+    if (config && extract_jsonb_value(config, CONFIG_KEY_OPTIONS, &options_val) &&
+        options_val.type == jbvBinary) {
+        /* Parse options from JSONB object */
+        container = options_val.val.binary.data;
+        it = JsonbIteratorInit(container);
 
-    if (options_val.type != jbvBinary) {
-        return;
-    }
+        while ((token = JsonbIteratorNext(&it, &key_jv, false)) != WJB_DONE) {
+            if (token == WJB_KEY && key_jv.type == jbvString) {
+                /* Extract key using dynamic allocation */
+                char *key_str = pnstrdup(key_jv.val.string.val, key_jv.val.string.len);
+                char *val_str = NULL;
 
-    /* Parse options from JSONB object */
-    container = options_val.val.binary.data;
-    it = JsonbIteratorInit(container);
+                /* Get the value (next token should be WJB_VALUE). librdkafka takes
+                 * every property as a string; accept JSON numbers and booleans
+                 * too ("linger.ms": 10) instead of dropping them. */
+                token = JsonbIteratorNext(&it, &val_jv, false);
+                if (token == WJB_VALUE && val_jv.type == jbvString)
+                    val_str = pnstrdup(val_jv.val.string.val, val_jv.val.string.len);
+                else if (token == WJB_VALUE && val_jv.type == jbvNumeric)
+                    val_str = DatumGetCString(
+                        DirectFunctionCall1(numeric_out, NumericGetDatum(val_jv.val.numeric)));
+                else if (token == WJB_VALUE && val_jv.type == jbvBool)
+                    val_str = pstrdup(val_jv.val.boolean ? "true" : "false");
+                else
+                    ulak_log("warning",
+                             "Ignoring Kafka option %s: value must be a string, "
+                             "number or boolean",
+                             key_str);
 
-    while ((token = JsonbIteratorNext(&it, &key_jv, false)) != WJB_DONE) {
-        if (token == WJB_KEY && key_jv.type == jbvString) {
-            /* Extract key using dynamic allocation */
-            char *key_str = pnstrdup(key_jv.val.string.val, key_jv.val.string.len);
+                if (val_str) {
+                    if (kafka_conf_set_logged(conf, key_str, val_str)) {
+                        if (strcmp(key_str, "acks") == 0 ||
+                            strcmp(key_str, "request.required.acks") == 0) {
+                            if (option_acks)
+                                pfree(option_acks);
+                            option_acks = pstrdup(val_str);
+                        } else if (strcmp(key_str, "enable.idempotence") == 0) {
+                            option_idempotence = true;
+                        }
+                    }
 
-            /* Get the value (next token should be WJB_VALUE) */
-            token = JsonbIteratorNext(&it, &val_jv, false);
-            if (token == WJB_VALUE && val_jv.type == jbvString) {
-                char *val_str = pnstrdup(val_jv.val.string.val, val_jv.val.string.len);
-
-                if (rd_kafka_conf_set(conf, key_str, val_str, errstr, sizeof(errstr)) !=
-                    RD_KAFKA_CONF_OK) {
-                    ulak_log("warning", "Failed to set Kafka option %s=%s: %s", key_str,
-                             kafka_is_sensitive_key(key_str) ? "***" : val_str, errstr);
+                    /* Zero sensitive values before freeing */
+                    if (kafka_is_sensitive_key(key_str)) {
+                        explicit_bzero(val_str, strlen(val_str));
+                    }
+                    pfree(val_str);
                 }
-
-                /* Zero sensitive values before freeing */
-                if (kafka_is_sensitive_key(key_str)) {
-                    explicit_bzero(val_str, strlen(val_str));
-                }
-                pfree(val_str);
+                pfree(key_str);
             }
-            pfree(key_str);
         }
     }
+
+    /*
+     * The idempotent producer requires acks=all; with "0" or "1" (from
+     * ulak.kafka_acks or the endpoint options) rd_kafka_new() would refuse the
+     * configuration and the endpoint could never deliver. A lower acks level is
+     * an explicit trade of durability for latency, so turn idempotence off for
+     * it, unless the endpoint asked for idempotence itself: then the conflict
+     * is left for rd_kafka_new() to report.
+     */
+    if (!kafka_acks_is_all(option_acks ? option_acks : acks) && !option_idempotence) {
+        ulak_log("debug", "Kafka acks=%s: idempotent producer disabled",
+                 option_acks ? option_acks : acks);
+        kafka_conf_set_logged(conf, "enable.idempotence", "false");
+    }
+    if (option_acks)
+        pfree(option_acks);
 }

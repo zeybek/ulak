@@ -56,7 +56,7 @@ static DispatcherOperations kafka_dispatcher_ops = {
  * @return true if configuration is valid, false otherwise
  */
 bool kafka_dispatcher_validate_config(Jsonb *config) {
-    JsonbValue broker_val, topic_val;
+    JsonbValue broker_val, topic_val, partition_val;
     char *unknown_key = NULL;
 
     if (!config) {
@@ -67,12 +67,25 @@ bool kafka_dispatcher_validate_config(Jsonb *config) {
     if (!jsonb_validate_keys(config, KAFKA_ALLOWED_CONFIG_KEYS, &unknown_key)) {
         ulak_log("error",
                  "Kafka config contains unknown key '%s'. "
-                 "Allowed keys: broker, topic, options, key, partition",
+                 "Allowed keys: broker, topic, options, key, partition, headers",
                  unknown_key ? unknown_key : "unknown");
         if (unknown_key) {
             pfree(unknown_key);
         }
         return false;
+    }
+
+    /* partition: -1 (RD_KAFKA_PARTITION_UA, let the partitioner choose) or a
+     * partition number; the worker would otherwise fail building the dispatcher */
+    if (extract_jsonb_value(config, CONFIG_KEY_PARTITION, &partition_val)) {
+        int32 partition;
+
+        if (partition_val.type != jbvNumeric ||
+            !jsonb_numeric_to_int32(partition_val.val.numeric, &partition) || partition < -1) {
+            ulak_log("error", "Kafka config 'partition' must be an integer between -1 and %d",
+                     PG_INT32_MAX);
+            return false;
+        }
     }
 
     /* Kafka requires broker and topic - use stack allocation */
@@ -156,8 +169,7 @@ Dispatcher *kafka_dispatcher_create(Jsonb *config) {
     /* Get partition (optional) - parse numeric value */
     if (extract_jsonb_value(config, CONFIG_KEY_PARTITION, &partition_val)) {
         if (partition_val.type == jbvNumeric) {
-            kafka_dispatcher->partition = DatumGetInt32(
-                DirectFunctionCall1(numeric_int4, NumericGetDatum(partition_val.val.numeric)));
+            (void)jsonb_numeric_to_int32(partition_val.val.numeric, &kafka_dispatcher->partition);
         }
     }
 

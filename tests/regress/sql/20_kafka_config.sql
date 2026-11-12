@@ -89,6 +89,32 @@ SELECT ulak.validate_endpoint_config(
     '{"broker": "localhost:9092", "topic": "test", "unknown_key": "value"}'::jsonb
 ) AS unknown_key;
 
+-- partition must be -1 (partitioner chooses) or a partition number within int4
+SELECT ulak.validate_endpoint_config(
+    'kafka',
+    '{"broker": "localhost:9092", "topic": "test", "partition": 3000000000}'::jsonb
+) AS partition_out_of_range;
+
+SELECT ulak.validate_endpoint_config(
+    'kafka',
+    '{"broker": "localhost:9092", "topic": "test", "partition": -2}'::jsonb
+) AS partition_below_unassigned;
+
+SELECT ulak.validate_endpoint_config(
+    'kafka',
+    '{"broker": "localhost:9092", "topic": "test", "partition": 1.5}'::jsonb
+) AS partition_fraction;
+
+SELECT ulak.validate_endpoint_config(
+    'kafka',
+    '{"broker": "localhost:9092", "topic": "test", "partition": "3"}'::jsonb
+) AS partition_string;
+
+SELECT ulak.validate_endpoint_config(
+    'kafka',
+    '{"broker": "localhost:9092", "topic": "test", "partition": -1}'::jsonb
+) AS partition_unassigned_valid;
+
 -- ============================================================================
 -- KAFKA ENDPOINT CRUD OPERATIONS
 -- ============================================================================

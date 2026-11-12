@@ -289,6 +289,10 @@ header "TEST 8: Error Classification"
 psql_quiet "DELETE FROM ulak.queue;"
 psql_quiet "DELETE FROM ulak.dlq;"
 
+psql_quiet "ALTER SYSTEM SET ulak.capture_response = off;"
+psql_quiet "SELECT pg_reload_conf();"
+sleep 1
+
 # Create endpoint pointing to non-existent broker — will timeout (retryable)
 create_endpoint "kt-err" "{\"broker\": \"nonexistent:9092\", \"topic\": \"kt-err\"}" "kafka"
 
@@ -310,6 +314,118 @@ echo "  last_error: $(psql_exec "SELECT left(last_error, 120) FROM ulak.queue WH
 
 assert_eq "Failed message still pending (retryable)" "pending" "$STATUS"
 assert_contains "Error has RETRYABLE prefix" "RETRYABLE" "$ERROR"
+
+# ═══════════════════════════════════════════════════
+# TEST 8b: Error prefix on the synchronous path
+# ═══════════════════════════════════════════════════
+header "TEST 8b: Error Prefix (capture_response)"
+
+# The worker reads [PERMANENT]/[RETRYABLE] only at the start of last_error.
+# A prefix anywhere else is not seen, and a permanent failure would be retried.
+psql_quiet "DELETE FROM ulak.queue;"
+psql_quiet "ALTER SYSTEM SET ulak.capture_response = on;"
+psql_quiet "ALTER SYSTEM SET ulak.kafka_delivery_timeout = 5000;"
+psql_quiet "SELECT pg_reload_conf();"
+sleep 2
+# message.timeout.ms below the 5 s wait: librdkafka's own failure report
+# arrives first, which is the path under test
+create_endpoint "kt-err-sync" "{\"broker\": \"nonexistent:9092\", \"topic\": \"kt-err\", \"options\": {\"message.timeout.ms\": \"2000\"}}" "kafka"
+send_msg "kt-err-sync" "{\"should_fail\": true}"
+SYNC_ERR=""
+for _ in $(seq 1 30); do
+  SYNC_ERR=$(psql_exec "SELECT last_error FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'kt-err-sync') AND retry_count >= 1;")
+  [ -n "$SYNC_ERR" ] && break
+  sleep 1
+done
+echo "  last_error: ${SYNC_ERR:0:120}"
+assert_eq "Sync path: classification prefix at the start" "[RETRYABLE]" "${SYNC_ERR:0:11}"
+assert_contains "Sync path: the failure came from the delivery report" "delivery failed" "$SYNC_ERR"
+psql_quiet "SELECT ulak.disable_endpoint('kt-err-sync');"
+psql_quiet "ALTER SYSTEM RESET ulak.capture_response;"
+psql_quiet "ALTER SYSTEM RESET ulak.kafka_delivery_timeout;"
+psql_quiet "SELECT pg_reload_conf();"
+
+# ═══════════════════════════════════════════════════
+# TEST 9: acks=1 and non-string options
+# ═══════════════════════════════════════════════════
+header "TEST 9: acks=1 + Numeric Option Values"
+
+# enable.idempotence is on by default and librdkafka refuses it with acks=1,
+# so acks below "all" turns idempotence off. Options given as JSON numbers
+# ("linger.ms": 10) reach librdkafka too.
+psql_quiet "DELETE FROM ulak.queue;"
+kafka_create_topic "kt-acks1"
+create_endpoint "kt-acks1" "{\"broker\": \"${KAFKA_BROKER}\", \"topic\": \"kt-acks1\", \"options\": {\"acks\": \"1\", \"linger.ms\": 10}}" "kafka"
+ACKS1_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+send_msg "kt-acks1" "{\"test\": \"acks1\"}"
+wait_queue_drain 20
+
+COMPLETED=$(psql_exec "SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE q.status = 'completed' AND e.name = 'kt-acks1';")
+assert_eq "acks=1 endpoint delivers" "1" "$COMPLETED"
+assert_eq "acks=1 message in Kafka" "1" "$(kcat_count kt-acks1)"
+IGNORED=$(docker logs --since "$ACKS1_SINCE" ulak-postgres-1 2>&1 | grep -c "Ignoring Kafka option\|Failed to set Kafka option" || true)
+assert_eq "No option dropped or rejected" "0" "$IGNORED"
+
+# ═══════════════════════════════════════════════════
+# TEST 10: Late delivery report during synchronous dispatch
+# ═══════════════════════════════════════════════════
+header "TEST 10: Late Delivery Report (capture_response)"
+
+# With capture_response on, each message is produced and waited for alone,
+# with its own opaque, so the late report of a message that timed out cannot
+# complete the next one: every captured offset must be the offset of that
+# row's own payload.
+psql_quiet "DELETE FROM ulak.queue;"
+psql_quiet "ALTER SYSTEM SET ulak.capture_response = on;"
+psql_quiet "ALTER SYSTEM SET ulak.kafka_delivery_timeout = 5000;"
+psql_quiet "SELECT pg_reload_conf();"
+sleep 2
+kafka_create_topic "kt-late" 1
+create_endpoint "kt-late" "{\"broker\": \"${KAFKA_BROKER}\", \"topic\": \"kt-late\"}" "kafka"
+send_msg "kt-late" "{\"m\": \"warm\"}"
+wait_queue_drain 20
+
+docker pause ulak-kafka-1 > /dev/null
+send_msg "kt-late" "{\"m\": \"A\"}"
+A_RETRIED="f"
+for _ in $(seq 1 40); do
+  A_RETRIED=$(psql_exec "SELECT (retry_count >= 1) FROM ulak.queue WHERE payload->>'m' = 'A';")
+  [ "$A_RETRIED" = "t" ] && break
+  sleep 0.5
+done
+docker unpause ulak-kafka-1 > /dev/null
+assert_eq "Message produced while the broker is frozen times out as retryable" "t" "$A_RETRIED"
+
+send_msg "kt-late" "{\"m\": \"B\"}"
+psql_quiet "UPDATE ulak.queue SET next_retry_at = now() WHERE payload->>'m' = 'A';"
+DONE=0
+for _ in $(seq 1 60); do
+  DONE=$(psql_exec "SELECT count(*) FROM ulak.queue WHERE payload->>'m' IN ('A', 'B') AND status = 'completed';")
+  [ "$DONE" = "2" ] && break
+  sleep 1
+done
+assert_eq "A (after retry) and B completed" "2" "$DONE"
+sleep 2
+
+ROWS=$(psql_exec "SELECT payload->>'m' || '=' || coalesce(response->>'kafka_offset', 'none') FROM ulak.queue WHERE payload->>'m' IN ('warm', 'A', 'B') ORDER BY id;")
+MISMATCH=$(kcat_consume "kt-late" 8 | ROWS="$ROWS" python3 -c '
+import json, os, sys
+offsets = {}
+for line in sys.stdin:
+    try:
+        rec = json.loads(line)
+        offsets.setdefault(json.loads(rec["payload"])["m"], set()).add(str(rec["offset"]))
+    except Exception:
+        pass
+bad = [row for row in os.environ["ROWS"].split()
+       if row.split("=")[1] not in offsets.get(row.split("=")[0], set())]
+print(",".join(bad) if bad else "none")
+')
+assert_eq "Every captured kafka_offset belongs to that row's own message" "none" "$MISMATCH"
+
+psql_quiet "ALTER SYSTEM RESET ulak.capture_response;"
+psql_quiet "ALTER SYSTEM RESET ulak.kafka_delivery_timeout;"
+psql_quiet "SELECT pg_reload_conf();"
 
 # ═══════════════════════════════════════════════════
 # CLEANUP

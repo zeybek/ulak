@@ -30,7 +30,7 @@ extern const char *KAFKA_ALLOWED_CONFIG_KEYS[];
 /* ── Defaults ── */
 
 #define DEFAULT_RETRIES "3"        /**< Default librdkafka message.send.max.retries. */
-#define DEFAULT_BATCH_SIZE "16384" /**< Default librdkafka batch.num.messages. */
+#define DEFAULT_BATCH_SIZE "16384" /**< Default librdkafka batch.size (bytes per batch). */
 #define DEFAULT_LINGER_MS "5"      /**< Default librdkafka linger.ms. */
 
 /* ── Configuration Functions (kafka_config.c) ── */
@@ -39,19 +39,14 @@ extern const char *KAFKA_ALLOWED_CONFIG_KEYS[];
  * @brief Parse Kafka options from JSONB configuration.
  *
  * Sets librdkafka configuration options from the "options" field.
- * Also applies GUC-based defaults for acks and compression.
+ * Also applies GUC-based defaults for acks, compression and
+ * message.timeout.ms (= ulak.kafka_delivery_timeout); an acks level below
+ * "all" turns the idempotent producer off unless the options enable it.
  *
  * @param conf   librdkafka configuration to populate.
  * @param config JSONB endpoint configuration containing "options".
  */
 void kafka_parse_options(rd_kafka_conf_t *conf, Jsonb *config);
-
-/**
- * @brief Validate SASL/SSL configuration fields.
- * @param config JSONB endpoint configuration.
- * @return true if SASL/SSL configuration is valid.
- */
-bool kafka_validate_sasl_ssl_config(Jsonb *config);
 
 /* ── Callback Functions (kafka_callback.c) ── */
 
