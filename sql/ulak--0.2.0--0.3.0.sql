@@ -5,6 +5,9 @@
 -- ulak._limit_setting(). enable_fast_mode() documents its loss window.
 -- Function bodies are copied verbatim from sql/ulak.sql.
 
+-- complain if script is sourced in psql, rather than via ALTER EXTENSION
+\echo Use "ALTER EXTENSION ulak UPDATE TO '0.3.0'" to load this file. \quit
+
 CREATE OR REPLACE FUNCTION ulak._limit_setting(
     p_name text
 ) RETURNS bigint

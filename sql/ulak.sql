@@ -2,6 +2,9 @@
 -- Native transactional outbox with multi-protocol async dispatch
 -- (version comes from version.txt / ulak.control; see sql/ulak--X--Y.sql for upgrades)
 
+-- complain if script is sourced in psql, rather than via CREATE EXTENSION
+\echo Use "CREATE EXTENSION ulak" to load this file. \quit
+
 -- ============================================================================
 -- SCHEMA NOTE
 -- ============================================================================

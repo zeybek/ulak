@@ -4,6 +4,9 @@
 -- send_with_options(), send_batch*(), publish*() through it.
 -- Function bodies are copied verbatim from sql/ulak.sql.
 
+-- complain if script is sourced in psql, rather than via ALTER EXTENSION
+\echo Use "ALTER EXTENSION ulak UPDATE TO '0.2.0'" to load this file. \quit
+
 CREATE OR REPLACE FUNCTION ulak._wake_workers(
     p_id bigint,
     p_ordering_key text
