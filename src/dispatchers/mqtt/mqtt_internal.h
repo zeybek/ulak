@@ -100,4 +100,18 @@ void mqtt_cleanup_strings(MqttDispatcher *mqtt_dispatcher);
  */
 const char *mqtt_classify_error(int rc);
 
+/**
+ * @brief Classify an error returned by mosquitto_loop().
+ *
+ * A loop error means the connection broke. MOSQ_ERR_CONN_REFUSED is permanent
+ * only when the CONNACK rejected the client (credentials, authorization,
+ * protocol version, client id); "server unavailable" and similar refusals,
+ * and TLS failures, are retryable.
+ *
+ * @param mqtt MQTT dispatcher (for the last CONNACK code).
+ * @param rc   mosquitto error code from mosquitto_loop().
+ * @return ERROR_PREFIX_RETRYABLE or ERROR_PREFIX_PERMANENT.
+ */
+const char *mqtt_classify_loop_error(MqttDispatcher *mqtt, int rc);
+
 #endif /* ULAK_DISPATCHERS_MQTT_INTERNAL_H */

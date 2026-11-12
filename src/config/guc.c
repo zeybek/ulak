@@ -74,7 +74,7 @@ char *ulak_kafka_compression = NULL;
 #ifdef ENABLE_MQTT
 int ulak_mqtt_keepalive = 60;
 int ulak_mqtt_timeout = 5000;
-int ulak_mqtt_default_qos = 0;
+int ulak_mqtt_default_qos = 1;
 int ulak_mqtt_default_port = 1883;
 #endif /* ENABLE_MQTT */
 
@@ -347,7 +347,7 @@ void config_init_guc_variables(void) {
                             NULL, NULL, NULL);
 
     DefineCustomIntVariable("ulak.mqtt_default_qos", "Default MQTT QoS",
-                            "Default QoS level (0, 1, or 2)", &ulak_mqtt_default_qos, 0, 0, 2,
+                            "Default QoS level (0, 1, or 2)", &ulak_mqtt_default_qos, 1, 0, 2,
                             PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
     DefineCustomIntVariable("ulak.mqtt_default_port", "Default MQTT port",

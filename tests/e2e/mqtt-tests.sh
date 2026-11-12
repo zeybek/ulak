@@ -253,6 +253,118 @@ RETAINED=$(docker exec ulak-postgres-1 timeout 5 mosquitto_sub -h "$MQTT_BROKER"
 assert_contains "Retained message received" "retained" "$RETAINED"
 
 # ═══════════════════════════════════════════════════
+# TEST 8: Connect to an unreachable broker is bounded
+# ═══════════════════════════════════════════════════
+header "TEST 8: Connect Bounded by ulak.mqtt_timeout"
+
+# A blocking mosquitto_connect() waits for the kernel's TCP connect timeout
+# (minutes) against a blackholed address; the connect runs in
+# mosquitto_loop() under ulak.mqtt_timeout (5 s by default).
+psql_quiet "DELETE FROM ulak.queue;"
+create_endpoint "mt-blackhole" "{\"broker\": \"192.0.2.1\", \"port\": ${MQTT_PORT}, \"topic\": \"mt/blackhole\", \"qos\": 1}" "mqtt"
+send_msg "mt-blackhole" "{\"blackhole\": true}"
+BH_ERR=""
+for _ in $(seq 1 25); do
+  BH_ERR=$(psql_exec "SELECT last_error FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'mt-blackhole') AND retry_count >= 1;")
+  [ -n "$BH_ERR" ] && break
+  sleep 1
+done
+assert_contains "Unreachable broker: attempt ends within 25 s" "timed out after" "$BH_ERR"
+assert_contains "Unreachable broker: retryable" "RETRYABLE" "$BH_ERR"
+psql_quiet "SELECT ulak.disable_endpoint('mt-blackhole');"
+
+# ═══════════════════════════════════════════════════
+# TEST 9: Configured client_id with several workers
+# ═══════════════════════════════════════════════════
+header "TEST 9: client_id Per Worker"
+
+# With one shared client_id, each connect would make the broker close another
+# worker's connection (session takeover). With ulak.workers > 1 each worker
+# connects as <client_id>_<worker number>.
+MQTT_WORKERS=$(psql_exec "SELECT current_setting('ulak.workers');")
+if [ "$MQTT_WORKERS" -gt 1 ] 2>/dev/null; then
+  psql_quiet "DELETE FROM ulak.queue;"
+  CID_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  create_endpoint "mt-cid" "{\"broker\": \"${MQTT_BROKER}\", \"port\": ${MQTT_PORT}, \"topic\": \"mt/cid\", \"qos\": 1, \"client_id\": \"mt-fixed\"}" "mqtt"
+  CID_ROWS=$((MQTT_WORKERS * 10))
+  psql_quiet "SELECT ulak.send_batch('mt-cid', ARRAY(SELECT jsonb_build_object('i', g) FROM generate_series(1, ${CID_ROWS}) g));"
+  wait_queue_drain 30
+  CID_OK=$(psql_exec "SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'mt-cid' AND q.status = 'completed' AND q.retry_count = 0;")
+  assert_eq "All ${CID_ROWS} rows delivered on the first attempt" "$CID_ROWS" "$CID_OK"
+  CID_TAKEOVER=$(docker logs --since "$CID_SINCE" ulak-mosquitto-1 2>&1 | grep -c "already connected, closing old connection" || true)
+  assert_eq "No session takeover in the broker log" "0" "$CID_TAKEOVER"
+  CID_IDS=$(docker logs --since "$CID_SINCE" ulak-mosquitto-1 2>&1 | grep -o "as mt-fixed_[0-9]*" | sort -u | wc -l | tr -d ' ')
+  assert_gt "Workers connected under distinct ids (mt-fixed_N)" "0" "$CID_IDS"
+else
+  echo -e "  ${YELLOW}⊘${NC} skipped: ulak.workers = ${MQTT_WORKERS}, needs more than 1"
+  SKIP=$((SKIP + 1))
+fi
+
+# ═══════════════════════════════════════════════════
+# TEST 10: Default QoS is 1 (at-least-once)
+# ═══════════════════════════════════════════════════
+header "TEST 10: Default QoS"
+
+# QoS 0 marks the row delivered once the PUBLISH is written, with no broker
+# acknowledgment, so ulak.mqtt_default_qos is 1. A QoS 2 subscriber prints
+# the QoS the message was published with (%q).
+psql_quiet "DELETE FROM ulak.queue;"
+create_endpoint "mt-default-qos" "{\"broker\": \"${MQTT_BROKER}\", \"port\": ${MQTT_PORT}, \"topic\": \"mt/default-qos\"}" "mqtt"
+docker exec ulak-postgres-1 timeout 15 mosquitto_sub -h "$MQTT_BROKER" -p "$MQTT_PORT" -t "mt/default-qos" -q 2 -F '%q' -C 1 -W 15 > /tmp/mqtt-sub-10.txt 2>/dev/null &
+SUB_PID=$!
+sleep 1
+send_msg "mt-default-qos" "{\"test\": \"default-qos\"}"
+wait_queue_drain 15
+wait $SUB_PID 2>/dev/null || true
+assert_eq "Endpoint without qos publishes at QoS 1" "1" "$(tr -d '[:space:]' < /tmp/mqtt-sub-10.txt)"
+rm -f /tmp/mqtt-sub-10.txt
+
+# ═══════════════════════════════════════════════════
+# TEST 11: CONNACK refusals (server unavailable vs not authorized)
+# ═══════════════════════════════════════════════════
+header "TEST 11: CONNACK Refusal Classification"
+
+# Every refused CONNACK surfaces from mosquitto_loop() as MOSQ_ERR_CONN_REFUSED.
+# "Server unavailable" (return code 3) stays retryable; only refusals that will
+# not clear by themselves (bad credentials, not authorized, ...) are permanent.
+# A fake broker on the Docker host answers every CONNECT with one code.
+psql_quiet "DELETE FROM ulak.queue;"
+psql_quiet "DELETE FROM ulak.dlq;"
+FAKE_MQTT="$SCRIPT_DIR/fixtures/fake-mqtt-broker.py"
+python3 "$FAKE_MQTT" 1885 3 > /dev/null 2>&1 &
+FAKE3_PID=$!
+python3 "$FAKE_MQTT" 1886 5 > /dev/null 2>&1 &
+FAKE5_PID=$!
+sleep 1
+
+create_endpoint "mt-connack3" "{\"broker\": \"${WEBHOOK_HOST}\", \"port\": 1885, \"topic\": \"mt/connack\", \"qos\": 1}" "mqtt"
+create_endpoint "mt-connack5" "{\"broker\": \"${WEBHOOK_HOST}\", \"port\": 1886, \"topic\": \"mt/connack\", \"qos\": 1}" "mqtt"
+send_msg "mt-connack3" "{\"connack\": 3}"
+send_msg "mt-connack5" "{\"connack\": 5}"
+
+C3_ERR=""
+for _ in $(seq 1 20); do
+  C3_ERR=$(psql_exec "SELECT last_error FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'mt-connack3') AND retry_count >= 1;")
+  [ -n "$C3_ERR" ] && break
+  sleep 1
+done
+C5_ERR=""
+for _ in $(seq 1 20); do
+  C5_ERR=$(psql_exec "SELECT d.last_error FROM ulak.dlq d WHERE d.endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'mt-connack5');")
+  [ -n "$C5_ERR" ] && break
+  sleep 1
+done
+echo "  rc 3: ${C3_ERR}"
+echo "  rc 5: ${C5_ERR}"
+assert_eq "CONNACK 3 (server unavailable): [RETRYABLE]" "[RETRYABLE]" "${C3_ERR:0:11}"
+assert_eq "CONNACK 3: row kept for retry" "pending" "$(psql_exec "SELECT status FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'mt-connack3');")"
+assert_eq "CONNACK 3: nothing in the DLQ" "0" "$(psql_exec "SELECT count(*) FROM ulak.dlq WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'mt-connack3');")"
+assert_eq "CONNACK 5 (not authorized): [PERMANENT], dead-lettered" "[PERMANENT]" "${C5_ERR:0:11}"
+psql_quiet "SELECT ulak.disable_endpoint('mt-connack3');"
+psql_quiet "SELECT ulak.disable_endpoint('mt-connack5');"
+kill "$FAKE3_PID" "$FAKE5_PID" 2>/dev/null || true
+
+# ═══════════════════════════════════════════════════
 # CLEANUP
 # ═══════════════════════════════════════════════════
 

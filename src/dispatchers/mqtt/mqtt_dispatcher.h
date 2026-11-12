@@ -54,6 +54,8 @@ typedef struct MqttDispatcher {
     struct mosquitto *client; /**< Mosquitto client instance. */
     bool connected;           /**< Connection state for pooling. */
     time_t last_activity;     /**< Timestamp of last successful operation. */
+    bool connack_received;    /**< Set by the connect callback (CONNACK seen). */
+    int connack_rc;           /**< CONNACK return/reason code of the last connect. */
     /** @} */
 
     /** @name TLS configuration */

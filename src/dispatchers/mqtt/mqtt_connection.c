@@ -140,10 +140,16 @@ void mqtt_message_callback(struct mosquitto *mosq, void *obj,
  * Called when connection state changes.
  *
  * @param mosq Mosquitto client instance (unused)
- * @param obj User data pointer (unused)
+ * @param obj MQTT dispatcher (mosquitto_new user data)
  * @param result Connection result code (0 = success)
  */
 void mqtt_connect_callback(struct mosquitto *mosq, void *obj, int result) {
+    MqttDispatcher *mqtt = (MqttDispatcher *)obj;
+
+    if (mqtt) {
+        mqtt->connack_received = true;
+        mqtt->connack_rc = result;
+    }
     if (result == 0) {
         ulak_log("debug", "MQTT connected successfully");
     } else {
@@ -185,13 +191,20 @@ bool mqtt_ensure_connected(MqttDispatcher *mqtt, char **error_msg) {
 
     /* Connect or reconnect */
     keepalive = ulak_mqtt_keepalive > 0 ? ulak_mqtt_keepalive : 60;
+    mqtt->connack_received = false;
+    mqtt->connack_rc = 0;
 
+    /* The blocking mosquitto_connect() has no timeout of its own: against an
+     * unreachable broker it waits for the kernel's TCP connect timeout (minutes).
+     * The async variants start a non-blocking connect that mosquitto_loop()
+     * completes (TCP, TLS handshake, CONNACK), bounded below by
+     * ulak.mqtt_timeout. The host name lookup itself is still synchronous. */
     if (mqtt->last_activity > 0) {
         /* Previously connected - use reconnect to reuse existing session state */
-        rc = mosquitto_reconnect(mqtt->client);
+        rc = mosquitto_reconnect_async(mqtt->client);
     } else {
         /* First connection */
-        rc = mosquitto_connect(mqtt->client, mqtt->broker, mqtt->port, keepalive);
+        rc = mosquitto_connect_async(mqtt->client, mqtt->broker, mqtt->port, keepalive);
     }
 
     if (rc != MOSQ_ERR_SUCCESS) {
@@ -201,6 +214,52 @@ bool mqtt_ensure_connected(MqttDispatcher *mqtt, char **error_msg) {
         }
         mqtt->connected = false;
         return false;
+    }
+
+    {
+        int timeout_ms = ulak_mqtt_timeout > 0 ? ulak_mqtt_timeout : 5000;
+        struct timespec start, current;
+        int elapsed_ms = 0;
+
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        while (!mqtt->connack_received && elapsed_ms < timeout_ms) {
+            rc = mosquitto_loop(mqtt->client, 100, 1);
+            if (rc != MOSQ_ERR_SUCCESS) {
+                const char *prefix = mqtt_classify_loop_error(mqtt, rc);
+                if (error_msg) {
+                    /* A refused CONNACK: name the broker's reason, which decides
+                     * between retryable and permanent */
+                    if (rc == MOSQ_ERR_CONN_REFUSED && mqtt->connack_received)
+                        *error_msg =
+                            psprintf("%s MQTT connection refused: %s (CONNACK %d)", prefix,
+                                     mosquitto_connack_string(mqtt->connack_rc), mqtt->connack_rc);
+                    else
+                        *error_msg =
+                            psprintf("%s MQTT connect failed: %s", prefix, mosquitto_strerror(rc));
+                }
+                mqtt->connected = false;
+                return false;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &current);
+            elapsed_ms = (int)((current.tv_sec - start.tv_sec) * 1000 +
+                               (current.tv_nsec - start.tv_nsec) / 1000000);
+        }
+
+        if (!mqtt->connack_received || mqtt->connack_rc != 0) {
+            if (error_msg) {
+                if (!mqtt->connack_received)
+                    *error_msg = psprintf(ERROR_PREFIX_RETRYABLE
+                                          " MQTT connect to %s:%d timed out after %d ms",
+                                          mqtt->broker, mqtt->port, timeout_ms);
+                else
+                    *error_msg =
+                        psprintf("%s MQTT connection refused: %s (CONNACK %d)",
+                                 mqtt_classify_loop_error(mqtt, MOSQ_ERR_CONN_REFUSED),
+                                 mosquitto_connack_string(mqtt->connack_rc), mqtt->connack_rc);
+            }
+            mqtt->connected = false;
+            return false;
+        }
     }
 
     mqtt->connected = true;
