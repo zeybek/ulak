@@ -1084,3 +1084,29 @@ Datum ulak_shmem_metrics(PG_FUNCTION_ARGS) {
 
     SRF_RETURN_DONE(funcctx);
 }
+
+/**
+ * @brief SQL-callable: ulak._limit_setting(p_name text) returns bigint.
+ *
+ * The value of an enqueue limit, for the PL/pgSQL enqueue functions
+ * (ulak._check_backpressure, ulak._check_payload_size): "max_payload_size"
+ * or "max_queue_size", read from the GUCs, which are SIGHUP and cannot be
+ * raised by a session.
+ *
+ * @param p_name Limit name (text, not NULL).
+ * @return The limit as bigint.
+ */
+PG_FUNCTION_INFO_V1(ulak_limit_setting);
+Datum ulak_limit_setting(PG_FUNCTION_ARGS) {
+    char *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+    if (strcmp(name, "max_payload_size") == 0)
+        PG_RETURN_INT64((int64)ulak_max_payload_size);
+    if (strcmp(name, "max_queue_size") == 0)
+        PG_RETURN_INT64((int64)ulak_max_queue_size);
+
+    ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("unknown ulak limit \"%s\"", name),
+             errhint("Use \"max_payload_size\" or \"max_queue_size\".")));
+    PG_RETURN_NULL(); /* not reached */
+}

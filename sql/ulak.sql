@@ -840,6 +840,8 @@ DECLARE
     v_payload_hash text;
     v_existing_hash text;
 BEGIN
+    PERFORM ulak._check_payload_size(ARRAY[p_payload]);
+
     -- Backpressure check
     PERFORM ulak._check_backpressure();
 
@@ -922,8 +924,10 @@ DECLARE
     v_endpoint_id bigint;
     v_ids bigint[];
 BEGIN
-    -- Backpressure check
-    PERFORM ulak._check_backpressure();
+    PERFORM ulak._check_payload_size(p_payloads);
+
+    -- Backpressure check, counting every row of the batch
+    PERFORM ulak._check_backpressure(cardinality(p_payloads));
 
     -- Validate endpoint exists and is enabled
     SELECT id INTO v_endpoint_id
@@ -975,8 +979,10 @@ DECLARE
     v_endpoint_id bigint;
     v_ids bigint[];
 BEGIN
-    -- Backpressure check
-    PERFORM ulak._check_backpressure();
+    PERFORM ulak._check_payload_size(p_payloads);
+
+    -- Backpressure check, counting every row of the batch
+    PERFORM ulak._check_backpressure(cardinality(p_payloads));
 
     SELECT id INTO v_endpoint_id
     FROM ulak.endpoints
@@ -1465,6 +1471,19 @@ Returns the number of entries deleted. Called automatically by worker maintenanc
 -- QUEUE BACKPRESSURE
 -- ============================================================================
 
+-- Enqueue limits for the PL/pgSQL entry points, read from the server settings
+-- (SIGHUP), so a session cannot raise them with SET.
+CREATE OR REPLACE FUNCTION ulak._limit_setting(
+    p_name text
+) RETURNS bigint
+LANGUAGE c
+STABLE STRICT
+AS 'ulak', 'ulak_limit_setting';
+
+COMMENT ON FUNCTION ulak._limit_setting(text) IS
+'Internal: value of an enqueue limit, "max_payload_size" or "max_queue_size", as the enqueue functions
+enforce it: the server setting ulak.max_payload_size / ulak.max_queue_size (SIGHUP).';
+
 CREATE OR REPLACE FUNCTION ulak._check_backpressure(
     p_projected_additional bigint DEFAULT 0
 )
@@ -1476,7 +1495,7 @@ DECLARE
     v_active bigint;
     v_projected bigint;
 BEGIN
-    v_max_size := current_setting('ulak.max_queue_size', true)::int;
+    v_max_size := ulak._limit_setting('max_queue_size');
     IF v_max_size IS NULL OR v_max_size <= 0 THEN
         RETURN; -- backpressure disabled
     END IF;
@@ -1510,14 +1529,51 @@ with the rows being inserted reserved in the cache in between).
 Raises exception with SQLSTATE 53400 if the current queue or the projected total would exceed the limit.
 Set max_queue_size=0 to disable.';
 
+-- The PL/pgSQL entry points apply the same payload limit as the C send().
+-- Array elements are stored detoasted, so pg_column_size() of an unnested
+-- element is the uncompressed jsonb size that send() measures with VARSIZE.
+CREATE OR REPLACE FUNCTION ulak._check_payload_size(
+    p_payloads jsonb[]
+)
+RETURNS void
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_max bigint;
+    v_size bigint;
+BEGIN
+    v_max := COALESCE(ulak._limit_setting('max_payload_size'), 1048576);
+    IF v_max <= 0 THEN
+        v_max := 1048576;
+    END IF;
+
+    SELECT max(pg_column_size(p)) INTO v_size FROM unnest(p_payloads) AS p;
+
+    IF v_size > v_max THEN
+        RAISE EXCEPTION 'payload size % bytes exceeds ulak.max_payload_size (% bytes)', v_size, v_max
+        USING ERRCODE = '54000'; -- program_limit_exceeded, as in send()
+    END IF;
+END;
+$$;
+
+COMMENT ON FUNCTION ulak._check_payload_size(jsonb[]) IS
+'Internal: Raise SQLSTATE 54000 when any payload is larger than ulak.max_payload_size (default 1 MB).
+Called by send_with_options, send_batch, send_batch_with_priority, publish and publish_batch;
+send() performs the same check in C.';
+
 -- ============================================================================
 -- HIGH-THROUGHPUT MODE
 -- ============================================================================
 
--- Enable high-throughput mode for the current session
--- Disables synchronous_commit for ~2-3x faster writes at the cost of
--- up to 3× WAL segment duration (default ~600ms) of data loss on crash.
--- Safe for ulak pattern because messages are idempotent.
+-- Enable high-throughput mode for the current transaction.
+-- Disables synchronous_commit for ~2-3x faster writes. A crash can lose the
+-- transactions committed in the last three wal_writer_delay intervals
+-- (~600 ms by default). The outbox stays consistent because the business rows
+-- and the message are in the same transaction and are lost together, and the
+-- workers flush their claim to local disk before delivering, which flushes the
+-- sending transaction first. A failover to a standby can still lose a
+-- transaction committed this way, like any asynchronous commit.
 CREATE OR REPLACE FUNCTION ulak.enable_fast_mode()
 RETURNS void
 LANGUAGE plpgsql
@@ -1529,9 +1585,11 @@ END;
 $$;
 
 COMMENT ON FUNCTION ulak.enable_fast_mode() IS
-'Enable high-throughput mode by disabling synchronous_commit.
-Provides ~2-3x faster writes. Safe for ulak pattern (idempotent messages).
-Effect is transaction-scoped.';
+'Enable high-throughput mode by disabling synchronous_commit for the current transaction.
+Provides ~2-3x faster writes. A crash can lose the last ~3 x wal_writer_delay of commits; the message
+is lost together with the business rows of its transaction, and workers deliver it only after their
+claim commit has flushed it to local disk (a failover can still lose it, like any asynchronous
+commit). Effect is transaction-scoped.';
 
 -- ============================================================================
 -- PUB/SUB: EVENT TYPE MANAGEMENT
@@ -1635,6 +1693,8 @@ DECLARE
     v_count integer;
     v_projected_count bigint;
 BEGIN
+    PERFORM ulak._check_payload_size(ARRAY[p_payload]);
+
     SELECT id INTO v_event_type_id FROM ulak.event_types WHERE name = p_event_type;
     IF v_event_type_id IS NULL THEN
         RAISE EXCEPTION 'Event type ''%'' does not exist', p_event_type;
@@ -1706,6 +1766,9 @@ BEGIN
     IF v_missing_event_type IS NOT NULL THEN
         RAISE EXCEPTION 'Event type ''%'' does not exist', v_missing_event_type;
     END IF;
+
+    PERFORM ulak._check_payload_size(
+        ARRAY(SELECT e->'payload' FROM jsonb_array_elements(p_events) AS e));
 
     WITH batch_events AS (
         SELECT e->>'event_type' AS event_type, e->'payload' AS payload
@@ -2212,7 +2275,9 @@ GRANT EXECUTE ON FUNCTION ulak.cleanup_dlq() TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak._check_backpressure(bigint) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak._active_queue_count(bigint) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak._wake_workers(bigint, text) TO ulak_admin;
--- NOTE: _check_backpressure/_active_queue_count/_wake_workers are internal functions called
+GRANT EXECUTE ON FUNCTION ulak._check_payload_size(jsonb[]) TO ulak_admin;
+GRANT EXECUTE ON FUNCTION ulak._limit_setting(text) TO ulak_admin;
+-- NOTE: _check_backpressure/_active_queue_count/_wake_workers/_check_payload_size/_limit_setting are internal functions called
 -- by the SECURITY DEFINER send/publish APIs. No direct GRANT to ulak_application needed.
 GRANT EXECUTE ON FUNCTION ulak.archive_single_to_dlq(bigint) TO ulak_admin;
 GRANT EXECUTE ON FUNCTION ulak.archive_completed_messages(integer, integer) TO ulak_admin;
