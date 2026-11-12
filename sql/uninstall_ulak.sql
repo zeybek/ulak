@@ -31,21 +31,23 @@ DROP EXTENSION IF EXISTS ulak CASCADE;
 -- from ALL databases.
 \echo 'Step 2: Dropping roles...'
 
--- Check if roles are still used elsewhere before dropping
+-- Name the members of each role: dropping a role removes their membership
 DO $$
 DECLARE
-    role_in_use BOOLEAN;
+    v_role text;
+    v_members text;
 BEGIN
-    -- Check ulak_admin
-    SELECT EXISTS (
-        SELECT 1 FROM pg_roles r
-        JOIN pg_auth_members m ON r.oid = m.member
-        WHERE r.rolname = 'ulak_admin'
-    ) INTO role_in_use;
+    FOREACH v_role IN ARRAY ARRAY['ulak_admin', 'ulak_application', 'ulak_monitor'] LOOP
+        SELECT string_agg(quote_ident(m.rolname), ', ' ORDER BY m.rolname) INTO v_members
+        FROM pg_auth_members am
+        JOIN pg_roles r ON r.oid = am.roleid
+        JOIN pg_roles m ON m.oid = am.member
+        WHERE r.rolname = v_role;
 
-    IF role_in_use THEN
-        RAISE NOTICE 'ulak_admin has member roles - dropping anyway';
-    END IF;
+        IF v_members IS NOT NULL THEN
+            RAISE NOTICE 'role % has members (%); dropping it removes their membership', v_role, v_members;
+        END IF;
+    END LOOP;
 END $$;
 
 DROP ROLE IF EXISTS ulak_admin;
