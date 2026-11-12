@@ -71,20 +71,25 @@ void mqtt_cleanup_strings(MqttDispatcher *mqtt_dispatcher) {
 }
 
 /**
- * @brief Publish callback for MQTT batch mode.
+ * @brief Publish callback for MQTT.
  *
- * Called by mosquitto_loop() when broker sends PUBACK (QoS 1)
- * or PUBCOMP (QoS 2) for a published message.
+ * Called by mosquitto_loop() when the broker acknowledges a publish: PUBACK
+ * (QoS 1), PUBCOMP (QoS 2), or an MQTT 5 PUBREC that refuses it, which ends
+ * the QoS 2 flow. A reason code of 0x80 or above is a refusal; on MQTT 3.1.1
+ * it is always 0.
  *
  * IMPORTANT: This is called from the SAME thread as mosquitto_loop(),
  * NOT from a background thread like Kafka's delivery callback.
  * Therefore, no spinlock needed (unless threaded mode is used later).
  *
- * @param mosq Mosquitto client instance (unused)
- * @param obj User data pointer (MqttDispatcher)
- * @param mid Message ID that was acknowledged
+ * @param mosq        Mosquitto client instance (unused)
+ * @param obj         User data pointer (MqttDispatcher)
+ * @param mid         Message ID that was acknowledged
+ * @param reason_code Reason code of the acknowledgment
+ * @param props       MQTT 5 properties (unused)
  */
-void mqtt_publish_callback(struct mosquitto *mosq, void *obj, int mid) {
+void mqtt_publish_callback(struct mosquitto *mosq, void *obj, int mid, int reason_code,
+                           const mosquitto_property *props) {
     MqttDispatcher *mqtt = (MqttDispatcher *)obj;
     int i;
 
@@ -94,19 +99,28 @@ void mqtt_publish_callback(struct mosquitto *mosq, void *obj, int mid) {
     /* Synchronous dispatch waiting for its own PUBACK/PUBCOMP (QoS 1/2) */
     if (mqtt->sync_wait_mid != 0 && mid == mqtt->sync_wait_mid) {
         mqtt->sync_acked = true;
-        ulak_log("debug", "MQTT PUBACK received for sync mid=%d", mid);
+        mqtt->sync_reason_code = reason_code;
+        ulak_log("debug", "MQTT acknowledgment for sync mid=%d (reason code %d)", mid, reason_code);
         return;
     }
 
     if (!mqtt->pending_messages)
         return;
 
-    /* Find the pending message with this mid and mark it as delivered */
+    /* Find the pending message with this mid and record the outcome */
     for (i = 0; i < mqtt->pending_count; i++) {
-        if (mqtt->pending_messages[i].mid == mid) {
-            mqtt->pending_messages[i].delivered = true;
-            mqtt->pending_messages[i].success = true;
-            ulak_log("debug", "MQTT PUBACK received for mid=%d (index=%d)", mid, i);
+        MqttPendingMessage *pm = &mqtt->pending_messages[i];
+
+        if (pm->mid == mid) {
+            pm->delivered = true;
+            pm->success = reason_code < 0x80;
+            if (!pm->success)
+                snprintf(pm->error, MQTT_ERROR_BUFFER_SIZE,
+                         "%s MQTT broker refused the publish: %s (reason code %d)",
+                         mqtt_classify_publish_reason(reason_code),
+                         mosquitto_reason_string(reason_code), reason_code);
+            ulak_log("debug", "MQTT acknowledgment for mid=%d (index=%d, reason code %d)", mid, i,
+                     reason_code);
             return;
         }
     }
@@ -155,6 +169,16 @@ void mqtt_connect_callback(struct mosquitto *mosq, void *obj, int result) {
     } else {
         ulak_log("error", "MQTT connection failed: %d", result);
     }
+}
+
+bool mqtt_connack_refused(const MqttDispatcher *mqtt) {
+    return mqtt->connack_received && mqtt->connack_rc != 0;
+}
+
+const char *mqtt_connack_text(const MqttDispatcher *mqtt) {
+    /* mosquitto_connack_string() knows only the 3.1.1 return codes 0-5 */
+    return mqtt->protocol_version == MQTT_PROTOCOL_V5 ? mosquitto_reason_string(mqtt->connack_rc)
+                                                      : mosquitto_connack_string(mqtt->connack_rc);
 }
 
 /**
@@ -229,10 +253,9 @@ bool mqtt_ensure_connected(MqttDispatcher *mqtt, char **error_msg) {
                 if (error_msg) {
                     /* A refused CONNACK: name the broker's reason, which decides
                      * between retryable and permanent */
-                    if (rc == MOSQ_ERR_CONN_REFUSED && mqtt->connack_received)
-                        *error_msg =
-                            psprintf("%s MQTT connection refused: %s (CONNACK %d)", prefix,
-                                     mosquitto_connack_string(mqtt->connack_rc), mqtt->connack_rc);
+                    if (mqtt_connack_refused(mqtt))
+                        *error_msg = psprintf("%s MQTT connection refused: %s (CONNACK %d)", prefix,
+                                              mqtt_connack_text(mqtt), mqtt->connack_rc);
                     else
                         *error_msg =
                             psprintf("%s MQTT connect failed: %s", prefix, mosquitto_strerror(rc));
@@ -252,10 +275,9 @@ bool mqtt_ensure_connected(MqttDispatcher *mqtt, char **error_msg) {
                                           " MQTT connect to %s:%d timed out after %d ms",
                                           mqtt->broker, mqtt->port, timeout_ms);
                 else
-                    *error_msg =
-                        psprintf("%s MQTT connection refused: %s (CONNACK %d)",
-                                 mqtt_classify_loop_error(mqtt, MOSQ_ERR_CONN_REFUSED),
-                                 mosquitto_connack_string(mqtt->connack_rc), mqtt->connack_rc);
+                    *error_msg = psprintf("%s MQTT connection refused: %s (CONNACK %d)",
+                                          mqtt_classify_loop_error(mqtt, MOSQ_ERR_CONN_REFUSED),
+                                          mqtt_connack_text(mqtt), mqtt->connack_rc);
             }
             mqtt->connected = false;
             return false;

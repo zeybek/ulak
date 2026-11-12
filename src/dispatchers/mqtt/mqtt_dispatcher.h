@@ -38,15 +38,16 @@ typedef struct MqttDispatcher {
 
     /** @name Endpoint configuration (parsed from JSONB) */
     /** @{ */
-    char *broker;    /**< MQTT broker hostname. */
-    char *topic;     /**< Target topic for publishes. */
-    char *client_id; /**< Optional client ID. */
-    char *username;  /**< Optional username. */
-    char *password;  /**< Optional password (zeroed on cleanup). */
-    int qos;         /**< QoS level (0, 1, or 2). */
-    int port;        /**< Broker port number. */
-    bool retain;     /**< Publish retain flag. */
-    Jsonb *options;  /**< Additional MQTT options. */
+    char *broker;         /**< MQTT broker hostname. */
+    char *topic;          /**< Target topic for publishes. */
+    char *client_id;      /**< Optional client ID. */
+    char *username;       /**< Optional username. */
+    char *password;       /**< Optional password (zeroed on cleanup). */
+    int qos;              /**< QoS level (0, 1, or 2). */
+    int port;             /**< Broker port number. */
+    bool retain;          /**< Publish retain flag. */
+    int protocol_version; /**< MQTT_PROTOCOL_V311 (default) or MQTT_PROTOCOL_V5. */
+    Jsonb *options;       /**< Additional MQTT options. */
     /** @} */
 
     /** @name mosquitto client state */
@@ -80,7 +81,8 @@ typedef struct MqttDispatcher {
     int last_mid;       /**< Last message ID for dispatch_ex. */
     bool clean_session; /**< Clean session flag. */
     int sync_wait_mid; /**< mid the synchronous dispatch is waiting a PUBACK/PUBCOMP for (0 = none). */
-    bool sync_acked; /**< Set by the publish callback when sync_wait_mid is acknowledged. */
+    bool sync_acked;      /**< Set by the publish callback when sync_wait_mid is acknowledged. */
+    int sync_reason_code; /**< Reason code of that acknowledgment (0x80+ = refused, MQTT 5). */
     /** @} */
 
     /** @name Batch delivery tracking */

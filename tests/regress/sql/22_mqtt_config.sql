@@ -72,6 +72,17 @@ SELECT ulak.validate_endpoint_config(
     '{"broker": "localhost", "topic": "test", "options": {"keepalive": 60}}'::jsonb
 ) AS valid_options_object;
 
+-- protocol_version: "3.1.1" (the default) or "5"
+SELECT ulak.validate_endpoint_config(
+    'mqtt',
+    '{"broker": "localhost", "topic": "test", "protocol_version": "3.1.1"}'::jsonb
+) AS valid_protocol_311;
+
+SELECT ulak.validate_endpoint_config(
+    'mqtt',
+    '{"broker": "localhost", "topic": "test", "protocol_version": "5"}'::jsonb
+) AS valid_protocol_5;
+
 -- ============================================================================
 -- INVALID MQTT CONFIGS
 -- ============================================================================
@@ -141,6 +152,17 @@ SELECT ulak.validate_endpoint_config(
     'mqtt',
     '{"broker": "localhost", "topic": "test", "will_qos": 9}'::jsonb
 ) AS invalid_will_qos;
+
+-- protocol_version is a string, "3.1.1" or "5"
+SELECT ulak.validate_endpoint_config(
+    'mqtt',
+    '{"broker": "localhost", "topic": "test", "protocol_version": 5}'::jsonb
+) AS invalid_protocol_number;
+
+SELECT ulak.validate_endpoint_config(
+    'mqtt',
+    '{"broker": "localhost", "topic": "test", "protocol_version": "3.1"}'::jsonb
+) AS invalid_protocol_31;
 
 -- Unknown config key
 SELECT ulak.validate_endpoint_config(

@@ -35,6 +35,7 @@
 #define MQTT_CONFIG_KEY_WILL_QOS "will_qos"
 #define MQTT_CONFIG_KEY_WILL_RETAIN "will_retain"
 #define MQTT_CONFIG_KEY_CLEAN_SESSION "clean_session"
+#define MQTT_CONFIG_KEY_PROTOCOL_VERSION "protocol_version"
 
 /** @brief Allowed configuration keys for strict validation. */
 extern const char *MQTT_ALLOWED_CONFIG_KEYS[];
@@ -47,12 +48,20 @@ extern const char *MQTT_ALLOWED_CONFIG_KEYS[];
 /* ── Connection Functions (mqtt_connection.c) ── */
 
 /**
- * @brief Publish callback for batch mode -- tracks per-message PUBACK delivery.
- * @param mosq mosquitto client instance.
- * @param obj  User data pointer (MqttDispatcher).
- * @param mid  Message ID that was acknowledged.
+ * @brief Publish callback -- records the broker's acknowledgment of a mid.
+ *
+ * Registered with mosquitto_publish_v5_callback_set(), which libmosquitto also
+ * calls on MQTT 3.1.1 connections, with reason code 0.
+ *
+ * @param mosq        mosquitto client instance.
+ * @param obj         User data pointer (MqttDispatcher).
+ * @param mid         Message ID that was acknowledged.
+ * @param reason_code PUBACK (QoS 1) or PUBREC/PUBCOMP (QoS 2) reason code;
+ *                    0x80 and above is a refusal (MQTT 5 only).
+ * @param props       MQTT 5 properties of the acknowledgment (unused).
  */
-void mqtt_publish_callback(struct mosquitto *mosq, void *obj, int mid);
+void mqtt_publish_callback(struct mosquitto *mosq, void *obj, int mid, int reason_code,
+                           const mosquitto_property *props);
 
 /**
  * @brief Message callback -- called when a message is received.
@@ -103,15 +112,43 @@ const char *mqtt_classify_error(int rc);
 /**
  * @brief Classify an error returned by mosquitto_loop().
  *
- * A loop error means the connection broke. MOSQ_ERR_CONN_REFUSED is permanent
- * only when the CONNACK rejected the client (credentials, authorization,
- * protocol version, client id); "server unavailable" and similar refusals,
- * and TLS failures, are retryable.
+ * A loop error means the connection broke. A refused CONNACK is permanent
+ * only when it rejected the client (credentials, authorization, protocol
+ * version, client id, ban); "server unavailable" and similar refusals, and TLS
+ * failures, are retryable. libmosquitto reports an MQTT 5 refusal as
+ * MOSQ_ERR_PROTOCOL rather than MOSQ_ERR_CONN_REFUSED, so the CONNACK code
+ * recorded by the connect callback decides.
  *
  * @param mqtt MQTT dispatcher (for the last CONNACK code).
  * @param rc   mosquitto error code from mosquitto_loop().
  * @return ERROR_PREFIX_RETRYABLE or ERROR_PREFIX_PERMANENT.
  */
 const char *mqtt_classify_loop_error(MqttDispatcher *mqtt, int rc);
+
+/**
+ * @brief Whether the last connect attempt got a CONNACK that refused it.
+ * @param mqtt MQTT dispatcher.
+ * @return true if a CONNACK arrived with a non-zero code.
+ */
+bool mqtt_connack_refused(const MqttDispatcher *mqtt);
+
+/**
+ * @brief Text for the last CONNACK code, in the connection's protocol version.
+ * @param mqtt MQTT dispatcher.
+ * @return Static string from libmosquitto.
+ */
+const char *mqtt_connack_text(const MqttDispatcher *mqtt);
+
+/**
+ * @brief Classify an MQTT 5 refusal of a publish (PUBACK/PUBREC reason code).
+ *
+ * Not authorized, topic name invalid and payload format invalid do not change
+ * by themselves; unspecified and implementation-specific errors, packet
+ * identifier in use and quota exceeded may.
+ *
+ * @param reason_code Reason code of 0x80 or above.
+ * @return ERROR_PREFIX_RETRYABLE or ERROR_PREFIX_PERMANENT.
+ */
+const char *mqtt_classify_publish_reason(int reason_code);
 
 #endif /* ULAK_DISPATCHERS_MQTT_INTERNAL_H */

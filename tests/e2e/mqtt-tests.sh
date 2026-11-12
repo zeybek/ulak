@@ -365,6 +365,97 @@ psql_quiet "SELECT ulak.disable_endpoint('mt-connack5');"
 kill "$FAKE3_PID" "$FAKE5_PID" 2>/dev/null || true
 
 # ═══════════════════════════════════════════════════
+# TEST 12: MQTT 5 reports publishes the broker refuses
+# ═══════════════════════════════════════════════════
+header "TEST 12: MQTT 5 Publish Refusals"
+
+# A second Mosquitto on the compose network. Port 1883: anonymous clients may
+# publish to mt/acl/ok only. Port 1884: anonymous connections are refused.
+# MQTT 3.1.1 acknowledgments carry no reason code and Mosquitto acknowledges a
+# publish its ACL refused, so only "protocol_version": "5" can report it.
+psql_quiet "DELETE FROM ulak.queue;"
+psql_quiet "DELETE FROM ulak.dlq;"
+ACL_NET=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' ulak-postgres-1 | awk '{print $1}')
+docker rm -f ulak-mqtt-acl > /dev/null 2>&1 || true
+docker run -d --rm --name ulak-mqtt-acl --network "$ACL_NET" eclipse-mosquitto:2 sh -c '
+  printf "topic readwrite mt/acl/ok\n" > /tmp/acl
+  printf "per_listener_settings true\nlistener 1883\nallow_anonymous true\nacl_file /tmp/acl\nlistener 1884\nallow_anonymous false\n" > /tmp/m.conf
+  exec mosquitto -c /tmp/m.conf' > /dev/null
+for _ in $(seq 1 20); do
+  docker exec ulak-postgres-1 mosquitto_pub -h ulak-mqtt-acl -p 1883 -t mt/acl/ok -m ping > /dev/null 2>&1 && break
+  sleep 1
+done
+
+ACL_EP() { echo "{\"broker\": \"ulak-mqtt-acl\", \"port\": ${2:-1883}, \"topic\": \"$1\", \"qos\": ${3:-1}${4:+, \"protocol_version\": \"$4\"}}"; }
+create_endpoint "mt-v5-denied"     "$(ACL_EP mt/acl/denied 1883 1 5)" "mqtt"
+create_endpoint "mt-v5-denied-q2"  "$(ACL_EP mt/acl/denied 1883 2 5)" "mqtt"
+create_endpoint "mt-v5-ok"         "$(ACL_EP mt/acl/ok 1883 1 5)" "mqtt"
+create_endpoint "mt-v311-denied"   "$(ACL_EP mt/acl/denied 1883 1)" "mqtt"
+create_endpoint "mt-v5-refused"    "$(ACL_EP mt/acl/ok 1884 1 5)" "mqtt"
+
+docker exec ulak-postgres-1 timeout 15 mosquitto_sub -h ulak-mqtt-acl -p 1883 -V mqttv5 -t mt/acl/ok -q 1 -C 1 -W 15 > /tmp/mqtt-sub-12.txt 2>/dev/null &
+SUB_PID=$!
+sleep 1
+for ep in mt-v5-denied mt-v5-denied-q2 mt-v5-ok mt-v311-denied mt-v5-refused; do
+  send_msg "$ep" "{\"test\": \"$ep\"}"
+done
+
+acl_dlq_error() {
+  psql_exec "SELECT d.last_error FROM ulak.dlq d JOIN ulak.endpoints e ON e.id = d.endpoint_id WHERE e.name = '$1' LIMIT 1;"
+}
+for _ in $(seq 1 30); do
+  [ "$(psql_exec "SELECT count(*) FROM ulak.dlq d JOIN ulak.endpoints e ON e.id = d.endpoint_id WHERE e.name IN ('mt-v5-denied', 'mt-v5-denied-q2', 'mt-v5-refused');")" = "3" ] &&
+    [ "$(psql_exec "SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON e.id = q.endpoint_id WHERE e.name IN ('mt-v5-ok', 'mt-v311-denied') AND q.status = 'completed';")" = "2" ] && break
+  sleep 1
+done
+wait $SUB_PID 2>/dev/null || true
+
+V5_Q1_ERR=$(acl_dlq_error mt-v5-denied)
+V5_Q2_ERR=$(acl_dlq_error mt-v5-denied-q2)
+V5_CONN_ERR=$(acl_dlq_error mt-v5-refused)
+echo "  QoS 1 refused:     ${V5_Q1_ERR}"
+echo "  QoS 2 refused:     ${V5_Q2_ERR}"
+echo "  connect refused:   ${V5_CONN_ERR}"
+assert_eq "MQTT 5, QoS 1: refused publish dead-lettered as [PERMANENT]" "[PERMANENT]" "${V5_Q1_ERR:0:11}"
+assert_contains "MQTT 5, QoS 1: error names the refusal" "MQTT broker refused the publish" "$V5_Q1_ERR"
+assert_contains "MQTT 5, QoS 1: reason code 135 (not authorized)" "reason code 135" "$V5_Q1_ERR"
+assert_eq "MQTT 5, QoS 2: refused publish dead-lettered as [PERMANENT] (PUBREC)" "[PERMANENT]" "${V5_Q2_ERR:0:11}"
+assert_contains "MQTT 5, QoS 2: error names the refusal" "MQTT broker refused the publish" "$V5_Q2_ERR"
+assert_eq "MQTT 5: refused CONNACK is [PERMANENT]" "[PERMANENT]" "${V5_CONN_ERR:0:11}"
+assert_contains "MQTT 5: refused CONNACK reported with its reason" "MQTT connection refused" "$V5_CONN_ERR"
+assert_eq "MQTT 5: allowed topic completed" "completed" "$(psql_exec "SELECT q.status FROM ulak.queue q JOIN ulak.endpoints e ON e.id = q.endpoint_id WHERE e.name = 'mt-v5-ok';")"
+assert_eq "MQTT 5: allowed topic delivered" "1" "$(grep -c 'mt-v5-ok' /tmp/mqtt-sub-12.txt 2>/dev/null || echo 0)"
+# The known 3.1.1 limitation: the refused publish is acknowledged and completes
+assert_eq "MQTT 3.1.1: refused publish still completes (no reason code)" "completed" "$(psql_exec "SELECT q.status FROM ulak.queue q JOIN ulak.endpoints e ON e.id = q.endpoint_id WHERE e.name = 'mt-v311-denied';")"
+rm -f /tmp/mqtt-sub-12.txt
+
+section "Synchronous path (capture_response = on)"
+CAPTURE_AUTO=$(psql_exec "SELECT coalesce(sourcefile LIKE '%postgresql.auto.conf', false) FROM pg_settings WHERE name = 'ulak.capture_response';")
+CAPTURE_SAVED=$(psql_exec "SHOW ulak.capture_response;")
+docker exec ulak-postgres-1 psql -U postgres -d "$DB" -q -c "ALTER SYSTEM SET ulak.capture_response = on;" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
+sleep 1
+create_endpoint "mt-v5-denied-sync" "$(ACL_EP mt/acl/denied 1883 1 5)" "mqtt"
+send_msg "mt-v5-denied-sync" "{\"test\": \"sync\"}"
+V5_SYNC_ERR=""
+for _ in $(seq 1 20); do
+  V5_SYNC_ERR=$(acl_dlq_error mt-v5-denied-sync)
+  [ -n "$V5_SYNC_ERR" ] && break
+  sleep 1
+done
+echo "  sync refused:      ${V5_SYNC_ERR}"
+assert_eq "MQTT 5, sync dispatch: refused publish dead-lettered as [PERMANENT]" "[PERMANENT]" "${V5_SYNC_ERR:0:11}"
+assert_contains "MQTT 5, sync dispatch: error names the refusal" "MQTT broker refused the publish" "$V5_SYNC_ERR"
+if [ "$CAPTURE_AUTO" = "t" ]; then
+  docker exec ulak-postgres-1 psql -U postgres -d "$DB" -q -c "ALTER SYSTEM SET ulak.capture_response = ${CAPTURE_SAVED};" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
+else
+  docker exec ulak-postgres-1 psql -U postgres -d "$DB" -q -c "ALTER SYSTEM RESET ulak.capture_response;" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
+fi
+for ep in mt-v5-denied mt-v5-denied-q2 mt-v5-ok mt-v311-denied mt-v5-refused mt-v5-denied-sync; do
+  psql_quiet "SELECT ulak.disable_endpoint('$ep');"
+done
+docker rm -f ulak-mqtt-acl > /dev/null 2>&1 || true
+
+# ═══════════════════════════════════════════════════
 # CLEANUP
 # ═══════════════════════════════════════════════════
 
