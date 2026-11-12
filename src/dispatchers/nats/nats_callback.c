@@ -39,6 +39,27 @@ const char *nats_classify_error(natsStatus status) {
  * @param js_err_code JetStream error code
  * @return "[PERMANENT]" or "[RETRYABLE]" string constant
  */
+/**
+ * @brief Classify a failed JetStream publish (sync or async).
+ *
+ * "No responders" means no stream captures the subject (or JetStream is not
+ * running). A synchronous js_PublishMsg reports it as JSNotEnabledErr (10076),
+ * an async PubAck as NATS_NO_RESPONDERS with no code; both are retryable, so
+ * the message waits for the stream instead of going to the DLQ on one path
+ * and being retried on the other.
+ *
+ * THREAD SAFETY: called from the cnats AckHandler thread; constants only.
+ *
+ * @param status natsStatus of the publish
+ * @param js_err_code JetStream error code (0 if none)
+ * @return "[PERMANENT]" or "[RETRYABLE]" string constant
+ */
+const char *nats_classify_publish_error(natsStatus status, int js_err_code) {
+    if (status == NATS_NO_RESPONDERS)
+        return "[RETRYABLE]";
+    return (js_err_code != 0) ? nats_classify_js_error(js_err_code) : nats_classify_error(status);
+}
+
 const char *nats_classify_js_error(int js_err_code) {
     switch (js_err_code) {
     /* Permanent JetStream errors */

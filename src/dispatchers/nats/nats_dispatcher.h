@@ -65,6 +65,11 @@ typedef struct NatsDispatcher {
 
     Jsonb *static_headers; /**< Ref to endpoint config for header iteration. */
 
+    /** Nats-Msg-Id prefix "ulak-<system identifier>-<database oid>-": queue row
+     *  ids repeat across installations, and JetStream drops a repeat inside the
+     *  stream's duplicate window. */
+    char msg_id_prefix[64];
+
     /** @name Runtime connection state */
     /** @{ */
     natsConnection *conn; /**< Active NATS connection (NULL if disconnected). */
