@@ -121,17 +121,27 @@ static int64 ulak_backpressure_active_count(int64 reserve) {
     if (reserve < 0)
         reserve = 0;
 
-    if (ulak_shmem != NULL && ulak_shmem->lock != NULL) {
-        LWLockAcquire(ulak_shmem->lock, LW_EXCLUSIVE);
+    if (ulak_shmem != NULL) {
+        bool use_cache = false;
+
+        SpinLockAcquire(&ulak_shmem->active_count_mutex);
         if (ulak_shmem->active_count_dboid == MyDatabaseId &&
-            ulak_shmem->active_count_checked_at != 0 &&
-            now - ulak_shmem->active_count_checked_at < ULAK_BACKPRESSURE_CACHE_USEC) {
+            ulak_shmem->active_count_checked_at != 0) {
+            /* Fresh, or another sender is recounting: keep the cached value */
+            if (now - ulak_shmem->active_count_checked_at < ULAK_BACKPRESSURE_CACHE_USEC ||
+                (ulak_shmem->active_count_refresh_at != 0 &&
+                 now - ulak_shmem->active_count_refresh_at < ULAK_BACKPRESSURE_CACHE_USEC))
+                use_cache = true;
+            else
+                ulak_shmem->active_count_refresh_at = now; /* we recount */
+        }
+        if (use_cache) {
             count = ulak_shmem->active_count_cache;
             ulak_shmem->active_count_cache = count + reserve;
-            LWLockRelease(ulak_shmem->lock);
-            return count;
         }
-        LWLockRelease(ulak_shmem->lock);
+        SpinLockRelease(&ulak_shmem->active_count_mutex);
+        if (use_cache)
+            return count;
     }
 
     ret = SPI_execute("SELECT count(*) FROM ulak.queue WHERE status IN ('pending', 'processing')",
@@ -145,12 +155,13 @@ static int64 ulak_backpressure_active_count(int64 reserve) {
     if (isnull)
         count = 0;
 
-    if (ulak_shmem != NULL && ulak_shmem->lock != NULL) {
-        LWLockAcquire(ulak_shmem->lock, LW_EXCLUSIVE);
+    if (ulak_shmem != NULL) {
+        SpinLockAcquire(&ulak_shmem->active_count_mutex);
         ulak_shmem->active_count_dboid = MyDatabaseId;
         ulak_shmem->active_count_cache = count + reserve;
         ulak_shmem->active_count_checked_at = now;
-        LWLockRelease(ulak_shmem->lock);
+        ulak_shmem->active_count_refresh_at = 0;
+        SpinLockRelease(&ulak_shmem->active_count_mutex);
     }
 
     return count;
