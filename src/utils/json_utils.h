@@ -46,6 +46,13 @@ extern char *jsonb_to_string(Jsonb *jsonb);
  * @return palloc'd Jsonb; caller must pfree.
  */
 extern Jsonb *string_to_jsonb(const char *str);
+
+/**
+ * @brief Parse JSON text that came from outside (a server reply) into JSONB.
+ * @param str  JSON text to parse.
+ * @return palloc'd Jsonb, or NULL when the text is not valid JSON (no ERROR).
+ */
+extern Jsonb *string_to_jsonb_safe(const char *str);
 /** @} */
 
 /** @name Typed accessors */
@@ -94,6 +101,14 @@ extern bool jsonb_get_bool(Jsonb *jsonb, const char *key, bool default_value);
  * @return int32 value or default_value.
  */
 extern int32 jsonb_get_int32(Jsonb *jsonb, const char *key, int32 default_value);
+
+/**
+ * @brief Convert a JSONB numeric to int32 without raising an ERROR.
+ * @param num  Numeric value (JsonbValue.val.numeric).
+ * @param out  Set to the value on success (may be NULL).
+ * @return true if @p num is an integer within int32, false otherwise.
+ */
+extern bool jsonb_numeric_to_int32(Numeric num, int32 *out);
 
 /**
  * @brief Get a 64-bit integer value, returning default if absent.

@@ -33,6 +33,7 @@ typedef struct {
     char *access_token;   /**< Cached token (palloc'd in TopMemoryContext). */
     int access_token_len; /**< Length of cached token. */
     time_t expires_at;    /**< Absolute expiry (unix seconds, with 60s safety buffer). */
+    time_t failed_until;  /**< After a failed fetch, no new fetch before this time. */
 } OAuth2TokenCache;
 
 /**

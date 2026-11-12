@@ -7,6 +7,10 @@
  */
 
 #include "utils/json_utils.h"
+#include <errno.h>
+#if PG_VERSION_NUM >= 160000
+#include "nodes/miscnodes.h"
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include "utils/logging.h"
@@ -73,6 +77,55 @@ Jsonb *string_to_jsonb(const char *str) {
 }
 
 /**
+ * @brief Convert a C string to a JSONB value without raising on bad input.
+ *
+ * For text that did not come from ulak itself (a remote server's reply), where
+ * a syntax error must become a delivery failure instead of an ERROR that aborts
+ * the whole batch. The parser's message is discarded: it quotes the input.
+ *
+ * @param str JSON string to parse
+ * @return palloc'd Jsonb, or NULL if str is NULL or not valid JSON
+ */
+Jsonb *string_to_jsonb_safe(const char *str) {
+#if PG_VERSION_NUM >= 160000
+    ErrorSaveContext escontext = {T_ErrorSaveContext};
+    Datum result;
+
+    if (!str) {
+        return NULL;
+    }
+
+    if (!DirectInputFunctionCallSafe(jsonb_in, (char *)str, InvalidOid, -1, (Node *)&escontext,
+                                     &result)) {
+        return NULL;
+    }
+    return DatumGetJsonbP(result);
+#else
+    /* Soft input errors (ErrorSaveContext) only exist from PG16 on */
+    MemoryContext saved_ctx = CurrentMemoryContext;
+    Jsonb *volatile result = NULL;
+
+    if (!str) {
+        return NULL;
+    }
+
+    PG_TRY();
+    {
+        result = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(str)));
+    }
+    PG_CATCH();
+    {
+        MemoryContextSwitchTo(saved_ctx);
+        FlushErrorState();
+        result = NULL;
+    }
+    PG_END_TRY();
+
+    return result;
+#endif
+}
+
+/**
  * @brief Check if a JSONB object contains a specific key.
  * @param jsonb JSONB object to check
  * @param key Key to look for
@@ -127,6 +180,33 @@ int32 jsonb_get_int32(Jsonb *jsonb, const char *key, int32 default_value) {
     }
 
     return default_value;
+}
+
+/**
+ * @brief Convert a JSONB numeric to int32 without raising on bad input.
+ *
+ * numeric_int4 raises an ERROR for a value outside int4; called while a worker
+ * builds a dispatcher, that ERROR takes the whole batch down. This returns
+ * false instead, for fractions too.
+ *
+ * @param num Numeric value
+ * @param out Set to the value on success (may be NULL)
+ * @return true if num is an integer within int32
+ */
+bool jsonb_numeric_to_int32(Numeric num, int32 *out) {
+    char *str = DatumGetCString(DirectFunctionCall1(numeric_out, NumericGetDatum(num)));
+    char *end;
+    long long val;
+    bool ok;
+
+    errno = 0;
+    val = strtoll(str, &end, 10);
+    ok = errno == 0 && end != str && *end == '\0' && val >= PG_INT32_MIN && val <= PG_INT32_MAX;
+    pfree(str);
+
+    if (ok && out)
+        *out = (int32)val;
+    return ok;
 }
 
 /**
