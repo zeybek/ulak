@@ -93,6 +93,38 @@ SELECT ulak.validate_endpoint_config(
     '{"host": "localhost", "exchange": "e", "routing_key": "r", "unknown": "value"}'::jsonb
 ) AS unknown_key;
 
+-- frame_max is range-checked like ulak.amqp_frame_max (4096..2097152)
+SELECT ulak.validate_endpoint_config(
+    'amqp',
+    '{"host": "localhost", "exchange": "e", "routing_key": "r", "frame_max": 5000000000}'::jsonb
+) AS frame_max_out_of_int4;
+
+SELECT ulak.validate_endpoint_config(
+    'amqp',
+    '{"host": "localhost", "exchange": "e", "routing_key": "r", "frame_max": 1024}'::jsonb
+) AS frame_max_below_minimum;
+
+SELECT ulak.validate_endpoint_config(
+    'amqp',
+    '{"host": "localhost", "exchange": "e", "routing_key": "r", "frame_max": "131072"}'::jsonb
+) AS frame_max_string;
+
+SELECT ulak.validate_endpoint_config(
+    'amqp',
+    '{"host": "localhost", "exchange": "e", "routing_key": "r", "frame_max": 131072}'::jsonb
+) AS frame_max_valid;
+
+-- port and heartbeat beyond int4 are refused instead of raising an ERROR
+SELECT ulak.validate_endpoint_config(
+    'amqp',
+    '{"host": "localhost", "exchange": "e", "routing_key": "r", "port": 99999999999}'::jsonb
+) AS port_out_of_int4;
+
+SELECT ulak.validate_endpoint_config(
+    'amqp',
+    '{"host": "localhost", "exchange": "e", "routing_key": "r", "heartbeat": 99999999999}'::jsonb
+) AS heartbeat_out_of_int4;
+
 -- ============================================================================
 -- AMQP ENDPOINT CRUD
 -- ============================================================================

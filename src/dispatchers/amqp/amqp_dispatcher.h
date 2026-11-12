@@ -46,6 +46,7 @@
 /** @brief Tracks a single in-flight message during batch delivery with publisher confirms. */
 typedef struct {
     int64 msg_id;                       /**< PostgreSQL queue row ID. */
+    int64 published_id;                 /**< Id sent as message_id ("msg_<id>"). */
     uint64_t delivery_tag;              /**< AMQP delivery tag for confirms. */
     bool confirmed;                     /**< Confirm received from broker. */
     bool success;                       /**< ACK (not NACK) from broker. */

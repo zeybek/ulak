@@ -64,10 +64,12 @@ const char *AMQP_ALLOWED_CONFIG_KEYS[] = {
  */
 bool amqp_dispatcher_validate_config(Jsonb *config) {
     JsonbValue host_val, exchange_val, routing_key_val;
-    JsonbValue port_val, heartbeat_val, exchange_type_val, tls_val, ca_val, verify_val;
+    JsonbValue port_val, heartbeat_val, frame_max_val, exchange_type_val, tls_val, ca_val,
+        verify_val;
     char *unknown_key = NULL;
-    int port;
-    int heartbeat;
+    int32 port;
+    int32 heartbeat;
+    int32 frame_max;
     const char *type;
     int type_len;
     bool verify_peer;
@@ -117,9 +119,7 @@ bool amqp_dispatcher_validate_config(Jsonb *config) {
             ulak_log("error", "AMQP config 'port' must be a number");
             return false;
         }
-        port =
-            DatumGetInt32(DirectFunctionCall1(numeric_int4, NumericGetDatum(port_val.val.numeric)));
-        if (port < 1 || port > 65535) {
+        if (!jsonb_numeric_to_int32(port_val.val.numeric, &port) || port < 1 || port > 65535) {
             ulak_log("error", "AMQP config 'port' must be between 1 and 65535");
             return false;
         }
@@ -130,10 +130,20 @@ bool amqp_dispatcher_validate_config(Jsonb *config) {
             ulak_log("error", "AMQP config 'heartbeat' must be a number");
             return false;
         }
-        heartbeat = DatumGetInt32(
-            DirectFunctionCall1(numeric_int4, NumericGetDatum(heartbeat_val.val.numeric)));
-        if (heartbeat < 0 || heartbeat > 600) {
+        if (!jsonb_numeric_to_int32(heartbeat_val.val.numeric, &heartbeat) || heartbeat < 0 ||
+            heartbeat > 600) {
             ulak_log("error", "AMQP config 'heartbeat' must be between 0 and 600");
+            return false;
+        }
+    }
+
+    /* Same range as the ulak.amqp_frame_max GUC; 4096 is the AMQP 0-9-1 minimum */
+    if (extract_jsonb_value(config, AMQP_CONFIG_KEY_FRAME_MAX, &frame_max_val)) {
+        if (frame_max_val.type != jbvNumeric ||
+            !jsonb_numeric_to_int32(frame_max_val.val.numeric, &frame_max) || frame_max < 4096 ||
+            frame_max > 2097152) {
+            ulak_log("error",
+                     "AMQP config 'frame_max' must be an integer between 4096 and 2097152");
             return false;
         }
     }

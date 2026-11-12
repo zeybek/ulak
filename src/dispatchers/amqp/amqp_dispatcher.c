@@ -128,8 +128,7 @@ Dispatcher *amqp_dispatcher_create(Jsonb *config) {
 
     /* Get port (optional) */
     if (extract_jsonb_value(config, AMQP_CONFIG_KEY_PORT, &val) && val.type == jbvNumeric) {
-        amqp->port =
-            DatumGetInt32(DirectFunctionCall1(numeric_int4, NumericGetDatum(val.val.numeric)));
+        (void)jsonb_numeric_to_int32(val.val.numeric, &amqp->port);
     }
 
     /* Get vhost (optional) */
@@ -164,14 +163,12 @@ Dispatcher *amqp_dispatcher_create(Jsonb *config) {
 
     /* Get heartbeat (optional - override GUC default) */
     if (extract_jsonb_value(config, AMQP_CONFIG_KEY_HEARTBEAT, &val) && val.type == jbvNumeric) {
-        amqp->heartbeat =
-            DatumGetInt32(DirectFunctionCall1(numeric_int4, NumericGetDatum(val.val.numeric)));
+        (void)jsonb_numeric_to_int32(val.val.numeric, &amqp->heartbeat);
     }
 
     /* Get frame_max (optional - override GUC default) */
     if (extract_jsonb_value(config, AMQP_CONFIG_KEY_FRAME_MAX, &val) && val.type == jbvNumeric) {
-        amqp->frame_max =
-            DatumGetInt32(DirectFunctionCall1(numeric_int4, NumericGetDatum(val.val.numeric)));
+        (void)jsonb_numeric_to_int32(val.val.numeric, &amqp->frame_max);
     }
 
     /* TLS configuration */
@@ -328,7 +325,7 @@ bool amqp_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, Js
 
     amqp = (AmqpDispatcher *)dispatcher->private_data;
 
-    success = amqp_dispatcher_dispatch(dispatcher, payload, &error_msg);
+    success = amqp_dispatch_sync(amqp, payload, result ? result->message_id : 0, &error_msg);
 
     if (result) {
         result->success = success;

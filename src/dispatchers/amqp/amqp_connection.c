@@ -276,6 +276,13 @@ bool amqp_connect_internal(AmqpDispatcher *amqp, char **error_msg) {
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
 
+    /* Synchronous RPCs (channel.open, confirm.select) wait forever by default
+     * (rpc_timeout NULL; only the login handshake has its own 12 s limit):
+     * bound them by the same connection timeout */
+    status = amqp_set_rpc_timeout(amqp->conn, &tv);
+    if (status != AMQP_STATUS_OK)
+        ulak_log("warning", "Failed to set AMQP RPC timeout: %s", amqp_error_string2(status));
+
     /* Open socket connection */
     status = amqp_socket_open_noblock(amqp->socket, amqp->host, amqp->port, &tv);
     if (status != AMQP_STATUS_OK) {
@@ -383,6 +390,19 @@ bool amqp_ensure_connected(AmqpDispatcher *amqp, char **error_msg) {
     if (amqp->connected && amqp->conn && amqp->channel > 0) {
         /* Lazy check: assume connection is valid if recent operation succeeded */
         time_t now = time(NULL);
+        int heartbeat = amqp_get_heartbeat(amqp->conn);
+
+        /* librabbitmq sends heartbeats only from inside library calls, so an
+         * idle worker sends none and the broker closes the connection after
+         * missing them; its socket still looks valid here, and the next
+         * publish would fail. Reconnect after an idle heartbeat interval. */
+        if (heartbeat > 0 && amqp->last_successful_op > 0 &&
+            (now - amqp->last_successful_op) >= heartbeat) {
+            ulak_log("debug", "AMQP connection idle for %ld s (heartbeat %d s), reconnecting",
+                     (long)(now - amqp->last_successful_op), heartbeat);
+            return amqp_connect_internal(amqp, error_msg);
+        }
+
         if (amqp->last_successful_op > 0 &&
             (now - amqp->last_successful_op) < AMQP_PING_INTERVAL_SECONDS) {
             return true;
