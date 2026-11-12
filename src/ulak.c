@@ -264,13 +264,23 @@ Datum ulak_send(PG_FUNCTION_ARGS) {
      * one partition the row hashes to (wake.c sets its latch at commit).
      */
     ulak_wake_set_skip_trigger(true);
-    ret = SPI_execute_with_args(
-        "INSERT INTO ulak.queue "
-        "(endpoint_id, payload, status, retry_count, next_retry_at) "
-        "VALUES ($1, $2, 'pending', 0, NOW()) RETURNING id",
-        2, (Oid[]){INT8OID, JSONBOID},
-        (Datum[]){Int64GetDatum(endpoint_id), JsonbPGetDatum(payload_jsonb)}, NULL, false, 0);
-    ulak_wake_set_skip_trigger(false);
+    /* PG_FINALLY: if the INSERT raises and a savepoint catches it, the flag
+     * would otherwise stay set and swallow the wake-up of every later INSERT
+     * in this transaction that relies on the queue trigger */
+    PG_TRY();
+    {
+        ret = SPI_execute_with_args(
+            "INSERT INTO ulak.queue "
+            "(endpoint_id, payload, status, retry_count, next_retry_at) "
+            "VALUES ($1, $2, 'pending', 0, NOW()) RETURNING id",
+            2, (Oid[]){INT8OID, JSONBOID},
+            (Datum[]){Int64GetDatum(endpoint_id), JsonbPGetDatum(payload_jsonb)}, NULL, false, 0);
+    }
+    PG_FINALLY();
+    {
+        ulak_wake_set_skip_trigger(false);
+    }
+    PG_END_TRY();
     if (ret != SPI_OK_INSERT_RETURNING || SPI_processed != 1 || SPI_tuptable == NULL)
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
