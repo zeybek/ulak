@@ -5,6 +5,47 @@ All notable changes to ulak will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0](https://github.com/zeybek/ulak/compare/v0.2.0...v0.3.0) (2026-11-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* **redis:** TLS connections fail when the server certificate does not match the configured host. OOM and READONLY replies are retried instead of going to the DLQ.
+* **nats:** Nats-Msg-Id is ulak-<system identifier>-<database oid>-<row id>. Publishes to a subject without a stream are retried on the synchronous path too.
+* **amqp:** an unroutable mandatory publish is retried instead of completing. The message_id property is msg_<queue row id> instead of a per-connection delivery tag.
+* **mqtt:** ulak.mqtt_default_qos defaults to 1. With ulak.workers > 1 a configured client_id gets a _<worker number> suffix. CONNACK refusals such as "server unavailable" are retried instead of going to the DLQ.
+* **http:** HTTP 408 and 425 responses are retried instead of going to the DLQ.
+* **worker:** a row found stuck in 'processing' is charged a retry and moves to the DLQ once its retries are used up. A worker ended with pg_terminate_backend() is restarted after ulak.worker_restart_delay. Worker sessions run with synchronous_commit = local and lock_timeout = 10s.
+* **sql:** send_with_options(), send_batch(), send_batch_with_priority(), publish() and publish_batch() reject a payload larger than ulak.max_payload_size (SQLSTATE 54000), and send_batch() / send_batch_with_priority() count every row against ulak.max_queue_size (SQLSTATE 53400).
+
+### Features
+
+* **mqtt:** report publishes the broker refuses on MQTT 5 connections ([6e4002c](https://github.com/zeybek/ulak/commit/6e4002cca083d0a1b4d7cfdd2b9835487ac13092))
+
+
+### Bug Fixes
+
+* **amqp:** fail returned mandatory publishes and bound broker RPCs ([b932935](https://github.com/zeybek/ulak/commit/b93293563aeb8b7e2e85e53f7389b9651a520109))
+* **core:** keep the trigger wake-up after a send() that failed ([ad4eafb](https://github.com/zeybek/ulak/commit/ad4eafbf446d887b2b62dd74c0cc1f93d2d7f2b4))
+* **core:** start two timeout GUCs at their boot values ([f787d77](https://github.com/zeybek/ulak/commit/f787d774cf44983238af8cd4d03e1569d20fd615))
+* **http:** extend the SSRF guard to IPv6, NAT64 and broadcast addresses ([b7f5190](https://github.com/zeybek/ulak/commit/b7f5190b721e9419086682dac4ba126d9d1640e5))
+* **http:** retry 408 and 425, keep batch-mode headers and Retry-After ([7683656](https://github.com/zeybek/ulak/commit/76836562520cae3afad33c02bcf1d58d2af81e58))
+* **http:** size the OAuth2 token buffer to the response ([f78faa9](https://github.com/zeybek/ulak/commit/f78faa9618702c9d32ade589553484c0700ea15f))
+* **kafka:** tie sync reports to their produce and accept acks 0 and 1 ([b902767](https://github.com/zeybek/ulak/commit/b902767be56255c2d7b91026cf0e6da51316af36))
+* **mqtt:** publish with QoS 1 by default and bound the connect ([c886bcb](https://github.com/zeybek/ulak/commit/c886bcb8cf67ee1626036dd6582ee92dbdf7484a))
+* **nats:** retry publishes no stream takes and namespace Nats-Msg-Id ([7024104](https://github.com/zeybek/ulak/commit/7024104dd1d2bcb2e9ecf3fa9ce7a3930847678f))
+* **redis:** check the TLS host name and retry OOM and READONLY ([6165e0e](https://github.com/zeybek/ulak/commit/6165e0e5b423b36a2ce784804cf0f3c1140d3cfc))
+* **sql:** apply payload and queue limits on every enqueue function ([86c97e8](https://github.com/zeybek/ulak/commit/86c97e88e27d7dd19040553c3f281eb77b589c84))
+* **sql:** name the members of each ulak role in the uninstall script ([3ab3269](https://github.com/zeybek/ulak/commit/3ab3269839e89c7c1a400d3863d8570bc65020a3))
+* **sql:** refuse to run the extension scripts through psql ([dffe8e5](https://github.com/zeybek/ulak/commit/dffe8e51bd7981f465fcd2ef106ae2ea8b8deedd))
+* **sql:** warn when the ulak roles already exist with members ([04a6c78](https://github.com/zeybek/ulak/commit/04a6c78f85f825f10eae6179624d4349b1780a06))
+* **worker:** keep delivering through errors, stuck rows and restarts ([8174c7b](https://github.com/zeybek/ulak/commit/8174c7b3513c3350caf1c0ce14b53173d87d4e46))
+
+
+### Performance Improvements
+
+* **core:** keep senders off the registry lock in the backpressure check ([7b2b420](https://github.com/zeybek/ulak/commit/7b2b420a4bf8605361ed65796ff44b9c946a997b))
+
 ## [0.2.0](https://github.com/zeybek/ulak/compare/v0.1.2...v0.2.0) (2026-09-09)
 
 
