@@ -106,29 +106,49 @@ void redis_disconnect_internal(RedisDispatcher *redis);
  */
 bool redis_is_permanent_error(const char *error_str);
 
+/**
+ * @brief Whether an error reply means the connection reached a replica (READONLY).
+ * @param error_str  Error string from hiredis.
+ * @return true if the connection should be dropped and the host resolved again.
+ */
+bool redis_error_needs_reconnect(const char *error_str);
+
+/**
+ * @brief Disconnect and forget the cached address so the next use reconnects.
+ * @param redis  Redis dispatcher instance.
+ */
+void redis_reconnect_on_next_use(RedisDispatcher *redis);
+
 /* ── TLS Functions (redis_tls.c) ── */
 
 /**
- * @brief Create Redis SSL context from certificate files.
+ * @brief Create the TLS context from certificate files.
  *
- * @param ca_cert      CA certificate file path.
+ * Verifies the server certificate chain against @p ca_cert, or the system
+ * store when it is NULL.
+ *
+ * @param ca_cert      CA certificate file path (may be NULL).
  * @param client_cert  Client certificate file path (mTLS).
  * @param client_key   Client key file path.
  * @param error_msg    OUT - error description on failure.
- * @return redisSSLContext on success, NULL on failure.
+ * @return SSL_CTX on success, NULL on failure.
  */
-redisSSLContext *redis_tls_create_context(const char *ca_cert, const char *client_cert,
-                                          const char *client_key, char **error_msg);
+SSL_CTX *redis_tls_create_context(const char *ca_cert, const char *client_cert,
+                                  const char *client_key, char **error_msg);
 
 /**
  * @brief Initiate TLS handshake on an existing Redis connection.
  *
+ * Sends @p host as SNI and requires the certificate to match it (DNS name, or
+ * IP address for an IP literal).
+ *
  * @param ctx       Active hiredis connection.
  * @param ssl_ctx   SSL context created by redis_tls_create_context().
+ * @param host      Configured Redis host (name or IP literal).
  * @param error_msg OUT - error description on failure.
  * @return true on success, false on failure.
  */
-bool redis_tls_initiate(redisContext *ctx, redisSSLContext *ssl_ctx, char **error_msg);
+bool redis_tls_initiate(redisContext *ctx, SSL_CTX *ssl_ctx, const char *host, char **error_msg);
 
 /**
  * @brief Clean up Redis SSL context.
@@ -137,6 +157,6 @@ bool redis_tls_initiate(redisContext *ctx, redisSSLContext *ssl_ctx, char **erro
  *
  * @param ssl_ctx  SSL context to free (may be NULL).
  */
-void redis_tls_cleanup(redisSSLContext *ssl_ctx);
+void redis_tls_cleanup(SSL_CTX *ssl_ctx);
 
 #endif /* ULAK_REDIS_INTERNAL_H */

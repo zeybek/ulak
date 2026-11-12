@@ -271,6 +271,151 @@ assert_contains "Has ts field" "ts" "$FIELDS"
 assert_contains "Payload has order_id" "order_id" "$FIELDS"
 
 # ═══════════════════════════════════════════════════
+# TEST 9: TLS handshake with a peer that never answers
+# ═══════════════════════════════════════════════════
+header "TEST 9: TLS Handshake Bounded by connect_timeout"
+
+# redisConnectWithTimeout bounds only connect(); the TLS handshake needs its
+# own socket timeout, or a peer that accepts and stays silent holds the worker
+# forever. The listener runs on the Docker host (host.docker.internal).
+psql_quiet "DELETE FROM ulak.queue;"
+TLS_TMP=$(mktemp -d)
+SILENT_PORT=16390
+python3 -c '
+import socket, sys, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", int(sys.argv[1])))
+s.listen(16)
+held = []
+while True:
+    held.append(s.accept()[0])
+' "$SILENT_PORT" > /dev/null 2>&1 &
+SILENT_PID=$!
+sleep 1
+
+create_endpoint "rt-tls-silent" "{\"host\": \"${WEBHOOK_HOST}\", \"port\": ${SILENT_PORT}, \"stream_key\": \"rt-tls\", \"tls\": true, \"connect_timeout\": 2}" "redis"
+send_msg "rt-tls-silent" "{\"tls\": \"silent\"}"
+SILENT_ERR=""
+for _ in $(seq 1 20); do
+  SILENT_ERR=$(psql_exec "SELECT last_error FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'rt-tls-silent') AND retry_count >= 1;")
+  [ -n "$SILENT_ERR" ] && break
+  sleep 1
+done
+assert_contains "Silent TLS peer: handshake fails within 20 s" "TLS handshake failed" "$SILENT_ERR"
+assert_contains "Silent TLS peer: retryable" "RETRYABLE" "$SILENT_ERR"
+psql_quiet "SELECT ulak.disable_endpoint('rt-tls-silent');"
+kill "$SILENT_PID" 2>/dev/null || true
+
+# ═══════════════════════════════════════════════════
+# TEST 10: TLS certificate must match the host name
+# ═══════════════════════════════════════════════════
+header "TEST 10: TLS Host Name Verification"
+
+# hiredis checks only the chain, so the host name is checked separately. Same
+# CA, two certificates: one for another name, one for the configured host.
+TLS_PORT=16391
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TLS_TMP/ca.key" -out "$TLS_TMP/ca.pem" -days 1 -subj "/CN=ulak-e2e-ca" > /dev/null 2>&1
+for name in wrong.example "$WEBHOOK_HOST"; do
+  openssl req -newkey rsa:2048 -nodes -keyout "$TLS_TMP/$name.key" -out "$TLS_TMP/$name.csr" -subj "/CN=$name" > /dev/null 2>&1
+  printf "subjectAltName=DNS:%s\n" "$name" > "$TLS_TMP/$name.ext"
+  openssl x509 -req -in "$TLS_TMP/$name.csr" -CA "$TLS_TMP/ca.pem" -CAkey "$TLS_TMP/ca.key" -CAcreateserial -out "$TLS_TMP/$name.pem" -days 1 -extfile "$TLS_TMP/$name.ext" > /dev/null 2>&1
+done
+docker cp "$TLS_TMP/ca.pem" ulak-postgres-1:/tmp/ulak-e2e-redis-ca.pem > /dev/null
+docker exec ulak-postgres-1 chmod 644 /tmp/ulak-e2e-redis-ca.pem
+
+tls_server() {
+  python3 -c '
+import socket, ssl, sys
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(sys.argv[2], sys.argv[3])
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", int(sys.argv[1])))
+s.listen(16)
+while True:
+    c = s.accept()[0]
+    try:
+        t = ctx.wrap_socket(c, server_side=True)
+        t.recv(4096)
+        t.close()
+    except Exception:
+        c.close()
+' "$TLS_PORT" "$1" "$2" > /dev/null 2>&1 &
+  TLS_PID=$!
+  sleep 1
+}
+
+tls_error() {
+  local ep="$1" err=""
+  for _ in $(seq 1 20); do
+    err=$(psql_exec "SELECT last_error FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = '$ep') AND retry_count >= 1;")
+    [ -n "$err" ] && break
+    sleep 1
+  done
+  echo "$err"
+}
+
+tls_server "$TLS_TMP/wrong.example.pem" "$TLS_TMP/wrong.example.key"
+create_endpoint "rt-tls-wrong" "{\"host\": \"${WEBHOOK_HOST}\", \"port\": ${TLS_PORT}, \"stream_key\": \"rt-tls\", \"tls\": true, \"tls_ca_cert\": \"/tmp/ulak-e2e-redis-ca.pem\", \"connect_timeout\": 2}" "redis"
+send_msg "rt-tls-wrong" "{\"tls\": \"wrong-name\"}"
+WRONG_ERR=$(tls_error "rt-tls-wrong")
+assert_contains "Certificate for another name: refused" "hostname mismatch" "$WRONG_ERR"
+psql_quiet "SELECT ulak.disable_endpoint('rt-tls-wrong');"
+kill "$TLS_PID" 2>/dev/null || true
+sleep 1
+
+tls_server "$TLS_TMP/$WEBHOOK_HOST.pem" "$TLS_TMP/$WEBHOOK_HOST.key"
+create_endpoint "rt-tls-right" "{\"host\": \"${WEBHOOK_HOST}\", \"port\": ${TLS_PORT}, \"stream_key\": \"rt-tls\", \"tls\": true, \"tls_ca_cert\": \"/tmp/ulak-e2e-redis-ca.pem\", \"connect_timeout\": 2}" "redis"
+send_msg "rt-tls-right" "{\"tls\": \"right-name\"}"
+RIGHT_ERR=$(tls_error "rt-tls-right")
+TOTAL=$((TOTAL + 1))
+if [ -n "$RIGHT_ERR" ] && ! echo "$RIGHT_ERR" | grep -q "TLS"; then
+  # The stand-in server closes after the handshake, so XADD fails afterwards
+  echo -e "  ${GREEN}✓${NC} Certificate for the configured host: handshake accepted (then: ${RIGHT_ERR:0:60})"
+  PASS=$((PASS + 1))
+else
+  echo -e "  ${RED}✗${NC} Certificate for the configured host: unexpected error: ${RIGHT_ERR}"
+  FAIL=$((FAIL + 1))
+fi
+psql_quiet "SELECT ulak.disable_endpoint('rt-tls-right');"
+kill "$TLS_PID" 2>/dev/null || true
+docker exec ulak-postgres-1 rm -f /tmp/ulak-e2e-redis-ca.pem
+rm -rf "$TLS_TMP"
+
+# ═══════════════════════════════════════════════════
+# TEST 11: READONLY (node became a replica) is retryable
+# ═══════════════════════════════════════════════════
+header "TEST 11: READONLY / OOM Retryable"
+
+# After a failover the old primary answers writes with READONLY. Make the node
+# a replica of a master that does not exist: it keeps its data and answers
+# writes with READONLY.
+psql_quiet "DELETE FROM ulak.queue;"
+redis_del "rt-readonly"
+create_endpoint "rt-readonly" "{\"host\": \"${REDIS_HOST}\", \"stream_key\": \"rt-readonly\"}" "redis"
+redis_cmd REPLICAOF 127.0.0.1 6390 > /dev/null
+send_msg "rt-readonly" "{\"readonly\": true}"
+RO_ERR=""
+for _ in $(seq 1 20); do
+  RO_ERR=$(psql_exec "SELECT last_error FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'rt-readonly') AND retry_count >= 1;")
+  [ -n "$RO_ERR" ] && break
+  sleep 1
+done
+redis_cmd REPLICAOF NO ONE > /dev/null
+assert_contains "READONLY reply: retryable, not dead-lettered" "RETRYABLE" "$RO_ERR"
+assert_contains "READONLY reply: error kept" "READONLY" "$RO_ERR"
+psql_quiet "UPDATE ulak.queue SET next_retry_at = now() WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'rt-readonly');"
+RO_DONE=""
+for _ in $(seq 1 20); do
+  RO_DONE=$(psql_exec "SELECT status FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'rt-readonly');")
+  [ "$RO_DONE" = "completed" ] && break
+  sleep 1
+done
+assert_eq "Delivered once the node is a primary again" "completed" "$RO_DONE"
+assert_eq "Message in the stream" "1" "$(redis_xlen rt-readonly)"
+
+# ═══════════════════════════════════════════════════
 # CLEANUP
 # ═══════════════════════════════════════════════════
 

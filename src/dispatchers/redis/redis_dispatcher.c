@@ -354,6 +354,8 @@ bool redis_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char
             *error_msg = psprintf("%s Redis XADD error: %s", prefix, reply->str);
         }
         ulak_log("error", "Redis XADD error: %s", reply->str);
+        if (redis_error_needs_reconnect(reply->str))
+            redis_reconnect_on_next_use(redis);
         freeReplyObject(reply);
         return false;
     }
@@ -714,6 +716,7 @@ int redis_dispatcher_flush(Dispatcher *dispatcher, int timeout_ms, int64 **faile
     int i, success_count = 0, fail_count = 0;
     int pending;
     redisReply *reply;
+    bool reconnect = false;
 
     (void)timeout_ms; /* Redis pipeline flush is synchronous */
 
@@ -767,6 +770,8 @@ int redis_dispatcher_flush(Dispatcher *dispatcher, int timeout_ms, int64 **faile
             pm->success = false;
             snprintf(pm->error, sizeof(pm->error), "%s %s", prefix, reply->str);
             fail_count++;
+            if (redis_error_needs_reconnect(reply->str))
+                reconnect = true;
         } else {
             pm->success = false;
             snprintf(pm->error, sizeof(pm->error),
@@ -775,6 +780,10 @@ int redis_dispatcher_flush(Dispatcher *dispatcher, int timeout_ms, int64 **faile
         }
         freeReplyObject(reply);
     }
+
+    /* Every pipelined reply is read; only now can the connection go */
+    if (reconnect)
+        redis_reconnect_on_next_use(redis);
 
     /* Update last_successful_op if any success */
     if (success_count > 0) {
