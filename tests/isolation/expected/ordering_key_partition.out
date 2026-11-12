@@ -1,6 +1,12 @@
 Parsed test spec with 2 sessions
 
-starting permutation: w0_fetch w1_fetch w0_commit w1_commit
+starting permutation: w0_hash w0_fetch w1_fetch w0_commit w1_commit
+step w0_hash: SELECT hashtext('order-7000652638004') AS int32_min_hash;
+int32_min_hash
+--------------
+   -2147483648
+(1 row)
+
 step w0_fetch: 
     -- Lock then count via CTE (FOR UPDATE not allowed with aggregates).
     WITH locked AS (
@@ -8,7 +14,7 @@ step w0_fetch:
         FROM ulak.queue q
         WHERE q.status = 'pending'
           AND ((CASE WHEN q.ordering_key IS NULL THEN q.id
-                     ELSE abs(hashtext(q.ordering_key))::bigint
+                     ELSE abs(hashtext(q.ordering_key)::bigint)
                 END) % 2) = 0
         FOR UPDATE OF q SKIP LOCKED
     )
@@ -16,7 +22,7 @@ step w0_fetch:
 
 fetched
 -------
-      5
+      6
 (1 row)
 
 step w1_fetch: 
@@ -25,7 +31,7 @@ step w1_fetch:
         FROM ulak.queue q
         WHERE q.status = 'pending'
           AND ((CASE WHEN q.ordering_key IS NULL THEN q.id
-                     ELSE abs(hashtext(q.ordering_key))::bigint
+                     ELSE abs(hashtext(q.ordering_key)::bigint)
                 END) % 2) = 1
         FOR UPDATE OF q SKIP LOCKED
     )

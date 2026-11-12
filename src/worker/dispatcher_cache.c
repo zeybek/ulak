@@ -119,6 +119,14 @@ Dispatcher *get_or_create_dispatcher(int64 endpoint_id, ProtocolType proto_type,
     config_hash = hash_any((unsigned char *)config, VARSIZE(config));
 
     entry = hash_search(dispatcher_cache, &endpoint_id, HASH_ENTER, &found);
+    if (!found) {
+        /* dynahash fills in only the key, and recycles removed entries: clear
+         * the rest before dispatcher_create() can raise, or the cache
+         * teardown in the worker's error path frees a stale pointer. */
+        entry->dispatcher = NULL;
+        entry->config_hash = 0;
+        entry->last_used = GetCurrentTimestamp();
+    }
 
     if (found && entry->dispatcher) {
         if (entry->config_hash == config_hash) {
@@ -156,6 +164,24 @@ Dispatcher *get_or_create_dispatcher(int64 endpoint_id, ProtocolType proto_type,
 
     elog(DEBUG1, "[ulak] Created and cached dispatcher for endpoint %lld", (long long)endpoint_id);
     return entry->dispatcher;
+}
+
+void dispatcher_cache_invalidate(int64 endpoint_id) {
+    DispatcherCacheEntry *entry;
+    Dispatcher *dispatcher;
+
+    if (!dispatcher_cache)
+        return;
+
+    entry = hash_search(dispatcher_cache, &endpoint_id, HASH_FIND, NULL);
+    if (!entry)
+        return;
+
+    /* Unlink first: if dispatcher_free() raises, nothing points at it any more */
+    dispatcher = entry->dispatcher;
+    hash_search(dispatcher_cache, &endpoint_id, HASH_REMOVE, NULL);
+    if (dispatcher)
+        dispatcher_free(dispatcher);
 }
 
 void dispatcher_cache_exit_callback(int code, Datum arg) { dispatcher_cache_destroy(); }

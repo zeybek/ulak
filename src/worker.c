@@ -19,6 +19,7 @@
 #include "executor/spi.h"
 #include "storage/ipc.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
@@ -39,6 +40,12 @@ static int worker_id = 0;     /* This worker's ID (0 to total_workers-1) */
 static int total_workers = 1; /* Total number of workers for this database */
 
 static void ulak_worker_loop(void);
+
+/* Maintenance cadence on worker 0, in poll intervals (ulak.poll_interval):
+ * TTL expiry and archiving every ~5 s, the rest every ~30 s at the default */
+#define EXPIRE_EVERY_POLLS 10
+#define ARCHIVE_EVERY_POLLS 10
+#define MAINTENANCE_EVERY_POLLS 60
 
 /**
  * @brief SIGTERM signal handler.
@@ -71,6 +78,26 @@ static void ulak_sighup_handler(SIGNAL_ARGS) {
 }
 
 /**
+ * @brief Free this worker's registry slot (PID + latch) on any exit.
+ * @private
+ *
+ * A before_shmem_exit callback, so it also runs when the worker leaves
+ * through the bgworker error handler (an ERROR outside our PG_TRY, e.g.
+ * pg_cancel_backend() while waiting on the latch) and the loop epilogue is
+ * skipped. Otherwise the slot keeps the dead PID, the restarted worker cannot
+ * register its latch, and commit-time wake-ups never reach it again.
+ *
+ * @param code Exit code (unused).
+ * @param arg  Callback argument (unused).
+ */
+static void ulak_worker_shmem_exit(int code, Datum arg) {
+    (void)code;
+    (void)arg;
+    ulak_remove_worker_pid(worker_dboid, MyProcPid);
+    ulak_clear_worker();
+}
+
+/**
  * @brief Main entry point for background worker.
  *
  * This function is the single entry point for the ulak worker.
@@ -98,10 +125,33 @@ PGDLLEXPORT void ulak_worker_main(Datum main_arg) {
      */
     strlcpy(worker_dbname, ulak_database, NAMEDATALEN);
     BackgroundWorkerInitializeConnection(worker_dbname, NULL, 0);
+
+    /*
+     * No transaction of this worker waits for a synchronous standby: with the
+     * standby gone, SyncRepWaitForLSN() ends only on ProcDiePending, a query
+     * cancel or postmaster death, none of which our SIGTERM handler sets.
+     * The bookkeeping is idempotent and needs no standby durability; 'local'
+     * still flushes WAL. A session value outranks postgresql.conf, so a
+     * SIGHUP does not undo it.
+     */
+    SetConfigOption("synchronous_commit", "local", PGC_USERSET, PGC_S_SESSION);
+
+    /*
+     * SIGTERM cannot end a heavyweight-lock wait either. The claim never waits
+     * (SKIP LOCKED), but result writes, circuit-breaker updates, heartbeats and
+     * maintenance can queue behind another session's lock, e.g. an open admin
+     * transaction on an ulak.endpoints row. The timeout raises an ERROR that
+     * the catch paths handle, so a shutdown waits at most this long; 10 s is
+     * far above the normal waits.
+     */
+    SetConfigOption("lock_timeout", "10s", PGC_USERSET, PGC_S_SESSION);
+
     worker_dboid = MyDatabaseId;
     ulak_register_database(worker_dbname, worker_dboid);
     ulak_set_target_workers(worker_dboid, total_workers);
     (void)ulak_add_worker_pid(worker_dboid, MyProcPid, worker_id, MyLatch);
+    /* Runs after dispatcher_cache_exit_callback (callbacks run in reverse order) */
+    before_shmem_exit(ulak_worker_shmem_exit, (Datum)0);
 
     /* Set up signal handlers - MyLatch is now initialized */
     ulak_pqsignal(SIGTERM, ulak_sigterm_handler);
@@ -128,13 +178,98 @@ PGDLLEXPORT void ulak_worker_main(Datum main_arg) {
     /* Run the main worker loop */
     ulak_worker_loop();
 
-    /* Cleanup */
+    /* Cleanup (the registry slot is freed by ulak_worker_shmem_exit) */
     ulak_update_worker_activity(worker_dboid, worker_id);
-    ulak_remove_worker_pid(worker_dboid, MyProcPid);
-    ulak_clear_worker();
     ulak_worker_cleanup_libs();
 
-    proc_exit(0);
+    /*
+     * Exit code 1, not 0: the postmaster unregisters a background worker
+     * that exits with 0, so pg_terminate_backend() on a worker would leave
+     * its partition undelivered until the next server restart. Exit code 1
+     * restarts only this worker after bgw_restart_time
+     * (ulak.worker_restart_delay); any other code makes the postmaster reset
+     * the whole cluster. During a server shutdown nothing is restarted.
+     * Ref: postmaster.c CleanupBackend() and bgworker_should_start_now().
+     */
+    proc_exit(1);
+}
+
+/**
+ * @brief Sleep for an error backoff, returning early on SIGTERM.
+ * @private
+ *
+ * Waits on the latch rather than in pg_usleep(), which SIGTERM cannot
+ * interrupt. Wake-ups that arrive meanwhile are consumed; the next poll
+ * picks their rows up.
+ *
+ * @param timeout_ms Backoff length in milliseconds.
+ */
+static void ulak_worker_backoff(long timeout_ms) {
+    TimestampTz deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), timeout_ms);
+
+    while (!got_sigterm) {
+        long remaining = TimestampDifferenceMilliseconds(GetCurrentTimestamp(), deadline);
+        int rc;
+
+        if (remaining <= 0)
+            break;
+        rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, remaining,
+                       PG_WAIT_EXTENSION);
+        ResetLatch(MyLatch);
+        if (rc & WL_POSTMASTER_DEATH)
+            proc_exit(1);
+    }
+}
+
+/**
+ * @brief Run one maintenance task when its interval has passed.
+ * @private
+ *
+ * Time-based, not iteration-based: a busy worker re-arms its latch after
+ * every full batch, so counting iterations would run maintenance far more
+ * often than intended. The timestamp moves before the task runs and the task's
+ * errors are contained here, so a task that keeps failing is retried once
+ * per interval and never stops worker 0 from delivering its own partition.
+ *
+ * @param last_run    When the task last started; updated.
+ * @param interval_ms Minimum time between two runs.
+ * @param task        The maintenance function (manages its own transaction).
+ * @param name        Task name for the log.
+ */
+static void ulak_run_maintenance_task(TimestampTz *last_run, int interval_ms, void (*task)(void),
+                                      const char *name) {
+    MemoryContext caller_context = CurrentMemoryContext;
+    TimestampTz now = GetCurrentTimestamp();
+
+    if (*last_run != 0 && !TimestampDifferenceExceeds(*last_run, now, interval_ms))
+        return;
+    *last_run = now;
+
+    PG_TRY();
+    {
+        task();
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata;
+
+        /* errfinish() left us in ErrorContext, which CopyErrorData() refuses */
+        MemoryContextSwitchTo(caller_context);
+        edata = CopyErrorData();
+        FlushErrorState();
+        AbortCurrentTransaction();
+        MemoryContextSwitchTo(caller_context);
+        elog(WARNING, "[ulak] Maintenance task %s failed (non-fatal): %s", name,
+             edata->message ? edata->message : "unknown error");
+        FreeErrorData(edata);
+    }
+    PG_END_TRY();
+}
+
+static void recover_stale_at_startup(void) { recover_stale_processing_messages("worker restart"); }
+
+static void recover_stale_continuous(void) {
+    recover_stale_processing_messages("continuous recovery");
 }
 
 /**
@@ -148,9 +283,13 @@ PGDLLEXPORT void ulak_worker_main(Datum main_arg) {
  * error recovery with exponential backoff.
  */
 static void ulak_worker_loop(void) {
-    int ret;
+    MemoryContext loop_context = CurrentMemoryContext;
+    TimestampTz last_stale_check;
+    TimestampTz last_expire;
+    TimestampTz last_archive;
+    TimestampTz last_maintenance;
     int consecutive_errors = 0;
-    const int max_consecutive_errors = 10; /* Exit after 10 consecutive errors */
+    const int max_consecutive_errors = 10; /* Long backoff after 10 in a row */
     bool extension_ready = false;
     bool listener_registered = false;
     bool stale_recovery_done = false;
@@ -165,6 +304,9 @@ static void ulak_worker_loop(void) {
 
     /* Initialize dispatcher connection pool */
     dispatcher_cache_init();
+
+    /* Maintenance runs one interval after start (stale recovery also once at start) */
+    last_stale_check = last_expire = last_archive = last_maintenance = GetCurrentTimestamp();
 
     /* Main worker loop */
     while (!got_sigterm) {
@@ -251,52 +393,10 @@ static void ulak_worker_loop(void) {
             stale_recovery_done = true;
 
             if (worker_id == 0) {
-                PG_TRY();
-                {
-                    int stale_timeout_seconds = config_get_stale_recovery_timeout();
-                    int spi_ret;
-                    SetCurrentStatementStartTimestamp();
-                    StartTransactionCommand();
-                    spi_ret = SPI_connect();
-                    if (spi_ret == SPI_OK_CONNECT) {
-                        static const char *recovery_sql =
-                            "UPDATE ulak.queue SET status = 'pending', "
-                            "retry_count = retry_count + 1, "
-                            "last_error = 'Recovered from stale processing state (worker "
-                            "restart)', "
-                            "next_retry_at = NOW(), updated_at = NOW() "
-                            "WHERE status = 'processing' "
-                            "AND processing_started_at < NOW() - ($1 || ' seconds')::interval";
-                        Oid argtypes[1] = {TEXTOID};
-                        Datum values[1];
-                        char nulls[1] = {' '};
-                        char timeout_str[32];
+                TimestampTz never = 0;
 
-                        PushActiveSnapshot(GetTransactionSnapshot());
-                        snprintf(timeout_str, sizeof(timeout_str), "%d", stale_timeout_seconds);
-                        values[0] = CStringGetTextDatum(timeout_str);
-
-                        ret = SPI_execute_with_args(recovery_sql, 1, argtypes, values, nulls, false,
-                                                    0);
-                        if (ret == SPI_OK_UPDATE && SPI_processed > 0) {
-                            elog(LOG, "[ulak] Recovered %lu stale processing messages",
-                                 (unsigned long)SPI_processed);
-                        }
-                        PopActiveSnapshot();
-                        SPI_finish();
-                    }
-                    CommitTransactionCommand();
-                }
-                PG_CATCH();
-                {
-                    ErrorData *edata = CopyErrorData();
-                    FreeErrorData(edata);
-                    FlushErrorState();
-                    if (IsTransactionState())
-                        AbortCurrentTransaction();
-                    elog(WARNING, "[ulak] Stale recovery failed (non-fatal), continuing");
-                }
-                PG_END_TRY();
+                ulak_run_maintenance_task(&never, 0, recover_stale_at_startup,
+                                          "startup stale recovery");
             }
         }
 
@@ -308,57 +408,25 @@ static void ulak_worker_loop(void) {
         {
             /* Process messages on timeout or latch set */
             if ((rc & WL_TIMEOUT) || (rc & WL_LATCH_SET)) {
-                /* Periodic stale recovery check - only worker 0 to avoid contention */
-                if (worker_id == 0) {
-                    static int stale_check_counter = 0;
-                    int stale_check_interval =
-                        (config_get_stale_recovery_timeout() * 1000) / ulak_poll_interval;
-                    if (stale_check_interval < 1)
-                        stale_check_interval = 1;
-
-                    stale_check_counter++;
-                    if (stale_check_counter >= stale_check_interval) {
-                        recover_stale_processing_messages();
-                        stale_check_counter = 0;
-                    }
-                }
-
                 /*
                  * Maintenance tasks: only worker_id=0 runs these to avoid
                  * multiple workers fighting over the same rows (which causes
                  * lock contention and potential crashes under high concurrency).
+                 * TTL expiry every ~10 polls (5s at the default interval) is
+                 * plenty; each run scans every pending row.
                  */
                 if (worker_id == 0) {
-                    /* TTL expiry: every ~10 polls (5s at the default interval) is
-                     * plenty; running it on every poll was a full pending scan. */
-                    {
-                        static int expire_counter = 0;
-                        expire_counter++;
-                        if (expire_counter >= 10) {
-                            mark_expired_messages();
-                            expire_counter = 0;
-                        }
-                    }
-
-                    /* Periodically archive completed messages to prevent queue bloat */
-                    {
-                        static int archive_counter = 0;
-                        archive_counter++;
-                        if (archive_counter >= 10) {
-                            archive_completed_messages();
-                            archive_counter = 0;
-                        }
-                    }
-
-                    /* Run low-frequency maintenance tasks */
-                    {
-                        static int maintenance_counter = 0;
-                        maintenance_counter++;
-                        if (maintenance_counter >= 60) {
-                            run_periodic_maintenance();
-                            maintenance_counter = 0;
-                        }
-                    }
+                    ulak_run_maintenance_task(&last_stale_check,
+                                              config_get_stale_recovery_timeout() * 1000,
+                                              recover_stale_continuous, "stale recovery");
+                    ulak_run_maintenance_task(&last_expire, EXPIRE_EVERY_POLLS * ulak_poll_interval,
+                                              mark_expired_messages, "mark_expired_messages");
+                    ulak_run_maintenance_task(
+                        &last_archive, ARCHIVE_EVERY_POLLS * ulak_poll_interval,
+                        archive_completed_messages, "archive_completed_messages");
+                    ulak_run_maintenance_task(&last_maintenance,
+                                              MAINTENANCE_EVERY_POLLS * ulak_poll_interval,
+                                              run_periodic_maintenance, "periodic maintenance");
                 }
 
                 /* All workers process pending messages (hash/modulo partitioned).
@@ -383,11 +451,13 @@ static void ulak_worker_loop(void) {
             char sqlstate_buf[6];
 
             /*
-             * Copy error details to stack buffers BEFORE any cleanup.
-             * CopyErrorData pallocs in CurrentMemoryContext which
-             * AbortCurrentTransaction will destroy — so extract what
-             * we need first, then free, then abort.
+             * errfinish() leaves CurrentMemoryContext = ErrorContext, which
+             * CopyErrorData() asserts against and FlushErrorState() resets:
+             * staying there would make the next iteration allocate in a
+             * context that the next error wipes. Copy the error details to
+             * stack buffers before any cleanup, then free, then abort.
              */
+            MemoryContextSwitchTo(loop_context);
             edata = CopyErrorData();
             strlcpy(error_buf, edata->message ? edata->message : "unknown error",
                     sizeof(error_buf));
@@ -395,8 +465,11 @@ static void ulak_worker_loop(void) {
             FreeErrorData(edata);
             FlushErrorState();
 
-            if (IsTransactionState())
-                AbortCurrentTransaction();
+            /* Unconditional: an error raised while starting or committing a
+             * transaction leaves one that IsTransactionState() does not
+             * report; with no transaction this is a no-op. */
+            AbortCurrentTransaction();
+            MemoryContextSwitchTo(loop_context);
 
             /* Rows claimed by the interrupted batch go back to pending now
              * rather than after stale_recovery_timeout */
@@ -419,16 +492,15 @@ static void ulak_worker_loop(void) {
                 elog(WARNING, "[ulak] %d consecutive errors, worker sleeping for recovery",
                      consecutive_errors);
                 /*
-                 * DO NOT call proc_exit(1) here — PostgreSQL treats non-zero
-                 * exit as a crash and may restart the entire cluster.
-                 * Instead, sleep and reset the counter. The worker will
-                 * resume processing after the backoff period.
-                 * Ref: PostgreSQL postmaster HandleChildCrash().
+                 * Back off in place rather than exit: proc_exit(1) would only
+                 * restart this worker after ulak.worker_restart_delay, and not
+                 * at all with BGW_NEVER_RESTART. Sleep, reset the counter and
+                 * resume; SIGTERM still ends the sleep at once.
                  */
-                pg_usleep(30000000L); /* 30 second extended backoff */
+                ulak_worker_backoff(30000L); /* 30 second extended backoff */
                 consecutive_errors = 0;
             } else {
-                pg_usleep(1000000L); /* 1 second backoff */
+                ulak_worker_backoff(1000L); /* 1 second backoff */
             }
         }
         PG_END_TRY();

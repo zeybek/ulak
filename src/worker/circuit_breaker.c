@@ -12,16 +12,25 @@
 #include "executor/spi.h"
 #include "utils/builtins.h"
 
+#include "config/guc.h"
+
 bool cb_try_half_open_transition(int64 endpoint_id) {
-    Oid argtypes[1] = {INT8OID};
-    Datum values[1];
+    Oid argtypes[2] = {INT8OID, FLOAT8OID};
+    Datum values[2];
     int ret;
 
     values[0] = Int64GetDatum(endpoint_id);
+    values[1] = Float8GetDatum((double)ulak_circuit_breaker_cooldown);
 
-    ret = SPI_execute_with_args("UPDATE ulak.endpoints SET circuit_state = 'half_open' "
-                                "WHERE id = $1 AND circuit_state = 'open'",
-                                1, argtypes, values, NULL, false, 0);
+    /* While half_open, circuit_half_open_at is the probe deadline: until it
+     * passes every worker defers, afterwards one may send a new probe. */
+    ret = SPI_execute_with_args(
+        "UPDATE ulak.endpoints SET circuit_state = 'half_open', "
+        "circuit_half_open_at = NOW() + make_interval(secs => $2) "
+        "WHERE id = $1 AND ((circuit_state = 'open' AND circuit_half_open_at <= NOW()) "
+        "OR (circuit_state = 'half_open' AND (circuit_half_open_at IS NULL "
+        "OR circuit_half_open_at <= NOW())))",
+        2, argtypes, values, NULL, false, 0);
 
     return ret == SPI_OK_UPDATE && SPI_processed > 0;
 }
