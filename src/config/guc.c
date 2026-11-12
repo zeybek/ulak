@@ -65,7 +65,7 @@ bool ulak_http_enable_pipelining = true;
 #ifdef ENABLE_KAFKA
 int ulak_kafka_delivery_timeout = 30000;
 int ulak_kafka_poll_interval = 100;
-int ulak_kafka_flush_timeout = 1000;
+int ulak_kafka_flush_timeout = 5000;
 int ulak_kafka_batch_capacity = 64;
 char *ulak_kafka_acks = NULL;
 char *ulak_kafka_compression = NULL;
@@ -89,7 +89,7 @@ int ulak_redis_default_port = 6379;
 int ulak_amqp_connection_timeout = 10;
 int ulak_amqp_heartbeat = 60;
 int ulak_amqp_frame_max = 131072;
-int ulak_amqp_delivery_timeout = 5000;
+int ulak_amqp_delivery_timeout = 30000;
 int ulak_amqp_batch_capacity = 64;
 bool ulak_amqp_ssl_verify_peer = true;
 #endif /* ENABLE_AMQP */
