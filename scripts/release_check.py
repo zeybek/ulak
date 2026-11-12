@@ -90,7 +90,6 @@ def main() -> int:
     meta = json.loads(Path("META.json").read_text())
 
     errors: list[str] = []
-    fixed: list[str] = []
 
     control_version = extract_control_value(control, "default_version")
     if control_version != version:
@@ -110,14 +109,15 @@ def main() -> int:
 
     check_upgrade_chain(version, errors)
 
-    expected_sql_file = f"sql/ulak--{version}.sql"
+    # The source schema, which every checkout and archive has; the versioned
+    # install script is generated from it by make and changes name each release.
+    expected_sql_file = "sql/ulak.sql"
     if provides.get("file") != expected_sql_file:
-        provides["file"] = expected_sql_file
-        Path("META.json").write_text(json.dumps(meta, indent=2) + "\n")
-        fixed.append(f"Auto-fixed META.json provides.ulak.file to {expected_sql_file}")
-
-    for msg in fixed:
-        print(msg)
+        errors.append(
+            f"META.json provides.ulak.file={provides.get('file')!r} must be {expected_sql_file!r}"
+        )
+    elif not Path(expected_sql_file).exists():
+        errors.append(f"{expected_sql_file} is missing")
 
     if errors:
         print("Release metadata validation failed:", file=sys.stderr)

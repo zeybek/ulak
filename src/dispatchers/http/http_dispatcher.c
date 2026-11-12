@@ -368,7 +368,7 @@ bool http_dispatcher_validate_config(Jsonb *config) {
         ulak_log("error",
                  "HTTP config contains unknown key '%s'. "
                  "Allowed keys: url, method, headers, timeout, connect_timeout, "
-                 "signing_secret, cloudevents, ce_mode, ce_type, rate_limit, "
+                 "signing_secret, cloudevents, cloudevents_mode, cloudevents_type, rate_limit, "
                  "auth, tls_client_cert, tls_client_key, tls_ca_bundle, "
                  "tls_pinned_public_key, proxy, auto_disable_on_gone",
                  unknown_key ? unknown_key : "unknown");
@@ -407,12 +407,23 @@ bool http_dispatcher_validate_config(Jsonb *config) {
     }
 
     /* SSRF Protection: Block internal/private IP addresses
-     * Prevents requests to localhost, private networks, and cloud metadata endpoints
+     * Prevents requests to localhost, private networks, and cloud metadata endpoints.
+     * A host that does not resolve is refused with its own message: it is a typo
+     * or a DNS problem, not an internal address.
      */
-    if (http_is_internal_url(url_val.val.string.val, url_val.val.string.len)) {
-        ulak_log("error", "HTTP config URL targets internal/private network address "
-                          "(SSRF protection)");
-        return false;
+    {
+        HttpUrlTarget target =
+            http_classify_url_target(url_val.val.string.val, url_val.val.string.len);
+
+        if (target == HTTP_URL_TARGET_INTERNAL) {
+            ulak_log("error", "HTTP config URL targets internal/private network address "
+                              "(SSRF protection)");
+            return false;
+        }
+        if (target == HTTP_URL_TARGET_UNRESOLVED) {
+            ulak_log("error", "HTTP config URL host could not be resolved");
+            return false;
+        }
     }
 
     /* Validate HTTP method if provided */

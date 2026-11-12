@@ -46,6 +46,7 @@ typedef struct {
     bool deferred;             /* Put back to pending by the circuit breaker — skip dispatch */
     bool rate_limited;         /* Deferred by rate limiter — skip dispatch */
     int32 rate_limit_defer_ms; /* How long to defer a rate-limited message (next_retry_at) */
+    int32 retry_after_seconds; /* Server Retry-After from dispatch_ex, 0 = not set */
 } MessageBatchInfo;
 
 #endif /* ULAK_WORKER_BATCH_TYPES_H */

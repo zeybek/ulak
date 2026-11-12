@@ -96,11 +96,32 @@ bool http_validate_url_scheme(const char *url, size_t url_len);
  */
 bool http_url_has_userinfo(const char *url, size_t url_len);
 
+/** Where an http(s) URL points, as seen by the SSRF guard. */
+typedef enum HttpUrlTarget {
+    HTTP_URL_TARGET_PUBLIC,    /**< resolves only to public addresses (or the guard is off) */
+    HTTP_URL_TARGET_INTERNAL,  /**< localhost, an internal literal, or resolves to one */
+    HTTP_URL_TARGET_UNRESOLVED /**< no host, or the host did not resolve */
+} HttpUrlTarget;
+
+/**
+ * @brief Classify the host of an http(s) URL for SSRF protection.
+ *
+ * Internal means loopback, RFC 1918, link-local/metadata, CGNAT, 0.0.0.0/8,
+ * broadcast, IPv6 unspecified/loopback/link-local/unique-local, or an IPv4-
+ * mapped or NAT64 address carrying one of those. Always PUBLIC when the
+ * http_allow_internal_urls GUC is enabled.
+ *
+ * @param url      URL string to check (need not be NUL-terminated).
+ * @param url_len  Length of the URL string.
+ * @return HTTP_URL_TARGET_PUBLIC, HTTP_URL_TARGET_INTERNAL or HTTP_URL_TARGET_UNRESOLVED.
+ */
+HttpUrlTarget http_classify_url_target(const char *url, size_t url_len);
+
 /**
  * @brief Check if URL targets an internal/private IP address (SSRF protection).
  *
- * Blocks RFC 1918, loopback, link-local and CGNAT addresses unless
- * the http_allow_internal_urls GUC is enabled.
+ * Same as http_classify_url_target() == HTTP_URL_TARGET_INTERNAL: a host that
+ * does not resolve is not reported as internal.
  *
  * @param url      URL string to check.
  * @param url_len  Length of the URL string.
@@ -145,6 +166,33 @@ bool http_validate_proxy_url_scheme(const char *url, size_t url_len);
  */
 curl_socket_t ulak_http_opensocket_guard(void *clientp, curlsocktype purpose,
                                          struct curl_sockaddr *address);
+
+/* ============================================================================
+ * Response Classification (http_sync.c)
+ * ============================================================================ */
+
+/**
+ * @brief Parse the Retry-After header of a completed transfer.
+ *
+ * Integer delay-seconds only (RFC 9110 §10.2.3), accepted in 1..86400.
+ * Call it before the easy handle is reset or cleaned up.
+ *
+ * @param curl  Easy handle of the finished transfer.
+ * @return Delay in seconds, or 0 if absent, unparseable or libcurl < 7.84.
+ */
+int32 http_parse_retry_after(CURL *curl);
+
+/**
+ * @brief Whether a 4xx status is worth retrying.
+ *
+ * 429 Too Many Requests, 408 Request Timeout and 425 Too Early describe the
+ * moment, not the request; every other 4xx (except 410 and the OAuth2 401,
+ * which have their own handling) is permanent.
+ *
+ * @param response_code  HTTP status code in 400..499.
+ * @return true for 408, 425 and 429.
+ */
+bool http_status_is_retryable_4xx(long response_code);
 
 /* ============================================================================
  * Webhook Signing Functions (http_request.c)

@@ -31,7 +31,7 @@ static natsMsg *nats_build_msg(NatsDispatcher *nats, const char *payload, int64 
                                Jsonb *per_msg_headers) {
     natsMsg *msg = NULL;
     natsStatus s;
-    char msg_id_str[32];
+    char msg_id_str[96];
 
     s = natsMsg_Create(&msg, nats->subject, NULL, payload, (int)strlen(payload));
     if (s != NATS_OK)
@@ -39,7 +39,7 @@ static natsMsg *nats_build_msg(NatsDispatcher *nats, const char *payload, int64 
 
     /* Set Nats-Msg-Id for JetStream deduplication */
     if (nats->jetstream && msg_id > 0) {
-        snprintf(msg_id_str, sizeof(msg_id_str), "%lld", (long long)msg_id);
+        snprintf(msg_id_str, sizeof(msg_id_str), "%s%lld", nats->msg_id_prefix, (long long)msg_id);
         natsMsgHeader_Set(msg, "Nats-Msg-Id", msg_id_str);
     }
 
@@ -144,6 +144,10 @@ static bool nats_message_id_from_msg(natsMsg *msg, int64 *msg_id) {
         msg_id_str[0] == '\0')
         return false;
 
+    /* "ulak-<system identifier>-<database oid>-<row id>": the row id is last */
+    if (strrchr(msg_id_str, '-') != NULL)
+        msg_id_str = strrchr(msg_id_str, '-') + 1;
+
     parsed = strtoll(msg_id_str, &end, 10);
     if (end == msg_id_str || (end != NULL && *end != '\0') || parsed <= 0)
         return false;
@@ -195,7 +199,7 @@ static void nats_mark_pending_failure(NatsDispatcher *nats, natsMsg *msg, natsSt
     if (!nats_message_id_from_msg(msg, &msg_id))
         return;
 
-    prefix = (js_err_code != 0) ? nats_classify_js_error(js_err_code) : nats_classify_error(status);
+    prefix = nats_classify_publish_error(status, js_err_code);
     status_text = err_text ? err_text : natsStatus_GetText(status);
 
     pthread_mutex_lock(&nats->pending_lock);
@@ -317,8 +321,7 @@ bool nats_dispatcher_dispatch(Dispatcher *self, const char *payload, char **erro
         natsMsg_Destroy(msg);
 
         if (s != NATS_OK) {
-            const char *prefix =
-                (jerr != 0) ? nats_classify_js_error(jerr) : nats_classify_error(s);
+            const char *prefix = nats_classify_publish_error(s, jerr);
             *error_msg = psprintf("%s NATS JetStream publish failed: %s (js_err=%d)", prefix,
                                   natsStatus_GetText(s), jerr);
             return false;
@@ -395,8 +398,7 @@ bool nats_dispatcher_dispatch_ex(Dispatcher *self, const char *payload, Jsonb *h
         natsMsg_Destroy(msg);
 
         if (s != NATS_OK) {
-            const char *prefix =
-                (jerr != 0) ? nats_classify_js_error(jerr) : nats_classify_error(s);
+            const char *prefix = nats_classify_publish_error(s, jerr);
             result->success = false;
             result->error_msg =
                 psprintf("%s NATS JetStream publish failed: %s", prefix, natsStatus_GetText(s));

@@ -30,8 +30,19 @@ int get_max_retries_from_policy(Jsonb *retry_policy) {
     /* Parse retry_policy JSON to extract max_retries */
     if (extract_jsonb_value(retry_policy, "max_retries", &max_retries_val)) {
         if (max_retries_val.type == jbvNumeric) {
-            max_retries = DatumGetInt32(
-                DirectFunctionCall1(numeric_int4, NumericGetDatum(max_retries_val.val.numeric)));
+            bool out_of_range = false;
+
+            /* Not numeric_int4: its "integer out of range" ERROR is raised in
+             * the worker's result transaction, which then puts the whole
+             * batch back with no retry charged, on every cycle. A huge value
+             * means "retry practically forever"; anything else falls back. */
+            max_retries = numeric_int4_opt_error(max_retries_val.val.numeric, &out_of_range);
+            if (out_of_range)
+                return DatumGetBool(DirectFunctionCall2(
+                           numeric_gt, NumericGetDatum(max_retries_val.val.numeric),
+                           DirectFunctionCall1(int4_numeric, Int32GetDatum(0))))
+                           ? PG_INT32_MAX
+                           : ulak_default_max_retries;
             if (max_retries > 0)
                 return max_retries;
         }

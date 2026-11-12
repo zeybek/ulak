@@ -116,6 +116,109 @@ SELECT count(*) = 2 AS health_component_count
 FROM ulak.health_check();
 
 -- ============================================================================
+-- ENQUEUE LIMITS COME FROM THE SERVER SETTINGS (ulak._limit_setting)
+-- ============================================================================
+
+SELECT ulak._limit_setting('max_payload_size') AS max_payload_size,
+       ulak._limit_setting('max_queue_size') AS max_queue_size;
+
+-- Both are SIGHUP settings: a session cannot raise them for itself
+DO $$
+BEGIN
+    PERFORM set_config('ulak.max_payload_size', '104857600', false);
+    RAISE NOTICE 'session SET accepted (unexpected)';
+EXCEPTION WHEN cant_change_runtime_param THEN
+    RAISE NOTICE 'session SET of max_payload_size refused (%)', SQLSTATE;
+END $$;
+
+DO $$
+BEGIN
+    PERFORM ulak._limit_setting('max_retries');
+EXCEPTION WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'unknown limit refused: %', SQLERRM;
+END $$;
+
+-- ============================================================================
+-- PAYLOAD LIMIT ON EVERY ENTRY POINT (default ulak.max_payload_size = 1 MB)
+-- ============================================================================
+
+SELECT ulak.create_event_type('ph_evt') IS NOT NULL AS evt_created;
+SELECT ulak.subscribe('ph_evt', 'ph_ep') IS NOT NULL AS sub_created;
+
+CREATE TEMP TABLE ph_big AS
+SELECT jsonb_build_object('d', repeat('x', 1100000)) AS p;
+
+DO $$
+DECLARE
+    v_big jsonb := (SELECT p FROM ph_big);
+    v_calls text[] := ARRAY[
+        'send', 'send_with_options', 'send_batch', 'send_batch_with_priority',
+        'publish', 'publish_batch'];
+    v_call text;
+BEGIN
+    FOREACH v_call IN ARRAY v_calls LOOP
+        BEGIN
+            CASE v_call
+                WHEN 'send' THEN PERFORM ulak.send('ph_ep', v_big);
+                WHEN 'send_with_options' THEN PERFORM ulak.send_with_options('ph_ep', v_big);
+                WHEN 'send_batch' THEN
+                    PERFORM ulak.send_batch('ph_ep', ARRAY['{"small": 1}'::jsonb, v_big]);
+                WHEN 'send_batch_with_priority' THEN
+                    PERFORM ulak.send_batch_with_priority('ph_ep', ARRAY[v_big], 5::smallint);
+                WHEN 'publish' THEN PERFORM ulak.publish('ph_evt', v_big);
+                WHEN 'publish_batch' THEN
+                    PERFORM ulak.publish_batch(jsonb_build_array(
+                        jsonb_build_object('event_type', 'ph_evt', 'payload', '{"small": 1}'::jsonb),
+                        jsonb_build_object('event_type', 'ph_evt', 'payload', v_big)));
+            END CASE;
+            RAISE NOTICE '%: accepted (unexpected)', v_call;
+        EXCEPTION WHEN program_limit_exceeded THEN
+            RAISE NOTICE '%: rejected (%)', v_call, SQLSTATE;
+        END;
+    END LOOP;
+END $$;
+
+-- Nothing from the rejected calls reached the queue
+SELECT count(*) AS oversized_rows FROM ulak.queue
+WHERE endpoint_id = (SELECT endpoint_id FROM ph_ids)
+  AND octet_length(payload::text) > 1000000;
+
+-- Payloads under the limit are still accepted
+SELECT cardinality(ulak.send_batch('ph_ep', ARRAY['{"a": 1}'::jsonb, '{"b": 2}'::jsonb])) AS small_batch;
+SELECT ulak.publish('ph_evt', '{"small": true}'::jsonb) AS published;
+
+DROP TABLE ph_big;
+
+-- ============================================================================
+-- BACKPRESSURE COUNTS THE WHOLE BATCH (default ulak.max_queue_size = 1000000)
+-- ============================================================================
+
+-- A batch larger than the limit is refused even though the queue is nearly empty
+DO $$
+DECLARE
+    v_payloads jsonb[] := array_fill('{}'::jsonb, ARRAY[1000001]);
+BEGIN
+    BEGIN
+        PERFORM ulak.send_batch('ph_ep', v_payloads);
+        RAISE NOTICE 'send_batch: accepted (unexpected)';
+    EXCEPTION WHEN configuration_limit_exceeded THEN
+        RAISE NOTICE 'send_batch: rejected (%)', SQLSTATE;
+    END;
+    BEGIN
+        PERFORM ulak.send_batch_with_priority('ph_ep', v_payloads, 1::smallint);
+        RAISE NOTICE 'send_batch_with_priority: accepted (unexpected)';
+    EXCEPTION WHEN configuration_limit_exceeded THEN
+        RAISE NOTICE 'send_batch_with_priority: rejected (%)', SQLSTATE;
+    END;
+END $$;
+
+SELECT count(*) AS queued_after_backpressure FROM ulak.queue
+WHERE endpoint_id = (SELECT endpoint_id FROM ph_ids)
+  AND payload = '{}'::jsonb;
+
+SELECT ulak.drop_event_type('ph_evt') AS evt_dropped;
+
+-- ============================================================================
 -- CLEANUP
 -- ============================================================================
 

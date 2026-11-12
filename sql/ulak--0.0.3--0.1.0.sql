@@ -40,6 +40,9 @@
 -- upgraded database is catalog-identical to a fresh 0.1.0 install
 -- (verified with a pg_catalog diff during development).
 
+-- complain if script is sourced in psql, rather than via ALTER EXTENSION
+\echo Use "ALTER EXTENSION ulak UPDATE TO '0.1.0'" to load this file. \quit
+
 -- ---------------------------------------------------------------------------
 -- Indexes
 -- ---------------------------------------------------------------------------

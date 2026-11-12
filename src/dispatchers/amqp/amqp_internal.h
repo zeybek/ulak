@@ -118,6 +118,18 @@ const char *amqp_reply_error_string(amqp_rpc_reply_t reply, char *buffer, size_t
 bool amqp_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char **error_msg);
 
 /**
+ * @brief Publish one message and wait for its publisher confirm.
+ *
+ * @param amqp       The AMQP dispatcher.
+ * @param payload    Message payload.
+ * @param msg_id     Queue row id for the message_id property, or 0 when the
+ *                   caller has none (a process-unique id is used then).
+ * @param error_msg  OUT - prefixed error on failure (caller must pfree).
+ * @return true once the broker acked the message and did not return it.
+ */
+bool amqp_dispatch_sync(AmqpDispatcher *amqp, const char *payload, int64 msg_id, char **error_msg);
+
+/**
  * @brief Extended dispatch with headers, metadata, and result capture.
  *
  * Captures delivery_tag and confirm status in DispatchResult.

@@ -12,6 +12,7 @@
 
 #include "amqp_internal.h"
 #include "config/guc.h"
+#include "miscadmin.h"
 #include "postgres.h"
 #include "storage/spin.h"
 #include "utils/logging.h"
@@ -19,6 +20,48 @@
 /* Error prefix constants */
 #define ERROR_PREFIX_RETRYABLE "[RETRYABLE]"
 #define ERROR_PREFIX_PERMANENT "[PERMANENT]"
+
+/** Prefix of the message_id property; the rest is the queue row id. */
+#define AMQP_MESSAGE_ID_PREFIX "msg_"
+
+/**
+ * @private
+ * @brief Process-unique id for callers that do not know the queue row id.
+ *
+ * Same scheme as the HTTP dispatcher's fallback: pid in the high half, a
+ * counter in the low half, never a delivery tag (those restart at 1 on every
+ * connection).
+ *
+ * @return Fallback id.
+ */
+static int64 amqp_fallback_msg_id(void) {
+    static uint32 counter = 0;
+
+    counter++;
+    return ((int64)MyProcPid << 32) | (int64)counter;
+}
+
+/**
+ * @private
+ * @brief Read the id back from a returned message's message_id property.
+ * @param message_id Property value ("msg_<id>").
+ * @return The id, or 0 if the value is not ours.
+ */
+static int64 amqp_parse_message_id(amqp_bytes_t message_id) {
+    char buf[64];
+    size_t prefix_len = strlen(AMQP_MESSAGE_ID_PREFIX);
+    char *end;
+    long long id;
+
+    if (message_id.len <= prefix_len || message_id.len >= sizeof(buf))
+        return 0;
+    memcpy(buf, message_id.bytes, message_id.len);
+    buf[message_id.len] = '\0';
+    if (strncmp(buf, AMQP_MESSAGE_ID_PREFIX, prefix_len) != 0)
+        return 0;
+    id = strtoll(buf + prefix_len, &end, 10);
+    return *end == '\0' ? (int64)id : 0;
+}
 
 /**
  * @brief Process publisher confirms from the broker.
@@ -57,6 +100,7 @@ int amqp_process_confirms(AmqpDispatcher *amqp, int timeout_ms) {
 
         if (status != AMQP_STATUS_OK) {
             ulak_log("warning", "AMQP wait frame error: %s", amqp_error_string2(status));
+            amqp->connected = false;
             return -1;
         }
 
@@ -121,15 +165,51 @@ int amqp_process_confirms(AmqpDispatcher *amqp, int timeout_ms) {
                          (unsigned long)delivery_tag, multiple);
 
             } else if (frame.payload.method.id == AMQP_BASIC_RETURN_METHOD) {
-                /* Message was returned (e.g., mandatory flag set, no queue) */
+                /*
+                 * A mandatory publish that no queue took. The broker follows
+                 * it with a basic.ack (not a nack) for the same publish, sent
+                 * after the return, so the ack alone would mark a lost message
+                 * delivered: fail it here, matched by its message_id.
+                 */
                 amqp_basic_return_t *ret = (amqp_basic_return_t *)frame.payload.method.decoded;
+                amqp_message_t returned;
+                amqp_rpc_reply_t read_reply;
+                int reply_code = ret->reply_code;
+                char reply_text[128];
+                int64 returned_id = 0;
+
+                snprintf(reply_text, sizeof(reply_text), "%.*s", (int)ret->reply_text.len,
+                         (char *)ret->reply_text.bytes);
                 ulak_log("warning",
-                         "AMQP message returned: reply_code=%d, reply_text=%.*s, "
+                         "AMQP message returned: reply_code=%d, reply_text=%s, "
                          "exchange=%.*s, routing_key=%.*s",
-                         ret->reply_code, (int)ret->reply_text.len, (char *)ret->reply_text.bytes,
-                         (int)ret->exchange.len, (char *)ret->exchange.bytes,
-                         (int)ret->routing_key.len, (char *)ret->routing_key.bytes);
-                /* Note: We'll get a NACK for this message later, so we don't need to handle it here */
+                         reply_code, reply_text, (int)ret->exchange.len,
+                         (char *)ret->exchange.bytes, (int)ret->routing_key.len,
+                         (char *)ret->routing_key.bytes);
+
+                /* The returned content (header + body frames) follows the method */
+                read_reply = amqp_read_message(amqp->conn, frame.channel, &returned, 0);
+                if (read_reply.reply_type != AMQP_RESPONSE_NORMAL) {
+                    err = amqp_reply_error_string(read_reply, err_buffer, sizeof(err_buffer));
+                    ulak_log("error", "AMQP failed to read returned message: %s", err);
+                    amqp->connected = false;
+                    return -1;
+                }
+                if (returned.properties._flags & AMQP_BASIC_MESSAGE_ID_FLAG)
+                    returned_id = amqp_parse_message_id(returned.properties.message_id);
+                amqp_destroy_message(&returned);
+
+                for (int i = 0; returned_id != 0 && i < amqp->pending_count; i++) {
+                    AmqpPendingMessage *pm = &amqp->pending_messages[i];
+                    if (pm->published_id == returned_id && !pm->confirmed) {
+                        pm->confirmed = true;
+                        pm->success = false;
+                        snprintf(pm->error, AMQP_ERROR_BUFFER_SIZE,
+                                 "AMQP message returned by broker: %d %s", reply_code, reply_text);
+                        confirms_processed++;
+                        break;
+                    }
+                }
 
             } else if (frame.payload.method.id == AMQP_CONNECTION_CLOSE_METHOD ||
                        frame.payload.method.id == AMQP_CHANNEL_CLOSE_METHOD) {
@@ -158,15 +238,17 @@ int amqp_process_confirms(AmqpDispatcher *amqp, int timeout_ms) {
  *
  * @param amqp AMQP dispatcher instance
  * @param payload Message payload string
+ * @param published_id Id for the message_id property (queue row id or fallback)
  * @param delivery_tag_out Output delivery tag assigned to this message
  * @param error_msg Output error message on failure
  * @return true if message was published, false on failure
  */
-static bool amqp_publish_message(AmqpDispatcher *amqp, const char *payload,
+static bool amqp_publish_message(AmqpDispatcher *amqp, const char *payload, int64 published_id,
                                  uint64_t *delivery_tag_out, char **error_msg) {
     amqp_bytes_t exchange;
     amqp_bytes_t routing_key;
     amqp_basic_properties_t props;
+    char msg_id_buf[64];
     int status;
 
     if (!amqp || !payload) {
@@ -195,12 +277,12 @@ static bool amqp_publish_message(AmqpDispatcher *amqp, const char *payload,
     props.timestamp = (uint64_t)time(NULL);
     props.app_id = amqp_cstring_bytes("ulak");
 
-    /* Generate message_id from delivery tag for traceability */
-    {
-        char msg_id_buf[64];
-        snprintf(msg_id_buf, sizeof(msg_id_buf), "pgx-%lu", (unsigned long)amqp->next_delivery_tag);
-        props.message_id = amqp_cstring_bytes(msg_id_buf);
-    }
+    /* message_id = queue row id: unique, stable across retries, and how a
+     * basic.return is matched to its pending entry. Delivery tags restart at 1
+     * on every connection, so they cannot serve as an id. */
+    snprintf(msg_id_buf, sizeof(msg_id_buf), AMQP_MESSAGE_ID_PREFIX "%lld",
+             (long long)published_id);
+    props.message_id = amqp_cstring_bytes(msg_id_buf);
 
     /* Get current delivery tag before publish */
     if (delivery_tag_out) {
@@ -219,6 +301,9 @@ static bool amqp_publish_message(AmqpDispatcher *amqp, const char *payload,
                                   amqp_error_string2(status));
         }
         ulak_log("warning", "AMQP basic_publish failed: %s", amqp_error_string2(status));
+        /* The socket can look valid after the broker closed the connection;
+         * reconnect on the next attempt instead of failing it the same way */
+        amqp->connected = false;
         return false;
     }
 
@@ -239,8 +324,26 @@ static bool amqp_publish_message(AmqpDispatcher *amqp, const char *payload,
  * @return true on successful delivery and confirm, false on failure
  */
 bool amqp_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char **error_msg) {
-    AmqpDispatcher *amqp;
+    if (!dispatcher || !dispatcher->private_data) {
+        if (error_msg)
+            *error_msg = pstrdup("Invalid AMQP dispatcher");
+        return false;
+    }
+
+    return amqp_dispatch_sync((AmqpDispatcher *)dispatcher->private_data, payload, 0, error_msg);
+}
+
+/**
+ * @brief Publish one message and wait for its publisher confirm.
+ * @param amqp AMQP dispatcher instance
+ * @param payload Message payload string
+ * @param msg_id Queue row id, or 0 if unknown
+ * @param error_msg Output error message on failure
+ * @return true on successful delivery and confirm, false on failure
+ */
+bool amqp_dispatch_sync(AmqpDispatcher *amqp, const char *payload, int64 msg_id, char **error_msg) {
     uint64_t delivery_tag;
+    int64 published_id = msg_id > 0 ? msg_id : amqp_fallback_msg_id();
     int delivery_timeout;
     int poll_interval;
     int elapsed_ms;
@@ -248,16 +351,8 @@ bool amqp_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char 
     bool success;
     struct timespec start_time, now_time;
 
-    if (!dispatcher || !dispatcher->private_data) {
-        if (error_msg)
-            *error_msg = pstrdup("Invalid AMQP dispatcher");
-        return false;
-    }
-
-    amqp = (AmqpDispatcher *)dispatcher->private_data;
-
     /* Publish the message */
-    if (!amqp_publish_message(amqp, payload, &delivery_tag, error_msg)) {
+    if (!amqp_publish_message(amqp, payload, published_id, &delivery_tag, error_msg)) {
         return false;
     }
 
@@ -276,7 +371,8 @@ bool amqp_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char 
     SpinLockAcquire(&amqp->pending_lock);
     if (amqp->pending_count < amqp->pending_capacity) {
         AmqpPendingMessage *pm = &amqp->pending_messages[amqp->pending_count];
-        pm->msg_id = 0; /* No queue row ID for sync dispatch */
+        pm->msg_id = msg_id;
+        pm->published_id = published_id;
         pm->delivery_tag = delivery_tag;
         pm->confirmed = false;
         pm->success = false;
@@ -314,7 +410,7 @@ bool amqp_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char 
                 confirmed = true;
                 success = pm->success;
                 if (!success && error_msg && pm->error[0] != '\0') {
-                    *error_msg = pstrdup(pm->error);
+                    *error_msg = psprintf(ERROR_PREFIX_RETRYABLE " %s", pm->error);
                 }
                 break;
             }
@@ -339,7 +435,7 @@ bool amqp_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char 
     }
 
     if (!success) {
-        ulak_log("warning", "AMQP message delivery failed (NACK'd by broker)");
+        ulak_log("warning", "AMQP message delivery failed (NACK'd or returned by broker)");
         if (error_msg && *error_msg == NULL) {
             *error_msg = pstrdup(ERROR_PREFIX_RETRYABLE " AMQP message NACK'd by broker");
         }
@@ -389,7 +485,7 @@ bool amqp_dispatcher_produce(Dispatcher *dispatcher, const char *payload, int64 
     }
 
     /* Publish the message (connection ensured inside) */
-    if (!amqp_publish_message(amqp, payload, &delivery_tag, error_msg)) {
+    if (!amqp_publish_message(amqp, payload, msg_id, &delivery_tag, error_msg)) {
         return false;
     }
 
@@ -397,6 +493,7 @@ bool amqp_dispatcher_produce(Dispatcher *dispatcher, const char *payload, int64 
     index = amqp->pending_count;
     pm = &amqp->pending_messages[index];
     pm->msg_id = msg_id;
+    pm->published_id = msg_id;
     pm->delivery_tag = delivery_tag;
     pm->confirmed = false;
     pm->success = false;

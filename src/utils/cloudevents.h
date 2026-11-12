@@ -20,6 +20,9 @@
 #define CE_MODE_BINARY 1     /**< Attributes as HTTP headers (ce-*). */
 #define CE_MODE_STRUCTURED 2 /**< Full JSON envelope. */
 
+/** Content-Type of a structured-mode request (CloudEvents JSON event format). */
+#define CE_STRUCTURED_CONTENT_TYPE "application/cloudevents+json"
+
 /* CloudEvents spec version */
 #define CE_SPECVERSION "1.0"
 

@@ -160,6 +160,47 @@ static int kafka_elapsed_ms(struct timespec *start) {
  * ============================================================================ */
 
 /**
+ * @private
+ * @brief Take a fresh opaque for a synchronous produce.
+ *
+ * Caller holds pending_lock. The opaque is never NULL and never looks like a
+ * batch slot (see KAFKA_OPAQUE_SYNC).
+ *
+ * @param kd Kafka dispatcher
+ * @return Opaque to pass with RD_KAFKA_V_OPAQUE
+ */
+static void *kafka_next_sync_opaque(KafkaDispatcher *kd) {
+    void *opaque;
+
+    do {
+        kd->sync_seq++;
+        opaque = KAFKA_OPAQUE_SYNC(kd->sync_seq);
+    } while (opaque == NULL);
+    kd->sync_opaque = (uintptr_t)opaque;
+    return opaque;
+}
+
+/**
+ * @private
+ * @brief Give up on a synchronous produce that timed out.
+ *
+ * The row is reported retryable, so the message must not stay queued and go
+ * out later (librdkafka keeps it until message.timeout.ms): purge what is
+ * still in the local queue. A message already in flight may still land; its
+ * report no longer matches sync_opaque and is ignored.
+ *
+ * @param kd Kafka dispatcher
+ */
+static void kafka_abandon_sync_produce(KafkaDispatcher *kd) {
+    SpinLockAcquire(&kd->pending_lock);
+    kd->sync_opaque = 0;
+    SpinLockRelease(&kd->pending_lock);
+
+    rd_kafka_purge(kd->producer, RD_KAFKA_PURGE_F_QUEUE);
+    rd_kafka_poll(kd->producer, 0);
+}
+
+/**
  * @brief Dispatch a single Kafka message synchronously.
  * @param dispatcher Dispatcher instance
  * @param payload Message payload string
@@ -180,6 +221,7 @@ bool kafka_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char
     const char *prefix;
     struct timespec start_time;
     rd_kafka_headers_t *hdrs;
+    void *sync_opaque;
 
     kafka_dispatcher = (KafkaDispatcher *)dispatcher->private_data;
 
@@ -198,6 +240,7 @@ bool kafka_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char
     kafka_dispatcher->last_partition = -1;
     kafka_dispatcher->last_offset = -1;
     kafka_dispatcher->last_timestamp = 0;
+    sync_opaque = kafka_next_sync_opaque(kafka_dispatcher);
     SpinLockRelease(&kafka_dispatcher->pending_lock);
 
     /* Build headers from static config (dispatch() path has no per-message headers) */
@@ -210,7 +253,7 @@ bool kafka_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char
         RD_KAFKA_V_VALUE((void *)payload, strlen(payload)),
         RD_KAFKA_V_KEY(kafka_dispatcher->key,
                        kafka_dispatcher->key ? strlen(kafka_dispatcher->key) : 0),
-        RD_KAFKA_V_HEADERS(hdrs), RD_KAFKA_V_OPAQUE(NULL), RD_KAFKA_V_END);
+        RD_KAFKA_V_HEADERS(hdrs), RD_KAFKA_V_OPAQUE(sync_opaque), RD_KAFKA_V_END);
 
     if (err) {
         /* On failure we still own the headers */
@@ -253,6 +296,7 @@ bool kafka_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char
     SpinLockRelease(&kafka_dispatcher->pending_lock);
 
     if (!final_completed) {
+        kafka_abandon_sync_produce(kafka_dispatcher);
         ulak_log("warning", "Kafka message delivery timed out after %d ms", delivery_timeout);
         if (error_msg) {
             *error_msg =
@@ -264,10 +308,11 @@ bool kafka_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char
 
     if (!final_success) {
         err_str = err_copy[0] != '\0' ? err_copy : ERROR_PREFIX_RETRYABLE " Unknown error";
-        ulak_log("warning", "Kafka message delivery failed: %s", err_str);
+        ulak_log("warning", "%s", err_str);
         if (error_msg) {
-            /* err_copy already contains the classification prefix from callback */
-            *error_msg = psprintf("Kafka message delivery failed: %s", err_str);
+            /* err_copy is "<prefix> Kafka message delivery failed: ..." (callback);
+             * the worker only sees a prefix at the start of the string */
+            *error_msg = pstrdup(err_str);
         }
         return false;
     }
@@ -533,6 +578,10 @@ int kafka_dispatcher_flush(Dispatcher *dispatcher, int timeout_ms, int64 **faile
                 ulak_log("warning", "Kafka flush timed out, some messages may not be delivered");
             }
         }
+        /* Messages still in the local queue would otherwise be sent long after
+         * their rows were reported retryable (duplicates on retry); purging them
+         * makes their reports arrive now, with RD_KAFKA_RESP_ERR__PURGE_QUEUE */
+        rd_kafka_purge(kafka_dispatcher->producer, RD_KAFKA_PURGE_F_QUEUE);
         /* Final poll to process any remaining callbacks */
         rd_kafka_poll(kafka_dispatcher->producer, 0);
     }
@@ -667,6 +716,7 @@ bool kafka_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, J
     const char *prefix;
     struct timespec start_time;
     rd_kafka_headers_t *hdrs;
+    void *sync_opaque;
     const char *msg_key;
     size_t msg_key_len;
     JsonbValue key_val;
@@ -701,6 +751,7 @@ bool kafka_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, J
     kafka_dispatcher->last_partition = -1;
     kafka_dispatcher->last_offset = -1;
     kafka_dispatcher->last_timestamp = 0;
+    sync_opaque = kafka_next_sync_opaque(kafka_dispatcher);
     SpinLockRelease(&kafka_dispatcher->pending_lock);
 
     /* Build headers from static config + per-message headers */
@@ -711,7 +762,7 @@ bool kafka_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, J
         kafka_dispatcher->producer, RD_KAFKA_V_TOPIC(kafka_dispatcher->topic),
         RD_KAFKA_V_PARTITION(kafka_dispatcher->partition), RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
         RD_KAFKA_V_VALUE((void *)payload, strlen(payload)), RD_KAFKA_V_KEY(msg_key, msg_key_len),
-        RD_KAFKA_V_HEADERS(hdrs), RD_KAFKA_V_OPAQUE(NULL), RD_KAFKA_V_END);
+        RD_KAFKA_V_HEADERS(hdrs), RD_KAFKA_V_OPAQUE(sync_opaque), RD_KAFKA_V_END);
 
     if (err) {
         if (hdrs)
@@ -769,6 +820,7 @@ bool kafka_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, J
     SpinLockRelease(&kafka_dispatcher->pending_lock);
 
     if (!final_completed) {
+        kafka_abandon_sync_produce(kafka_dispatcher);
         if (result) {
             result->success = false;
             result->error_msg =
@@ -782,7 +834,7 @@ bool kafka_dispatcher_dispatch_ex(Dispatcher *dispatcher, const char *payload, J
         err_str = err_copy[0] != '\0' ? err_copy : ERROR_PREFIX_RETRYABLE " Unknown error";
         if (result) {
             result->success = false;
-            result->error_msg = psprintf("Kafka message delivery failed: %s", err_str);
+            result->error_msg = pstrdup(err_str);
         }
         return false;
     }

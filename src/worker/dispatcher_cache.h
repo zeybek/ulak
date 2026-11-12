@@ -54,6 +54,16 @@ extern Dispatcher *get_or_create_dispatcher(int64 endpoint_id, ProtocolType prot
                                             Jsonb *config);
 
 /**
+ * @brief Drop one endpoint's cached dispatcher, freeing it.
+ *
+ * Used after an error raised mid-delivery, when the dispatcher may hold a
+ * half-finished batch. No-op when the endpoint has no entry.
+ *
+ * @param endpoint_id Endpoint ID (hash key).
+ */
+extern void dispatcher_cache_invalidate(int64 endpoint_id);
+
+/**
  * @brief before_shmem_exit callback -- guaranteed cleanup on worker exit.
  *
  * Register via before_shmem_exit(dispatcher_cache_exit_callback, 0).

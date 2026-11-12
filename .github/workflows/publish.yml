@@ -17,6 +17,9 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # Passed to the shell through the environment, never interpolated into the
+  # script: the dispatch input is free text.
+  INPUT_TAG: ${{ inputs.tag }}
 
 permissions:
   contents: read
@@ -49,16 +52,16 @@ jobs:
         id: version
         run: |
           # workflow_dispatch input takes precedence; tag-push uses GITHUB_REF_NAME
-          if [ -n "${{ inputs.tag }}" ]; then
-            VERSION="${{ inputs.tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            VERSION="$INPUT_TAG"
           else
             VERSION="${GITHUB_REF_NAME}"
           fi
-          VERSION="${VERSION#v}"
-          if [ -z "$VERSION" ]; then
-            echo "::error::Could not determine version from inputs.tag or GITHUB_REF_NAME"
+          if ! printf '%s' "$VERSION" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::Not a release tag: '${VERSION}' (expected vX.Y.Z)"
             exit 1
           fi
+          VERSION="${VERSION#v}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building version: ${VERSION}"
 
@@ -67,14 +70,15 @@ jobs:
         run: |
           # For workflow_dispatch backfill: checkout the requested tag so the
           # Dockerfile build context matches that release.
-          git fetch --tags --depth=1 origin "refs/tags/${{ inputs.tag }}:refs/tags/${{ inputs.tag }}"
-          git checkout "${{ inputs.tag }}"
+          git fetch --tags --depth=1 origin "refs/tags/${INPUT_TAG}:refs/tags/${INPUT_TAG}"
+          git checkout "refs/tags/${INPUT_TAG}"
 
       - name: Compute short version (major.minor)
         id: shortver
+        env:
+          FULL: ${{ steps.version.outputs.version }}
         run: |
           # 0.1.2 → 0.1 ; non-semver inputs fall back to full version
-          FULL="${{ steps.version.outputs.version }}"
           SHORT="$(echo "$FULL" | awk -F. '{ if (NF >= 2) print $1"."$2; else print $0 }')"
           echo "value=${SHORT}" >> "$GITHUB_OUTPUT"
 
@@ -122,17 +126,22 @@ jobs:
         run: |
           # Tag-push: pg<N> is updated atomically, prefer that.
           # workflow_dispatch backfill: pull the version-suffixed tag instead.
-          if [ -n "${{ inputs.tag }}" ]; then
-            VERSION="${{ inputs.tag }}"
-            VERSION="${VERSION#v}"
+          if [ -n "$INPUT_TAG" ]; then
+            if ! printf '%s' "$INPUT_TAG" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+              echo "::error::Not a release tag: '${INPUT_TAG}' (expected vX.Y.Z)"
+              exit 1
+            fi
+            VERSION="${INPUT_TAG#v}"
             echo "value=${VERSION}-pg${{ matrix.pg }}" >> "$GITHUB_OUTPUT"
           else
             echo "value=pg${{ matrix.pg }}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Pull and test image
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.value }}
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.value }}"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
           docker pull "$IMAGE"
 
           # Start container
@@ -141,7 +150,7 @@ jobs:
             "$IMAGE"
 
           # Wait for PG to start
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if docker exec test-pg pg_isready -U postgres 2>/dev/null; then
               break
             fi

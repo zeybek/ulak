@@ -262,6 +262,145 @@ QMSG=$(rabbit_queue_messages "at-confirm")
 assert_eq "200 in RabbitMQ queue" "200" "$QMSG"
 
 # ═══════════════════════════════════════════════════
+# TEST 8: mandatory publish that no queue takes
+# ═══════════════════════════════════════════════════
+header "TEST 8: mandatory + Unroutable"
+
+# RabbitMQ answers with basic.return and then basic.ack; the row must fail
+# (retryable) instead of being completed by the ack.
+psql_quiet "DELETE FROM ulak.queue;"
+rabbit_delete_queue "at-unroutable"
+create_endpoint "at-unroutable" "{\"host\": \"${AMQP_HOST}\", \"port\": ${AMQP_PORT}, \"exchange\": \"\", \"routing_key\": \"at-unroutable\", \"mandatory\": true, \"username\": \"${AMQP_USER}\", \"password\": \"${AMQP_PASS}\"}" "amqp"
+send_msg "at-unroutable" "{\"test\": \"unroutable\"}"
+UR_ERR=""
+for _ in $(seq 1 20); do
+  UR_ERR=$(psql_exec "SELECT last_error FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'at-unroutable') AND retry_count >= 1;")
+  [ -n "$UR_ERR" ] && break
+  sleep 1
+done
+UR_STATUS=$(psql_exec "SELECT status FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'at-unroutable');")
+assert_eq "Unroutable mandatory message is not completed" "pending" "$UR_STATUS"
+assert_contains "Error names the broker's return" "returned by broker: 312" "$UR_ERR"
+
+# Once a queue exists for the routing key, the retry delivers it
+rabbit_declare_queue "at-unroutable"
+psql_quiet "UPDATE ulak.queue SET next_retry_at = now() WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'at-unroutable');"
+UR_DONE=""
+for _ in $(seq 1 20); do
+  UR_DONE=$(psql_exec "SELECT status FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'at-unroutable');")
+  [ "$UR_DONE" = "completed" ] && break
+  sleep 1
+done
+assert_eq "Delivered after the queue is declared" "completed" "$UR_DONE"
+assert_eq "One message in the queue" "1" "$(rabbit_queue_messages at-unroutable)"
+
+# ═══════════════════════════════════════════════════
+# TEST 9: message_id is the queue row id
+# ═══════════════════════════════════════════════════
+header "TEST 9: message_id = msg_<row id>"
+
+# Delivery tags restart at 1 on every connection, so they cannot be the id.
+psql_quiet "DELETE FROM ulak.queue;"
+rabbit_delete_queue "at-msgid"
+rabbit_declare_queue "at-msgid"
+create_endpoint "at-msgid" "{\"host\": \"${AMQP_HOST}\", \"port\": ${AMQP_PORT}, \"exchange\": \"\", \"routing_key\": \"at-msgid\", \"username\": \"${AMQP_USER}\", \"password\": \"${AMQP_PASS}\"}" "amqp"
+send_msg "at-msgid" "{\"test\": \"msgid\"}"
+wait_queue_drain 15
+ROW_ID=$(psql_exec "SELECT q.id FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'at-msgid';")
+if docker exec ulak-rabbitmq-1 sh -c 'command -v rabbitmqadmin' > /dev/null 2>&1; then
+  # rabbitmqadmin 2.x (RabbitMQ 4 images) prints a table row with
+  # 'message_id: "<id>"'; 1.x takes key=value arguments and has -f raw_json
+  GOT_ID=$(docker exec ulak-rabbitmq-1 rabbitmqadmin --non-interactive get messages --queue at-msgid --ack-mode ack_requeue_true 2>/dev/null \
+    | grep -o 'message_id: "[^"]*"' | head -1 | sed 's/message_id: "\(.*\)"/\1/')
+  if [ -z "$GOT_ID" ]; then
+    GOT_ID=$(docker exec ulak-rabbitmq-1 rabbitmqadmin get queue=at-msgid ackmode=ack_requeue_true -f raw_json 2>/dev/null \
+      | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['properties'].get('message_id','MISSING'))" 2>/dev/null)
+  fi
+  assert_eq "message_id carries the row id" "msg_${ROW_ID}" "$GOT_ID"
+else
+  echo -e "  ${YELLOW}⊘${NC} skipped: rabbitmqadmin not available in the broker image"
+  SKIP=$((SKIP + 1))
+fi
+
+# ═══════════════════════════════════════════════════
+# TEST 10: First publish after the broker dropped an idle connection
+# ═══════════════════════════════════════════════════
+header "TEST 10: Idle Past the Heartbeat"
+
+# librabbitmq only handles heartbeats inside library calls, so an idle worker
+# sends none and the broker closes the connection after two missed intervals.
+psql_quiet "DELETE FROM ulak.queue;"
+rabbit_delete_queue "at-idle"
+rabbit_declare_queue "at-idle"
+create_endpoint "at-idle" "{\"host\": \"${AMQP_HOST}\", \"port\": ${AMQP_PORT}, \"exchange\": \"\", \"routing_key\": \"at-idle\", \"heartbeat\": 2, \"username\": \"${AMQP_USER}\", \"password\": \"${AMQP_PASS}\"}" "amqp"
+# One ordering_key, so both rows land on the same worker and the second one
+# finds that worker's idle connection (with ulak.workers > 1 they would
+# otherwise likely go to different workers and connections).
+psql_quiet "SELECT ulak.send_with_options('at-idle', '{\"idle\": 1}'::jsonb, p_ordering_key := 'at-idle');"
+wait_queue_drain 15
+sleep 12
+psql_quiet "SELECT ulak.send_with_options('at-idle', '{\"idle\": 2}'::jsonb, p_ordering_key := 'at-idle');"
+IDLE_DONE=""
+for _ in $(seq 1 30); do
+  IDLE_DONE=$(psql_exec "SELECT status || ':' || retry_count FROM ulak.queue WHERE payload->>'idle' = '2';")
+  case "$IDLE_DONE" in completed:*) break ;; esac
+  sleep 1
+done
+assert_eq "Publish after idle: delivered on the first attempt" "completed:0" "$IDLE_DONE"
+echo "  last_error of the second message: $(psql_exec "SELECT coalesce(last_error, '-') FROM ulak.queue WHERE payload->>'idle' = '2';")"
+
+# ═══════════════════════════════════════════════════
+# TEST 11: Broker that stops answering after login
+# ═══════════════════════════════════════════════════
+header "TEST 11: Synchronous RPC Bounded (channel.open)"
+
+# librabbitmq waits for synchronous replies (channel.open-ok, confirm.select-ok)
+# forever unless amqp_set_rpc_timeout is set. A proxy on the Docker host
+# relays to RabbitMQ until the client sends channel.open and then drops
+# everything the broker says. The row must fail [RETRYABLE] within about
+# ulak.amqp_connection_timeout, and the same worker must go on: a row of
+# another endpoint in the same partition is delivered afterwards.
+psql_quiet "DELETE FROM ulak.queue;"
+rabbit_delete_queue "at-after-stall"
+rabbit_declare_queue "at-after-stall"
+STALL_PORT=5673
+python3 "$SCRIPT_DIR/fixtures/amqp-stall-proxy.py" "$STALL_PORT" localhost "$AMQP_PORT" > /dev/null 2>&1 &
+STALL_PID=$!
+sleep 1
+CONN_TIMEOUT=$(psql_exec "SELECT current_setting('ulak.amqp_connection_timeout');")
+WORKERS=$(psql_exec "SELECT current_setting('ulak.workers');")
+# Two ordering keys in the same partition, so one worker handles both rows
+KEY_B=$(psql_exec "SELECT k FROM (SELECT 'at-b-' || g AS k FROM generate_series(1, 1000) g) s WHERE abs(hashtext(k)::bigint) % ${WORKERS} = abs(hashtext('at-a')::bigint) % ${WORKERS} LIMIT 1;")
+
+create_endpoint "at-stall" "{\"host\": \"${WEBHOOK_HOST}\", \"port\": ${STALL_PORT}, \"exchange\": \"\", \"routing_key\": \"at-after-stall\", \"username\": \"${AMQP_USER}\", \"password\": \"${AMQP_PASS}\"}" "amqp"
+create_endpoint "at-after-stall" "{\"host\": \"${AMQP_HOST}\", \"port\": ${AMQP_PORT}, \"exchange\": \"\", \"routing_key\": \"at-after-stall\", \"username\": \"${AMQP_USER}\", \"password\": \"${AMQP_PASS}\"}" "amqp"
+STALL_START=$(date +%s)
+psql_quiet "SELECT ulak.send_with_options('at-stall', '{\"stall\": \"a\"}'::jsonb, p_ordering_key := 'at-a');"
+sleep 2
+psql_quiet "SELECT ulak.send_with_options('at-after-stall', '{\"stall\": \"b\"}'::jsonb, p_ordering_key := '${KEY_B}');"
+
+STALL_ERR=""
+STALL_SECS=""
+LIMIT=$((CONN_TIMEOUT + 15))
+for _ in $(seq 1 $LIMIT); do
+  STALL_ERR=$(psql_exec "SELECT last_error FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'at-stall') AND retry_count >= 1;")
+  if [ -n "$STALL_ERR" ]; then STALL_SECS=$(( $(date +%s) - STALL_START )); break; fi
+  sleep 1
+done
+echo "  stalled row after ${STALL_SECS:-?} s (connection timeout ${CONN_TIMEOUT} s): ${STALL_ERR:0:110}"
+assert_eq "Stalled channel.open: [RETRYABLE]" "[RETRYABLE]" "${STALL_ERR:0:11}"
+assert_contains "Stalled channel.open: failed in channel open" "channel open failed" "$STALL_ERR"
+B_DONE=""
+for _ in $(seq 1 $LIMIT); do
+  B_DONE=$(psql_exec "SELECT status FROM ulak.queue WHERE endpoint_id = (SELECT id FROM ulak.endpoints WHERE name = 'at-after-stall');")
+  [ "$B_DONE" = "completed" ] && break
+  sleep 1
+done
+assert_eq "Same worker delivers the next row afterwards" "completed" "$B_DONE"
+psql_quiet "SELECT ulak.disable_endpoint('at-stall');"
+kill "$STALL_PID" 2>/dev/null || true
+
+# ═══════════════════════════════════════════════════
 # CLEANUP
 # ═══════════════════════════════════════════════════
 
@@ -269,7 +408,7 @@ psql_quiet "DELETE FROM ulak.dlq;"
 psql_quiet "DELETE FROM ulak.queue;"
 psql_quiet "DO \$\$ DECLARE r RECORD; BEGIN FOR r IN SELECT name FROM ulak.endpoints WHERE name LIKE 'at-%' LOOP BEGIN PERFORM ulak.drop_endpoint(r.name); EXCEPTION WHEN OTHERS THEN NULL; END; END LOOP; END; \$\$;"
 
-for q in at-single at-batch at-fan-1 at-fan-2 at-fan-3 at-persist at-throughput at-confirm; do
+for q in at-single at-batch at-fan-1 at-fan-2 at-fan-3 at-persist at-throughput at-confirm at-unroutable at-msgid at-idle at-after-stall; do
   rabbit_delete_queue "$q"
 done
 

@@ -18,7 +18,8 @@ build/
 dist/
 
 # PostgreSQL build artifacts - generated versioned SQL files
-sql/ulak--?.?.?.sql
+sql/ulak--*.sql
+!sql/ulak--*--*.sql
 
 # Development files
 .vscode/

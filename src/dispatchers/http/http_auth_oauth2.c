@@ -24,6 +24,13 @@
 /* Default timeout for token endpoint requests */
 #define TOKEN_FETCH_TIMEOUT_SECS 10
 
+/* Largest token response accepted; anything bigger aborts the transfer */
+#define TOKEN_RESPONSE_MAX_BYTES 65536
+
+/* After a failed fetch, fail the following requests at once for this long
+ * instead of paying the fetch timeout again for every row of the batch */
+#define TOKEN_FAILURE_BACKOFF_SECS 10
+
 /** @brief Response buffer for token fetch. */
 typedef struct {
     char *data;
@@ -43,15 +50,29 @@ typedef struct {
 static size_t token_write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t total = size * nmemb;
     ResponseBuffer *buf = (ResponseBuffer *)userp;
+    size_t needed = buf->size + total + 1;
 
-    if (buf->size + total >= buf->capacity) {
+    if (needed > buf->capacity) {
+        size_t new_capacity = buf->capacity;
+        char *new_data;
+
         /* Cap at 64KB to prevent abuse */
-        if (buf->capacity >= 65536)
+        if (needed > TOKEN_RESPONSE_MAX_BYTES)
             return 0;
-        buf->capacity = (buf->capacity == 0) ? 4096 : buf->capacity * 2;
-        if (buf->capacity > 65536)
-            buf->capacity = 65536;
-        buf->data = repalloc(buf->data, buf->capacity);
+        /* One chunk can be up to CURL_MAX_WRITE_SIZE (16 KB), so a single
+         * doubling of the 4 KB start is not always enough */
+        while (new_capacity < needed)
+            new_capacity *= 2;
+        if (new_capacity > TOKEN_RESPONSE_MAX_BYTES)
+            new_capacity = TOKEN_RESPONSE_MAX_BYTES;
+
+        /* Copy by hand so the old block (part of a token) is zeroed */
+        new_data = palloc(new_capacity);
+        memcpy(new_data, buf->data, buf->size);
+        explicit_bzero(buf->data, buf->capacity);
+        pfree(buf->data);
+        buf->data = new_data;
+        buf->capacity = new_capacity;
     }
 
     memcpy(buf->data + buf->size, contents, total);
@@ -77,6 +98,7 @@ static bool oauth2_fetch_token(HttpAuthConfig *auth) {
     Jsonb *json_response;
     char *access_token;
     int32 expires_in;
+    int32 expiry_buffer;
     MemoryContext old_ctx;
 
     curl = curl_easy_init();
@@ -150,13 +172,14 @@ static bool oauth2_fetch_token(HttpAuthConfig *auth) {
         return false;
     }
 
-    /* Parse JSON response */
-    json_response = string_to_jsonb(response.data);
+    /* Parse JSON response; a non-JSON 200 (form-encoded reply, proxy page)
+     * is a failed fetch, not an ERROR */
+    json_response = string_to_jsonb_safe(response.data);
     explicit_bzero(response.data, response.size);
     pfree(response.data);
 
     if (!json_response) {
-        elog(WARNING, "[ulak] OAuth2: failed to parse token response as JSON");
+        elog(WARNING, "[ulak] OAuth2: token response is not valid JSON");
         return false;
     }
 
@@ -178,7 +201,12 @@ static bool oauth2_fetch_token(HttpAuthConfig *auth) {
     auth->config.oauth2.cache.access_token_len = strlen(access_token);
     MemoryContextSwitchTo(old_ctx);
 
-    auth->config.oauth2.cache.expires_at = time(NULL) + expires_in - TOKEN_EXPIRY_BUFFER_SECS;
+    /* A token shorter-lived than twice the buffer would be expired on arrival
+     * and fetched again for every message; keep it for half its lifetime */
+    expiry_buffer = TOKEN_EXPIRY_BUFFER_SECS;
+    if (expires_in < 2 * TOKEN_EXPIRY_BUFFER_SECS)
+        expiry_buffer = expires_in > 0 ? expires_in / 2 : 0;
+    auth->config.oauth2.cache.expires_at = time(NULL) + expires_in - expiry_buffer;
 
     elog(DEBUG1, "[ulak] OAuth2: token fetched, expires in %d seconds", expires_in);
 
@@ -202,11 +230,18 @@ struct curl_slist *http_auth_oauth2_apply(HttpAuthConfig *auth, CURL *curl,
     /* Check if cached token is still valid */
     if (!auth->config.oauth2.cache.access_token ||
         time(NULL) >= auth->config.oauth2.cache.expires_at) {
-        if (!oauth2_fetch_token(auth)) {
-            elog(WARNING, "[ulak] OAuth2: token fetch failed, cannot authenticate");
+        if (time(NULL) < auth->config.oauth2.cache.failed_until) {
+            /* Token endpoint failed moments ago: do not wait on it again per row */
             *auth_error = true;
             return headers;
         }
+        if (!oauth2_fetch_token(auth)) {
+            elog(WARNING, "[ulak] OAuth2: token fetch failed, cannot authenticate");
+            auth->config.oauth2.cache.failed_until = time(NULL) + TOKEN_FAILURE_BACKOFF_SECS;
+            *auth_error = true;
+            return headers;
+        }
+        auth->config.oauth2.cache.failed_until = 0;
     }
 
     /* Add Authorization header */

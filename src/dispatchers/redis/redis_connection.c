@@ -43,15 +43,33 @@ bool redis_is_permanent_error(const char *error_str) {
     if (strstr(error_str, "WRONGTYPE") != NULL)
         return true;
 
-    /* Server resource issues */
-    if (strstr(error_str, "OOM") != NULL)
-        return true;
-
-    /* Read-only replica */
-    if (strstr(error_str, "READONLY") != NULL)
-        return true;
+    /* OOM (maxmemory reached) clears once memory is evicted or trimmed, and
+     * READONLY (the node became a replica) once the client reaches the new
+     * primary: both are retryable, see redis_error_needs_reconnect() */
 
     return false;
+}
+
+/**
+ * @brief Whether a Redis error reply means this connection points at the wrong node.
+ *
+ * After a failover the old primary answers writes with READONLY; keeping the
+ * connection would fail every later message the same way.
+ *
+ * @param error_str Redis error string
+ * @return true if the caller should drop the connection and resolve the host again
+ */
+bool redis_error_needs_reconnect(const char *error_str) {
+    return error_str && strncmp(error_str, "READONLY", 8) == 0;
+}
+
+/**
+ * @brief Drop the connection and the cached address after a READONLY reply.
+ * @param redis Redis dispatcher instance
+ */
+void redis_reconnect_on_next_use(RedisDispatcher *redis) {
+    redis_disconnect_internal(redis);
+    redis->resolved_ip[0] = '\0';
 }
 
 /* ------------------------------------------------------------------------
@@ -260,7 +278,7 @@ bool redis_connect_internal(RedisDispatcher *redis, char **error_msg) {
 
     if (redis->tls) {
         /* TLS connection */
-        redisSSLContext *ssl_ctx;
+        SSL_CTX *ssl_ctx;
 
         /* Create SSL context */
         ssl_ctx = redis_tls_create_context(redis->tls_ca_cert, redis->tls_cert, redis->tls_key,
@@ -290,8 +308,12 @@ bool redis_connect_internal(RedisDispatcher *redis, char **error_msg) {
             return false;
         }
 
+        /* redisConnectWithTimeout bounds only connect(); without a socket timeout
+         * the blocking handshake waits forever on a peer that never answers */
+        redisSetTimeout(redis->context, timeout);
+
         /* Initiate SSL handshake */
-        if (!redis_tls_initiate(redis->context, redis->ssl_context, error_msg)) {
+        if (!redis_tls_initiate(redis->context, redis->ssl_context, redis->host, error_msg)) {
             redisFree(redis->context);
             redis->context = NULL;
             redis_tls_cleanup(redis->ssl_context);

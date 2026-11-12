@@ -235,33 +235,55 @@ fi
 # ═══════════════════════════════════════════════════
 header "TEST 6: JetStream Missing Stream Does Not Complete"
 
-psql_quiet "DELETE FROM ulak.queue;"
-psql_quiet "DELETE FROM ulak.dlq;"
-nats_purge_stream "NTTEST"
+# No stream captures the subject, so the broker answers "no responders". The
+# asynchronous batch path (capture_response off) and the synchronous path
+# (capture_response on) report that differently (cnats turns it into
+# JSNotEnabledErr on a sync publish); both must keep the rows for retry.
+CAPTURE_AUTO=$(psql_exec "SELECT coalesce(sourcefile LIKE '%postgresql.auto.conf', false) FROM pg_settings WHERE name = 'ulak.capture_response';")
+CAPTURE_SAVED=$(psql_exec "SHOW ulak.capture_response;")
 
 create_endpoint "nt-js-missing-stream" "{\"url\": \"nats://${NATS_HOST}:${NATS_PORT}\", \"subject\": \"missing.stream\", \"jetstream\": true}" "nats"
 
-psql_quiet "
-DO \$\$ DECLARE a jsonb[];
-BEGIN
-  a := ARRAY(SELECT jsonb_build_object('missing_stream', g) FROM generate_series(1, 5) g);
-  PERFORM ulak.send_batch('nt-js-missing-stream', a);
-END; \$\$;"
+for CAPTURE_MODE in off on; do
+  section "capture_response = ${CAPTURE_MODE}"
+  psql_quiet "DELETE FROM ulak.queue;"
+  psql_quiet "DELETE FROM ulak.dlq;"
+  nats_purge_stream "NTTEST"
+  docker exec ulak-postgres-1 psql -U postgres -d "$DB" -q -c "ALTER SYSTEM SET ulak.capture_response = ${CAPTURE_MODE};" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
+  sleep 1
 
-for i in $(seq 1 30); do
-  ATTEMPTED=$(psql_exec "SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'nt-js-missing-stream' AND (q.status = 'completed' OR q.status = 'failed' OR q.retry_count > 0 OR q.last_error IS NOT NULL);")
-  [ "$ATTEMPTED" = "5" ] && break
-  sleep 0.5
+  psql_quiet "
+  DO \$\$ DECLARE a jsonb[];
+  BEGIN
+    a := ARRAY(SELECT jsonb_build_object('missing_stream', g) FROM generate_series(1, 5) g);
+    PERFORM ulak.send_batch('nt-js-missing-stream', a);
+  END; \$\$;"
+
+  # attempted = no longer pending/processing without an error, in the queue or the DLQ
+  for i in $(seq 1 40); do
+    ATTEMPTED=$(psql_exec "SELECT (SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'nt-js-missing-stream' AND q.status <> 'processing' AND (q.status IN ('completed', 'failed') OR q.retry_count > 0 OR q.last_error IS NOT NULL)) + (SELECT count(*) FROM ulak.dlq d JOIN ulak.endpoints e ON d.endpoint_id = e.id WHERE e.name = 'nt-js-missing-stream');")
+    [ "$ATTEMPTED" = "5" ] && break
+    sleep 0.5
+  done
+
+  COMPLETED=$(psql_exec "SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE q.status = 'completed' AND e.name = 'nt-js-missing-stream';")
+  NOT_COMPLETED=$(psql_exec "SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE q.status = 'pending' AND q.last_error LIKE '[RETRYABLE]%' AND e.name = 'nt-js-missing-stream';")
+  DEAD=$(psql_exec "SELECT count(*) FROM ulak.dlq d JOIN ulak.endpoints e ON d.endpoint_id = e.id WHERE e.name = 'nt-js-missing-stream';")
+  MSGS=$(nats_stream_msgs "NTTEST")
+  echo "  last_error: $(psql_exec "SELECT left(coalesce(max(q.last_error), '-'), 110) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'nt-js-missing-stream';")"
+
+  assert_eq "Missing-stream messages attempted (capture ${CAPTURE_MODE})" "5" "$ATTEMPTED"
+  assert_eq "Missing-stream messages not completed (capture ${CAPTURE_MODE})" "0" "$COMPLETED"
+  assert_eq "Missing-stream messages pending for retry, [RETRYABLE] (capture ${CAPTURE_MODE})" "5" "$NOT_COMPLETED"
+  assert_eq "None dead-lettered (capture ${CAPTURE_MODE})" "0" "$DEAD"
+  assert_eq "No messages persisted to unrelated stream (capture ${CAPTURE_MODE})" "0" "$MSGS"
 done
 
-COMPLETED=$(psql_exec "SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE q.status = 'completed' AND e.name = 'nt-js-missing-stream';")
-NOT_COMPLETED=$(psql_exec "SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE q.status IN ('pending','failed') AND e.name = 'nt-js-missing-stream';")
-MSGS=$(nats_stream_msgs "NTTEST")
-
-assert_eq "Missing-stream messages attempted" "5" "$ATTEMPTED"
-assert_eq "Missing-stream messages not completed" "0" "$COMPLETED"
-assert_eq "Missing-stream messages remain retry/failed" "5" "$NOT_COMPLETED"
-assert_eq "No messages persisted to unrelated stream" "0" "$MSGS"
+if [ "$CAPTURE_AUTO" = "t" ]; then
+  docker exec ulak-postgres-1 psql -U postgres -d "$DB" -q -c "ALTER SYSTEM SET ulak.capture_response = ${CAPTURE_SAVED};" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
+else
+  docker exec ulak-postgres-1 psql -U postgres -d "$DB" -q -c "ALTER SYSTEM RESET ulak.capture_response;" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
+fi
 
 # ═══════════════════════════════════════════════════
 # TEST 7: Error Classification
@@ -286,6 +308,38 @@ assert_eq "Failed message still pending" "pending" "$STATUS"
 # Verify connection error is logged (worker log shows WARNING)
 NATS_ERRS=$(docker logs ulak-postgres-1 2>&1 | grep -c "NATS connection failed to nats://nonexistent-host")
 assert_gt "Connection error logged" "0" "$NATS_ERRS"
+
+# ═══════════════════════════════════════════════════
+# TEST 9: Nats-Msg-Id is namespaced per installation
+# ═══════════════════════════════════════════════════
+header "TEST 9: Nats-Msg-Id Namespace"
+
+# Row ids repeat across databases, and JetStream drops a repeated Nats-Msg-Id
+# inside the stream's duplicate window. Publish a foreign message with the
+# next bare row id first; ulak's message must still be stored.
+psql_quiet "DELETE FROM ulak.queue;"
+nats_purge_stream "NTTEST"
+create_endpoint "nt-msgid" "{\"url\": \"nats://${NATS_HOST}:${NATS_PORT}\", \"subject\": \"nt.msgid\", \"jetstream\": true}" "nats"
+NEXT_ID=$(psql_exec "SELECT last_value + 1 FROM ulak.queue_id_seq;")
+docker exec ulak-postgres-1 nats -s "nats://${NATS_HOST}:${NATS_PORT}" pub nt.msgid "foreign" -H "Nats-Msg-Id:${NEXT_ID}" > /dev/null 2>&1
+send_msg "nt-msgid" "{\"test\": \"msgid\"}"
+wait_queue_drain 15
+ROW_ID=$(psql_exec "SELECT q.id FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'nt-msgid';")
+TOTAL=$((TOTAL + 1))
+if [ "$ROW_ID" = "$NEXT_ID" ]; then
+  echo -e "  ${GREEN}✓${NC} Row id ${ROW_ID} matches the foreign message's Nats-Msg-Id"
+  PASS=$((PASS + 1))
+else
+  echo -e "  ${YELLOW}⊘${NC} Row id ${ROW_ID} differs from the predicted ${NEXT_ID} (sequence moved); collision not exercised"
+  SKIP=$((SKIP + 1)); TOTAL=$((TOTAL - 1))
+fi
+assert_eq "Both messages stored (no false duplicate)" "2" "$(nats_stream_msgs NTTEST)"
+# Sequence numbers survive a purge, so fetch by subject: ulak's message is the
+# last one published on nt.msgid
+STORED_ID=$(docker exec ulak-postgres-1 nats -s "nats://${NATS_HOST}:${NATS_PORT}" stream get NTTEST --last-for=nt.msgid 2>/dev/null | grep -o "ulak-[0-9]*-[0-9]*-[0-9]*" | head -1)
+SYSID=$(psql_exec "SELECT system_identifier FROM pg_control_system();")
+DBOID=$(psql_exec "SELECT oid FROM pg_database WHERE datname = current_database();")
+assert_eq "Nats-Msg-Id = ulak-<system identifier>-<database oid>-<row id>" "ulak-${SYSID}-${DBOID}-${ROW_ID}" "$STORED_ID"
 
 # ═══════════════════════════════════════════════════
 # CLEANUP

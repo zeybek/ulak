@@ -121,17 +121,27 @@ static int64 ulak_backpressure_active_count(int64 reserve) {
     if (reserve < 0)
         reserve = 0;
 
-    if (ulak_shmem != NULL && ulak_shmem->lock != NULL) {
-        LWLockAcquire(ulak_shmem->lock, LW_EXCLUSIVE);
+    if (ulak_shmem != NULL) {
+        bool use_cache = false;
+
+        SpinLockAcquire(&ulak_shmem->active_count_mutex);
         if (ulak_shmem->active_count_dboid == MyDatabaseId &&
-            ulak_shmem->active_count_checked_at != 0 &&
-            now - ulak_shmem->active_count_checked_at < ULAK_BACKPRESSURE_CACHE_USEC) {
+            ulak_shmem->active_count_checked_at != 0) {
+            /* Fresh, or another sender is recounting: keep the cached value */
+            if (now - ulak_shmem->active_count_checked_at < ULAK_BACKPRESSURE_CACHE_USEC ||
+                (ulak_shmem->active_count_refresh_at != 0 &&
+                 now - ulak_shmem->active_count_refresh_at < ULAK_BACKPRESSURE_CACHE_USEC))
+                use_cache = true;
+            else
+                ulak_shmem->active_count_refresh_at = now; /* we recount */
+        }
+        if (use_cache) {
             count = ulak_shmem->active_count_cache;
             ulak_shmem->active_count_cache = count + reserve;
-            LWLockRelease(ulak_shmem->lock);
-            return count;
         }
-        LWLockRelease(ulak_shmem->lock);
+        SpinLockRelease(&ulak_shmem->active_count_mutex);
+        if (use_cache)
+            return count;
     }
 
     ret = SPI_execute("SELECT count(*) FROM ulak.queue WHERE status IN ('pending', 'processing')",
@@ -145,12 +155,13 @@ static int64 ulak_backpressure_active_count(int64 reserve) {
     if (isnull)
         count = 0;
 
-    if (ulak_shmem != NULL && ulak_shmem->lock != NULL) {
-        LWLockAcquire(ulak_shmem->lock, LW_EXCLUSIVE);
+    if (ulak_shmem != NULL) {
+        SpinLockAcquire(&ulak_shmem->active_count_mutex);
         ulak_shmem->active_count_dboid = MyDatabaseId;
         ulak_shmem->active_count_cache = count + reserve;
         ulak_shmem->active_count_checked_at = now;
-        LWLockRelease(ulak_shmem->lock);
+        ulak_shmem->active_count_refresh_at = 0;
+        SpinLockRelease(&ulak_shmem->active_count_mutex);
     }
 
     return count;
@@ -253,13 +264,23 @@ Datum ulak_send(PG_FUNCTION_ARGS) {
      * one partition the row hashes to (wake.c sets its latch at commit).
      */
     ulak_wake_set_skip_trigger(true);
-    ret = SPI_execute_with_args(
-        "INSERT INTO ulak.queue "
-        "(endpoint_id, payload, status, retry_count, next_retry_at) "
-        "VALUES ($1, $2, 'pending', 0, NOW()) RETURNING id",
-        2, (Oid[]){INT8OID, JSONBOID},
-        (Datum[]){Int64GetDatum(endpoint_id), JsonbPGetDatum(payload_jsonb)}, NULL, false, 0);
-    ulak_wake_set_skip_trigger(false);
+    /* PG_FINALLY: if the INSERT raises and a savepoint catches it, the flag
+     * would otherwise stay set and swallow the wake-up of every later INSERT
+     * in this transaction that relies on the queue trigger */
+    PG_TRY();
+    {
+        ret = SPI_execute_with_args(
+            "INSERT INTO ulak.queue "
+            "(endpoint_id, payload, status, retry_count, next_retry_at) "
+            "VALUES ($1, $2, 'pending', 0, NOW()) RETURNING id",
+            2, (Oid[]){INT8OID, JSONBOID},
+            (Datum[]){Int64GetDatum(endpoint_id), JsonbPGetDatum(payload_jsonb)}, NULL, false, 0);
+    }
+    PG_FINALLY();
+    {
+        ulak_wake_set_skip_trigger(false);
+    }
+    PG_END_TRY();
     if (ret != SPI_OK_INSERT_RETURNING || SPI_processed != 1 || SPI_tuptable == NULL)
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
@@ -1062,4 +1083,30 @@ Datum ulak_shmem_metrics(PG_FUNCTION_ARGS) {
     }
 
     SRF_RETURN_DONE(funcctx);
+}
+
+/**
+ * @brief SQL-callable: ulak._limit_setting(p_name text) returns bigint.
+ *
+ * The value of an enqueue limit, for the PL/pgSQL enqueue functions
+ * (ulak._check_backpressure, ulak._check_payload_size): "max_payload_size"
+ * or "max_queue_size", read from the GUCs, which are SIGHUP and cannot be
+ * raised by a session.
+ *
+ * @param p_name Limit name (text, not NULL).
+ * @return The limit as bigint.
+ */
+PG_FUNCTION_INFO_V1(ulak_limit_setting);
+Datum ulak_limit_setting(PG_FUNCTION_ARGS) {
+    char *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+    if (strcmp(name, "max_payload_size") == 0)
+        PG_RETURN_INT64((int64)ulak_max_payload_size);
+    if (strcmp(name, "max_queue_size") == 0)
+        PG_RETURN_INT64((int64)ulak_max_queue_size);
+
+    ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("unknown ulak limit \"%s\"", name),
+             errhint("Use \"max_payload_size\" or \"max_queue_size\".")));
+    PG_RETURN_NULL(); /* not reached */
 }

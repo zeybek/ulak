@@ -130,10 +130,60 @@ SELECT ulak.validate_endpoint_config(
     'kafka',
     '{"broker": "localhost:9092", "topic": "test", "unknown_key": "value"}'::jsonb
 ) AS unknown_key;
-WARNING:  [ulak] ERROR: Kafka config contains unknown key 'unknown_key'. Allowed keys: broker, topic, options, key, partition
+WARNING:  [ulak] ERROR: Kafka config contains unknown key 'unknown_key'. Allowed keys: broker, topic, options, key, partition, headers
  unknown_key 
 -------------
  f
+(1 row)
+
+-- partition must be -1 (partitioner chooses) or a partition number within int4
+SELECT ulak.validate_endpoint_config(
+    'kafka',
+    '{"broker": "localhost:9092", "topic": "test", "partition": 3000000000}'::jsonb
+) AS partition_out_of_range;
+WARNING:  [ulak] ERROR: Kafka config 'partition' must be an integer between -1 and 2147483647
+ partition_out_of_range 
+------------------------
+ f
+(1 row)
+
+SELECT ulak.validate_endpoint_config(
+    'kafka',
+    '{"broker": "localhost:9092", "topic": "test", "partition": -2}'::jsonb
+) AS partition_below_unassigned;
+WARNING:  [ulak] ERROR: Kafka config 'partition' must be an integer between -1 and 2147483647
+ partition_below_unassigned 
+----------------------------
+ f
+(1 row)
+
+SELECT ulak.validate_endpoint_config(
+    'kafka',
+    '{"broker": "localhost:9092", "topic": "test", "partition": 1.5}'::jsonb
+) AS partition_fraction;
+WARNING:  [ulak] ERROR: Kafka config 'partition' must be an integer between -1 and 2147483647
+ partition_fraction 
+--------------------
+ f
+(1 row)
+
+SELECT ulak.validate_endpoint_config(
+    'kafka',
+    '{"broker": "localhost:9092", "topic": "test", "partition": "3"}'::jsonb
+) AS partition_string;
+WARNING:  [ulak] ERROR: Kafka config 'partition' must be an integer between -1 and 2147483647
+ partition_string 
+------------------
+ f
+(1 row)
+
+SELECT ulak.validate_endpoint_config(
+    'kafka',
+    '{"broker": "localhost:9092", "topic": "test", "partition": -1}'::jsonb
+) AS partition_unassigned_valid;
+ partition_unassigned_valid 
+----------------------------
+ t
 (1 row)
 
 -- ============================================================================

@@ -35,6 +35,11 @@
 #define KAFKA_OPAQUE_GENERATION(raw) ((uint32)((uintptr_t)(raw) >> KAFKA_OPAQUE_INDEX_BITS))
 #define KAFKA_OPAQUE_INDEX(raw)                                                                    \
     ((int)(((uintptr_t)(raw)) & ((1 << KAFKA_OPAQUE_INDEX_BITS) - 1)) - 1)
+/* Synchronous produce: index bits 0 (never used by a batch slot), the rest a
+ * per-produce sequence, so a late report of an earlier timed-out message
+ * cannot complete the current one */
+#define KAFKA_OPAQUE_SYNC(seq) ((void *)(((uintptr_t)(seq)) << KAFKA_OPAQUE_INDEX_BITS))
+#define KAFKA_OPAQUE_IS_SYNC(raw) ((((uintptr_t)(raw)) & ((1 << KAFKA_OPAQUE_INDEX_BITS) - 1)) == 0)
 
 /** @brief Tracks a single in-flight message during batch produce/flush. */
 typedef struct KafkaPendingMessage {
@@ -75,6 +80,8 @@ typedef struct KafkaDispatcher {
 
     /** @name Single-message delivery tracking for dispatch() fallback */
     /** @{ */
+    uintptr_t sync_opaque;            /**< Opaque of the sync produce being waited for. */
+    uint32 sync_seq;                  /**< Last sequence used for KAFKA_OPAQUE_SYNC(). */
     volatile bool delivery_completed; /**< Set by callback when delivery report received. */
     volatile bool delivery_success;   /**< True if message delivered successfully. */
     char

@@ -4,6 +4,9 @@
  */
 
 #include "postgres.h"
+
+#include "access/xlog.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/jsonb.h"
 #include "utils/memutils.h"
@@ -278,24 +281,23 @@ bool nats_dispatcher_validate_config(Jsonb *config) {
                         return false;
                     }
 
-                    PG_TRY();
+                    /* Checked without pg_strtoint32(): its ERROR would have to be
+                     * caught here, and the worker builds dispatchers outside any
+                     * transaction. Anything accepted here pg_strtoint32 accepts. */
                     {
-                        (void)pg_strtoint32(option_value);
-                    }
-                    PG_CATCH();
-                    {
-                        ErrorData *edata;
+                        char *end;
+                        long parsed;
 
-                        MemoryContextSwitchTo(ErrorContext);
-                        edata = CopyErrorData();
-                        FlushErrorState();
-                        pfree(option_value);
-                        elog(WARNING,
-                             "[ulak] ERROR: NATS option values must be valid integer strings");
-                        FreeErrorData(edata);
-                        return false;
+                        errno = 0;
+                        parsed = strtol(option_value, &end, 10);
+                        if (errno != 0 || end == option_value || *end != '\0' ||
+                            parsed < PG_INT32_MIN || parsed > PG_INT32_MAX) {
+                            pfree(option_value);
+                            elog(WARNING,
+                                 "[ulak] ERROR: NATS option values must be valid integer strings");
+                            return false;
+                        }
                     }
-                    PG_END_TRY();
 
                     pfree(option_value);
                 }
@@ -321,6 +323,13 @@ Dispatcher *nats_dispatcher_create(Jsonb *config) {
     NatsDispatcher *nats;
     natsStatus s;
 
+    /* Like every other dispatcher: nats_apply_options() raises an ERROR on a
+     * value the validator would have refused, so never reach it unvalidated */
+    if (!nats_dispatcher_validate_config(config)) {
+        elog(WARNING, "[ulak] Invalid NATS dispatcher configuration");
+        return NULL;
+    }
+
     /* Allocate in dispatcher cache context for lifecycle management */
     cache_ctx = AllocSetContextCreate(CurrentMemoryContext, "NatsDispatcherContext",
                                       ALLOCSET_DEFAULT_SIZES);
@@ -334,6 +343,9 @@ Dispatcher *nats_dispatcher_create(Jsonb *config) {
     dispatcher->ops = &nats_ops;
     dispatcher->ops->cleanup = nats_dispatcher_cleanup;
     dispatcher->private_data = nats;
+
+    snprintf(nats->msg_id_prefix, sizeof(nats->msg_id_prefix), "ulak-%llu-%u-",
+             (unsigned long long)GetSystemIdentifier(), MyDatabaseId);
 
     /* Parse config using extract_jsonb_value pattern */
     {

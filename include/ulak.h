@@ -80,6 +80,9 @@
 #define ERROR_PREFIX_PERMANENT_LEN 11        /**< Length of permanent prefix */
 #define ERROR_PREFIX_RETRYABLE_LEN 11        /**< Length of retryable prefix */
 #define ERROR_PREFIX_DISABLE_LEN 9           /**< Length of disable prefix */
+/** Server-requested retry delay in a batch-mode error, followed by seconds and "]",
+ *  e.g. "[RETRYABLE] [RETRY_AFTER=30] HTTP 429" (batch flush has no DispatchResult) */
+#define ERROR_MARKER_RETRY_AFTER "[RETRY_AFTER="
 /** @} */
 
 /** @name Extension lifecycle functions

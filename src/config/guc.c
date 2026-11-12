@@ -65,7 +65,7 @@ bool ulak_http_enable_pipelining = true;
 #ifdef ENABLE_KAFKA
 int ulak_kafka_delivery_timeout = 30000;
 int ulak_kafka_poll_interval = 100;
-int ulak_kafka_flush_timeout = 1000;
+int ulak_kafka_flush_timeout = 5000;
 int ulak_kafka_batch_capacity = 64;
 char *ulak_kafka_acks = NULL;
 char *ulak_kafka_compression = NULL;
@@ -74,7 +74,7 @@ char *ulak_kafka_compression = NULL;
 #ifdef ENABLE_MQTT
 int ulak_mqtt_keepalive = 60;
 int ulak_mqtt_timeout = 5000;
-int ulak_mqtt_default_qos = 0;
+int ulak_mqtt_default_qos = 1;
 int ulak_mqtt_default_port = 1883;
 #endif /* ENABLE_MQTT */
 
@@ -89,7 +89,7 @@ int ulak_redis_default_port = 6379;
 int ulak_amqp_connection_timeout = 10;
 int ulak_amqp_heartbeat = 60;
 int ulak_amqp_frame_max = 131072;
-int ulak_amqp_delivery_timeout = 5000;
+int ulak_amqp_delivery_timeout = 30000;
 int ulak_amqp_batch_capacity = 64;
 bool ulak_amqp_ssl_verify_peer = true;
 #endif /* ENABLE_AMQP */
@@ -281,9 +281,10 @@ void config_init_guc_variables(void) {
                              &ulak_http_allow_internal_urls, false, PGC_SUSET, GUC_NOT_IN_SAMPLE,
                              NULL, NULL, NULL);
 
-    DefineCustomIntVariable("ulak.http_batch_capacity", "HTTP batch capacity",
-                            "Maximum pending HTTP requests in a batch", &ulak_http_batch_capacity,
-                            200, 1, 1000, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+    DefineCustomIntVariable(
+        "ulak.http_batch_capacity", "HTTP batch capacity",
+        "Initial size of the per-endpoint pending request array (grows as needed)",
+        &ulak_http_batch_capacity, 200, 1, 1000, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
     DefineCustomIntVariable("ulak.http_max_connections_per_host", "Max connections per host",
                             "Maximum concurrent connections per target host",
@@ -346,7 +347,7 @@ void config_init_guc_variables(void) {
                             NULL, NULL, NULL);
 
     DefineCustomIntVariable("ulak.mqtt_default_qos", "Default MQTT QoS",
-                            "Default QoS level (0, 1, or 2)", &ulak_mqtt_default_qos, 0, 0, 2,
+                            "Default QoS level (0, 1, or 2)", &ulak_mqtt_default_qos, 1, 0, 2,
                             PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
     DefineCustomIntVariable("ulak.mqtt_default_port", "Default MQTT port",

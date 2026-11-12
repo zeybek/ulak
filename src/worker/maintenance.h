@@ -35,11 +35,15 @@ extern void mark_expired_messages(void);
 /**
  * @brief Recover messages stuck in 'processing' state.
  *
- * Runs periodically to recover messages left in 'processing' state due
- * to worker crashes or connection drops. Messages older than
- * stale_recovery_timeout are reset to 'pending' status.
+ * Runs at worker start and periodically to recover messages left in
+ * 'processing' state due to worker crashes or connection drops. Messages
+ * older than stale_recovery_timeout are charged a retry and reset to
+ * 'pending'; those whose retries are used up go to the DLQ instead.
+ *
+ * @param reason Short context for last_error and the log line
+ *               (e.g. "worker restart").
  */
-extern void recover_stale_processing_messages(void);
+extern void recover_stale_processing_messages(const char *reason);
 
 /**
  * @brief Move completed messages from queue to archive.
@@ -54,8 +58,8 @@ extern void archive_completed_messages(void);
  * @brief Run low-frequency maintenance tasks.
  *
  * Event log cleanup, DLQ cleanup, archive partition maintenance, and
- * old archive partition removal. Intended to be called every ~60 loop
- * iterations (~5 minutes at default poll_interval).
+ * old archive partition removal. Intended to be called every 60 poll
+ * intervals (~30 seconds at the default ulak.poll_interval).
  */
 extern void run_periodic_maintenance(void);
 

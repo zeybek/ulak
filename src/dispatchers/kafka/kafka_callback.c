@@ -5,11 +5,15 @@
  * Clean Architecture: Interface Adapters Layer
  * Handles async delivery callbacks from librdkafka.
  *
- * CRITICAL THREAD SAFETY NOTES:
- * - This callback is called from librdkafka's background thread, NOT PostgreSQL
- * - NEVER use palloc, pfree, pstrdup, or any PostgreSQL memory functions
+ * CALLBACK RULES:
+ * - librdkafka serves delivery reports from rd_kafka_poll()/rd_kafka_flush(),
+ *   so the callback runs on the worker's own thread (no background event
+ *   callback is configured), inside librdkafka's call stack
+ * - NEVER use palloc, pfree, pstrdup, ereport or any other PostgreSQL function:
+ *   an ERROR would longjmp out through librdkafka's frames
  * - Use fixed-size buffers and strncpy for error messages
- * - All access to shared state must be protected by spinlock
+ * - Shared state stays under the spinlock (cheap, and safe should a
+ *   background queue ever be configured)
  */
 
 #include <string.h>
@@ -42,9 +46,9 @@ const char *kafka_classify_error(rd_kafka_resp_err_t err) {
 /**
  * @brief Delivery report callback invoked by librdkafka when delivery status is known.
  *
- * IMPORTANT: This callback is called from librdkafka's background thread, NOT
- * the PostgreSQL thread. Therefore, we CANNOT use PostgreSQL memory functions
- * like pstrdup(), palloc(), etc. as they are not thread-safe.
+ * Runs inside rd_kafka_poll()/rd_kafka_flush() on the worker's thread. It must
+ * not call PostgreSQL functions such as pstrdup() or palloc(): an ERROR raised
+ * there would longjmp through librdkafka.
  *
  * Solution: Use fixed-size buffers and strncpy for error messages.
  *
@@ -69,7 +73,7 @@ void kafka_delivery_report(rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, 
     }
 
     /* Batch-mode messages carry a generation-stamped slot index in _private;
-     * synchronous dispatch passes NULL (raw == 0). */
+     * synchronous dispatch a per-produce KAFKA_OPAQUE_SYNC() value. */
     raw = (uintptr_t)rkmessage->_private;
     index = (raw != 0) ? KAFKA_OPAQUE_INDEX(raw) : -1;
 
@@ -83,7 +87,16 @@ void kafka_delivery_report(rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, 
 
     pending_count = kafka_dispatcher->pending_count;
 
-    if (raw != 0 && KAFKA_OPAQUE_GENERATION(raw) != kafka_dispatcher->batch_generation) {
+    if (raw == 0 || (KAFKA_OPAQUE_IS_SYNC(raw) && raw != kafka_dispatcher->sync_opaque)) {
+        /* Report of a synchronous produce that is no longer awaited (it timed
+         * out and its row was reported retryable): it must not complete the
+         * message that is being waited for now. */
+        SpinLockRelease(&kafka_dispatcher->pending_lock);
+        return;
+    }
+
+    if (!KAFKA_OPAQUE_IS_SYNC(raw) &&
+        KAFKA_OPAQUE_GENERATION(raw) != kafka_dispatcher->batch_generation) {
         /* Stale report from an earlier batch (flush already timed out and the
          * slot may have been reused). Ignore it — the message was reported as
          * failed/retryable when its own flush ended. */
@@ -91,7 +104,7 @@ void kafka_delivery_report(rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, 
         return;
     }
 
-    if (raw != 0) {
+    if (!KAFKA_OPAQUE_IS_SYNC(raw)) {
         /* Batch mode - update the specific slot; never fall through to the
          * single-message fields, which belong to the synchronous path only. */
         if (index < 0 || index >= pending_count || kafka_dispatcher->pending_messages == NULL) {
@@ -113,14 +126,14 @@ void kafka_delivery_report(rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, 
             snprintf(pm->error, KAFKA_ERROR_BUFFER_SIZE, "%s %s", prefix, err_str);
         }
     } else {
-        /* Legacy single-message mode - also protected by spinlock */
+        /* Synchronous dispatch / dispatch_ex - also protected by spinlock */
         if (rkmessage->err) {
             kafka_dispatcher->delivery_success = false;
             /* Thread-safe: copy classified error to fixed buffer */
             prefix = kafka_classify_error(rkmessage->err);
             err_str = rd_kafka_err2str(rkmessage->err);
-            snprintf(kafka_dispatcher->delivery_error, KAFKA_ERROR_BUFFER_SIZE, "%s %s", prefix,
-                     err_str);
+            snprintf(kafka_dispatcher->delivery_error, KAFKA_ERROR_BUFFER_SIZE,
+                     "%s Kafka message delivery failed: %s", prefix, err_str);
         } else {
             kafka_dispatcher->delivery_success = true;
             kafka_dispatcher->delivery_error[0] = '\0';

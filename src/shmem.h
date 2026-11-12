@@ -91,13 +91,19 @@ typedef struct UlakShmemState {
     UlakDatabaseEntry databases[ULAK_MAX_DATABASES];
 
     /*
-     * Backpressure count cache (protected by lock). send()/publish() consult
-     * this instead of scanning the queue on every call; it is refreshed at
-     * most once per ULAK_BACKPRESSURE_CACHE_USEC per database.
+     * Backpressure count cache (protected by active_count_mutex, not lock:
+     * every send() touches it, and the registry LWLock taken exclusively
+     * would serialise all senders with the workers). send()/publish()
+     * consult this instead of scanning the queue on every call; it is
+     * refreshed at most once per ULAK_BACKPRESSURE_CACHE_USEC per database,
+     * and active_count_refresh_at marks a recount in progress so concurrent
+     * senders keep the old value instead of all counting at once.
      */
+    slock_t active_count_mutex;
     Oid active_count_dboid;
     int64 active_count_cache;
     TimestampTz active_count_checked_at;
+    TimestampTz active_count_refresh_at;
 
     /* Shared rate limit buckets — all workers share these */
     RateLimitShmemBucket rate_limit_buckets[RL_SHMEM_MAX_ENDPOINTS];

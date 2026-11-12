@@ -15,6 +15,7 @@
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/snapmgr.h"
 
@@ -76,7 +77,7 @@ void mark_expired_messages(void) {
     CommitTransactionCommand();
 }
 
-void recover_stale_processing_messages(void) {
+void recover_stale_processing_messages(const char *reason) {
     int ret;
     int spi_ret;
     int stale_timeout_seconds = config_get_stale_recovery_timeout();
@@ -92,27 +93,81 @@ void recover_stale_processing_messages(void) {
     }
     PushActiveSnapshot(GetTransactionSnapshot());
 
-    /* Parameterized recovery query with configurable timeout */
+    /*
+     * A row left in 'processing' was in the hands of a worker that died or
+     * hung, possibly because of the payload itself. Every recovery charges a
+     * retry, and a row whose retries are used up goes to the DLQ like any
+     * other exhausted row instead of being delivered again forever. The
+     * max_retries expression mirrors get_max_retries_from_policy(): the
+     * endpoint's retry_policy number (rounded, at least 1, capped at int4)
+     * or ulak.default_max_retries. The rows are locked first so a worker
+     * that is just writing its outcome (and holds the row lock) is skipped.
+     */
     {
         static const char *recovery_sql =
-            "UPDATE ulak.queue SET status = 'pending', "
-            "retry_count = retry_count + 1, "
-            "last_error = 'Recovered from stale processing state (continuous recovery)', "
-            "next_retry_at = NOW(), updated_at = NOW() "
-            "WHERE status = 'processing' "
-            "AND processing_started_at < NOW() - ($1 || ' seconds')::interval";
-        Oid argtypes[1] = {TEXTOID};
-        Datum values[1];
-        char nulls[1] = {' '};
+            "WITH stale AS ("
+            "  SELECT q.id, q.retry_count + 1 AS retry_count, "
+            "         q.retry_count + 1 >= COALESCE(CASE "
+            "           WHEN jsonb_typeof(e.retry_policy->'max_retries') = 'number' "
+            "            AND round((e.retry_policy->'max_retries')::numeric) >= 1 "
+            "           THEN LEAST(round((e.retry_policy->'max_retries')::numeric), "
+            "                      2147483647)::int "
+            "         END, $2) AS exhausted "
+            "  FROM ulak.queue q JOIN ulak.endpoints e ON e.id = q.endpoint_id "
+            "  WHERE q.status = 'processing' "
+            "    AND q.processing_started_at < NOW() - ($1 || ' seconds')::interval "
+            "  FOR UPDATE OF q SKIP LOCKED) "
+            "UPDATE ulak.queue q SET "
+            "  status = CASE WHEN s.exhausted THEN 'failed' ELSE 'pending' END, "
+            "  retry_count = s.retry_count, "
+            "  last_error = CASE WHEN s.exhausted THEN $3 || ', max retries reached' ELSE $3 END, "
+            "  failed_at = CASE WHEN s.exhausted THEN NOW() ELSE q.failed_at END, "
+            "  next_retry_at = NOW(), updated_at = NOW() "
+            "FROM stale s WHERE q.id = s.id AND q.status = 'processing' "
+            "RETURNING q.id, s.exhausted";
+        Oid argtypes[3] = {TEXTOID, INT4OID, TEXTOID};
+        Datum values[3];
+        char nulls[3] = {' ', ' ', ' '};
         char timeout_str[32];
 
         snprintf(timeout_str, sizeof(timeout_str), "%d", stale_timeout_seconds);
         values[0] = CStringGetTextDatum(timeout_str);
+        values[1] = Int32GetDatum(ulak_default_max_retries);
+        values[2] =
+            CStringGetTextDatum(psprintf("Recovered from stale processing state (%s)", reason));
 
-        ret = SPI_execute_with_args(recovery_sql, 1, argtypes, values, nulls, false, 0);
-        if (ret == SPI_OK_UPDATE && SPI_processed > 0) {
-            elog(LOG, "[ulak] Continuous recovery: reset %lu stale processing messages",
-                 (unsigned long)SPI_processed);
+        ret = SPI_execute_with_args(recovery_sql, 3, argtypes, values, nulls, false, 0);
+        if (ret != SPI_OK_UPDATE_RETURNING) {
+            elog(WARNING, "[ulak] Stale recovery (%s) failed: SPI error %d", reason, ret);
+        } else if (SPI_processed > 0 && SPI_tuptable != NULL) {
+            uint64 n = SPI_processed;
+            Datum *dlq_ids = palloc(sizeof(Datum) * n);
+            uint64 dlq_count = 0;
+            uint64 r;
+
+            for (r = 0; r < n; r++) {
+                bool isnull;
+                HeapTuple tuple = SPI_tuptable->vals[r];
+
+                if (DatumGetBool(SPI_getbinval(tuple, SPI_tuptable->tupdesc, 2, &isnull)) &&
+                    !isnull)
+                    dlq_ids[dlq_count++] = SPI_getbinval(tuple, SPI_tuptable->tupdesc, 1, &isnull);
+            }
+            if (dlq_count > 0) {
+                ArrayType *dlq_array = construct_array(dlq_ids, (int)dlq_count, INT8OID,
+                                                       sizeof(int64), true, TYPALIGN_DOUBLE);
+
+                ret = SPI_execute_with_args("SELECT ulak.archive_single_to_dlq(id) "
+                                            "FROM unnest($1::bigint[]) AS id",
+                                            1, (Oid[]){INT8ARRAYOID},
+                                            (Datum[]){PointerGetDatum(dlq_array)}, NULL, false, 0);
+                if (ret != SPI_OK_SELECT)
+                    elog(WARNING, "[ulak] Stale recovery DLQ archive failed: SPI error %d", ret);
+            }
+            elog(LOG,
+                 "[ulak] Stale recovery (%s): %llu message(s) back to pending, %llu moved to "
+                 "the DLQ after max retries",
+                 reason, (unsigned long long)(n - dlq_count), (unsigned long long)dlq_count);
         }
     }
 

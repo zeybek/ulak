@@ -47,6 +47,21 @@ fi
 section "Killing worker PID=$WORKER_PID..."
 psql_exec "SELECT pg_terminate_backend(${WORKER_PID});" > /dev/null
 
+# The 100 messages are usually delivered before the kill, so draining the
+# queue alone proves nothing. Require a new worker process, and deliver
+# messages enqueued after the kill (ulak.worker_restart_delay, 5 s).
+NEW_PID=""
+for i in $(seq 1 30); do
+  NEW_PID=$(psql_exec "SELECT pid FROM pg_stat_activity WHERE backend_type = 'ulak worker' AND pid <> ${WORKER_PID} LIMIT 1;")
+  [ -n "$NEW_PID" ] && break
+  sleep 1
+done
+assert_gt "Worker restarted after pg_terminate_backend (new PID)" "0" "${NEW_PID:-0}"
+
+create_endpoint "crash-after" "{\"url\": \"${WEBHOOK_URL}/ok/crash-after\", \"method\": \"POST\"}"
+section "Enqueuing 20 messages after the kill..."
+send_batch "crash-after" 20
+
 sleep 1
 
 # Check for stuck processing messages
@@ -60,11 +75,15 @@ sleep 20
 # Worker should have restarted and recovered stale messages
 wait_queue_drain 30
 
-COMPLETED=$(psql_exec "SELECT count(*) FROM ulak.queue WHERE status = 'completed';")
+COMPLETED=$(completed_count "crash-test")
 DELIVERED=$(webhook_count "ok/crash-recovery")
+AFTER_COMPLETED=$(completed_count "crash-after")
+AFTER_DELIVERED=$(webhook_count "ok/crash-after")
 
 assert_eq "All 100 messages completed" "100" "$COMPLETED"
 assert_gt "Webhook received >= 100 (at-least-once)" "99" "$DELIVERED"
+assert_eq "All 20 messages sent after the kill completed" "20" "$AFTER_COMPLETED"
+assert_gt "Webhook received >= 20 after the kill" "19" "$AFTER_DELIVERED"
 # Note: pg_terminate_backend causes expected FATAL log — check for PANIC only
 PANICS=$(docker logs ulak-postgres-1 2>&1 | grep -c "PANIC" || true)
 TOTAL=$((TOTAL + 1))

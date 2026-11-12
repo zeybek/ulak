@@ -148,6 +148,67 @@ WARNING:  [ulak] ERROR: AMQP config contains unknown key 'unknown'. Allowed keys
  f
 (1 row)
 
+-- frame_max is range-checked like ulak.amqp_frame_max (4096..2097152)
+SELECT ulak.validate_endpoint_config(
+    'amqp',
+    '{"host": "localhost", "exchange": "e", "routing_key": "r", "frame_max": 5000000000}'::jsonb
+) AS frame_max_out_of_int4;
+WARNING:  [ulak] ERROR: AMQP config 'frame_max' must be an integer between 4096 and 2097152
+ frame_max_out_of_int4 
+-----------------------
+ f
+(1 row)
+
+SELECT ulak.validate_endpoint_config(
+    'amqp',
+    '{"host": "localhost", "exchange": "e", "routing_key": "r", "frame_max": 1024}'::jsonb
+) AS frame_max_below_minimum;
+WARNING:  [ulak] ERROR: AMQP config 'frame_max' must be an integer between 4096 and 2097152
+ frame_max_below_minimum 
+-------------------------
+ f
+(1 row)
+
+SELECT ulak.validate_endpoint_config(
+    'amqp',
+    '{"host": "localhost", "exchange": "e", "routing_key": "r", "frame_max": "131072"}'::jsonb
+) AS frame_max_string;
+WARNING:  [ulak] ERROR: AMQP config 'frame_max' must be an integer between 4096 and 2097152
+ frame_max_string 
+------------------
+ f
+(1 row)
+
+SELECT ulak.validate_endpoint_config(
+    'amqp',
+    '{"host": "localhost", "exchange": "e", "routing_key": "r", "frame_max": 131072}'::jsonb
+) AS frame_max_valid;
+ frame_max_valid 
+-----------------
+ t
+(1 row)
+
+-- port and heartbeat beyond int4 are refused instead of raising an ERROR
+SELECT ulak.validate_endpoint_config(
+    'amqp',
+    '{"host": "localhost", "exchange": "e", "routing_key": "r", "port": 99999999999}'::jsonb
+) AS port_out_of_int4;
+WARNING:  [ulak] ERROR: AMQP config 'port' must be between 1 and 65535
+ port_out_of_int4 
+------------------
+ f
+(1 row)
+
+SELECT ulak.validate_endpoint_config(
+    'amqp',
+    '{"host": "localhost", "exchange": "e", "routing_key": "r", "heartbeat": 99999999999}'::jsonb
+) AS heartbeat_out_of_int4;
+WARNING:  [ulak] ERROR: AMQP config 'heartbeat' must be between 0 and 600
+ heartbeat_out_of_int4 
+-----------------------
+ f
+(1 row)
+
 -- ============================================================================
 -- AMQP ENDPOINT CRUD
 -- ============================================================================

@@ -18,11 +18,29 @@
 #include "shmem.h"
 #include "storage/lwlock.h"
 #include "storage/spin.h"
+#include "utils/builtins.h"
 #include "utils/json_utils.h"
+#include "utils/numeric.h"
 #include "utils/timestamp.h"
 
 /** Stale bucket threshold: 10 minutes without any refill = evictable */
 #define RL_STALE_THRESHOLD_US (10LL * 60 * 1000000)
+
+/**
+ * @brief Bucket capacity for a rate and burst.
+ * @private
+ *
+ * burst, or one second's worth of tokens without it, but never below one
+ * token: a dispatch needs a whole token, so a bucket capped at e.g. 0.5
+ * (30 per minute) would never deliver.
+ *
+ * @param tokens_per_second Refill rate in tokens per second
+ * @param burst Configured burst (0 = not set)
+ * @return Maximum number of tokens the bucket holds
+ */
+static double rate_limit_capacity(double tokens_per_second, int burst) {
+    return Max(1.0, (burst > 0) ? (double)burst : tokens_per_second);
+}
 
 /**
  * @brief Find an existing bucket for the given endpoint.
@@ -97,28 +115,36 @@ static RateLimitShmemBucket *create_bucket(int64 endpoint_id, double tokens_per_
 
     /* If no empty slot, try evicting oldest stale bucket */
     if (first_empty < 0 && oldest_stale >= 0) {
+        int64 evicted_endpoint = 0;
+
         SpinLockAcquire(&buckets[oldest_stale].mutex);
         /* Re-verify staleness under lock */
         if (buckets[oldest_stale].active &&
             (now - buckets[oldest_stale].last_refill) > RL_STALE_THRESHOLD_US) {
-            elog(DEBUG1, "[ulak] Rate limit: evicting stale bucket for endpoint %lld",
-                 (long long)buckets[oldest_stale].endpoint_id);
+            evicted_endpoint = buckets[oldest_stale].endpoint_id;
             buckets[oldest_stale].active = false;
             first_empty = oldest_stale;
         }
         SpinLockRelease(&buckets[oldest_stale].mutex);
+        /* Logged after the release: nothing that can allocate or raise may run
+         * under a spinlock */
+        if (first_empty >= 0)
+            elog(DEBUG1, "[ulak] Rate limit: evicting stale bucket for endpoint %lld",
+                 (long long)evicted_endpoint);
     }
 
     if (first_empty < 0) {
-        elog(WARNING, "[ulak] Rate limit: max endpoints (%d) reached, no stale buckets to evict",
-             RL_SHMEM_MAX_ENDPOINTS);
+        elog(WARNING,
+             "[ulak] Rate limit: max endpoints (%d) reached, no stale buckets to evict; rate "
+             "limit not enforced for endpoint %lld",
+             RL_SHMEM_MAX_ENDPOINTS, (long long)endpoint_id);
         return NULL;
     }
 
     /* Initialize new bucket under per-bucket spinlock */
     SpinLockAcquire(&buckets[first_empty].mutex);
     {
-        double max_tokens = (burst > 0) ? (double)burst : tokens_per_second;
+        double max_tokens = rate_limit_capacity(tokens_per_second, burst);
         buckets[first_empty].endpoint_id = endpoint_id;
         buckets[first_empty].max_tokens = max_tokens;
         buckets[first_empty].tokens = max_tokens; /* Start full */
@@ -203,7 +229,7 @@ bool rate_limit_acquire(int64 endpoint_id, double tokens_per_second, int burst) 
 
     /* Update config if changed (hot reload) */
     bucket->refill_rate = tokens_per_second / 1000000.0;
-    bucket->max_tokens = (burst > 0) ? (double)burst : tokens_per_second;
+    bucket->max_tokens = rate_limit_capacity(tokens_per_second, burst);
 
     /* Refill tokens based on elapsed time */
     elapsed_us = now - bucket->last_refill;
@@ -227,15 +253,18 @@ bool rate_limit_acquire(int64 endpoint_id, double tokens_per_second, int burst) 
 /**
  * @brief Parse rate limit config from endpoint JSONB.
  *
- * Expected format: "rate_limit": { "limit": N, "interval": "second|minute|hour", "burst": N }
- * Normalizes limit to tokens_per_second regardless of interval.
- * burst defaults to limit if not specified.
+ * Two forms: "rate_limit": N (N requests per second, fractions allowed, no
+ * burst) or
+ * "rate_limit": { "limit": N, "interval": "second|minute|hour", "burst": N }.
+ * Normalizes to tokens_per_second regardless of interval. A rate <= 0 means
+ * no limit. Without burst the bucket holds one second's worth, at least one.
  *
  * @param config Endpoint JSONB configuration
  * @param tokens_per_second Output: normalized rate in tokens/second
  * @param burst Output: burst size (0 if not specified)
  */
 void rate_limit_parse_config(Jsonb *config, double *tokens_per_second, int *burst) {
+    JsonbValue rl_val;
     Jsonb *rl_obj;
     int limit;
     char *interval;
@@ -245,6 +274,23 @@ void rate_limit_parse_config(Jsonb *config, double *tokens_per_second, int *burs
 
     if (!config)
         return;
+
+    /* Scalar form: requests per second */
+    if (extract_jsonb_value(config, RL_CONFIG_KEY, &rl_val) && rl_val.type == jbvNumeric) {
+        char *num_str =
+            DatumGetCString(DirectFunctionCall1(numeric_out, NumericGetDatum(rl_val.val.numeric)));
+        double rate = strtod(num_str, NULL);
+
+        pfree(num_str);
+        if (!(rate > 0.0))
+            return;
+        if (rate > 1000000.0) {
+            elog(WARNING, "[ulak] Rate limit: %g per second exceeds max 1000000, clamping", rate);
+            rate = 1000000.0;
+        }
+        *tokens_per_second = rate;
+        return;
+    }
 
     /* Extract nested "rate_limit" object */
     rl_obj = jsonb_get_nested(config, RL_CONFIG_KEY);

@@ -80,7 +80,10 @@ static void wake_xact_callback(XactEvent event, void *arg) {
 
 /**
  * @brief Same partition formula as the claim query in batch_processor.c:
- *        (ordering_key IS NULL ? id : abs(hashtext(ordering_key))) % workers.
+ *        (ordering_key IS NULL ? id : abs(hashtext(ordering_key)::bigint)) % workers.
+ *
+ * The hash is widened before abs(): hashtext() can return INT32_MIN, which
+ * has no int4 absolute value.
  */
 static int wake_partition_of(int64 message_id, const char *ordering_key) {
     int workers = ulak_workers > 0 ? ulak_workers : 1;

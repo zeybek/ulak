@@ -59,6 +59,15 @@ extern const char *nats_classify_error(natsStatus status);
 extern const char *nats_classify_js_error(int js_err_code);
 
 /**
+ * @brief Prefix for a failed JetStream publish, same on the sync and async path.
+ *
+ * NATS_NO_RESPONDERS (no stream for the subject) is retryable whatever
+ * jsErrCode came with it; otherwise as nats_classify_js_error() /
+ * nats_classify_error().
+ */
+extern const char *nats_classify_publish_error(natsStatus status, int js_err_code);
+
+/**
  * @brief Initialize jsOptions with ulak's async publish result handler.
  *
  * The NATS C client invokes AckHandler for both positive and negative async

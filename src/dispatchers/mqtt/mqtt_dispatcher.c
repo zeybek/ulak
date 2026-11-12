@@ -18,22 +18,33 @@
 #include "core/entities.h"
 #include "mqtt_internal.h"
 #include "postgres.h"
+#include "postmaster/bgworker.h"
 #include "utils/json_utils.h"
 #include "utils/logging.h"
 
 #include <time.h>
 
-const char *MQTT_ALLOWED_CONFIG_KEYS[] = {
-    MQTT_CONFIG_KEY_BROKER,        MQTT_CONFIG_KEY_TOPIC,
-    MQTT_CONFIG_KEY_QOS,           MQTT_CONFIG_KEY_PORT,
-    MQTT_CONFIG_KEY_CLIENT_ID,     MQTT_CONFIG_KEY_RETAIN,
-    MQTT_CONFIG_KEY_USERNAME,      MQTT_CONFIG_KEY_PASSWORD,
-    MQTT_CONFIG_KEY_OPTIONS,       MQTT_CONFIG_KEY_TLS,
-    MQTT_CONFIG_KEY_TLS_CA_CERT,   MQTT_CONFIG_KEY_TLS_CERT,
-    MQTT_CONFIG_KEY_TLS_KEY,       MQTT_CONFIG_KEY_TLS_INSECURE,
-    MQTT_CONFIG_KEY_WILL_TOPIC,    MQTT_CONFIG_KEY_WILL_PAYLOAD,
-    MQTT_CONFIG_KEY_WILL_QOS,      MQTT_CONFIG_KEY_WILL_RETAIN,
-    MQTT_CONFIG_KEY_CLEAN_SESSION, NULL};
+const char *MQTT_ALLOWED_CONFIG_KEYS[] = {MQTT_CONFIG_KEY_BROKER,
+                                          MQTT_CONFIG_KEY_TOPIC,
+                                          MQTT_CONFIG_KEY_QOS,
+                                          MQTT_CONFIG_KEY_PORT,
+                                          MQTT_CONFIG_KEY_CLIENT_ID,
+                                          MQTT_CONFIG_KEY_RETAIN,
+                                          MQTT_CONFIG_KEY_USERNAME,
+                                          MQTT_CONFIG_KEY_PASSWORD,
+                                          MQTT_CONFIG_KEY_OPTIONS,
+                                          MQTT_CONFIG_KEY_TLS,
+                                          MQTT_CONFIG_KEY_TLS_CA_CERT,
+                                          MQTT_CONFIG_KEY_TLS_CERT,
+                                          MQTT_CONFIG_KEY_TLS_KEY,
+                                          MQTT_CONFIG_KEY_TLS_INSECURE,
+                                          MQTT_CONFIG_KEY_WILL_TOPIC,
+                                          MQTT_CONFIG_KEY_WILL_PAYLOAD,
+                                          MQTT_CONFIG_KEY_WILL_QOS,
+                                          MQTT_CONFIG_KEY_WILL_RETAIN,
+                                          MQTT_CONFIG_KEY_CLEAN_SESSION,
+                                          MQTT_CONFIG_KEY_PROTOCOL_VERSION,
+                                          NULL};
 
 /**
  * @brief Classify an MQTT error as retryable or permanent.
@@ -58,6 +69,58 @@ const char *mqtt_classify_error(int rc) {
     default:
         return ERROR_PREFIX_RETRYABLE;
     }
+}
+
+const char *mqtt_classify_loop_error(MqttDispatcher *mqtt, int rc) {
+    if (rc == MOSQ_ERR_CONN_REFUSED || mqtt_connack_refused(mqtt)) {
+        switch (mqtt->connack_rc) {
+        case 1:    /* 3.1.1: unacceptable protocol version */
+        case 2:    /* 3.1.1: identifier rejected */
+        case 4:    /* 3.1.1: bad user name or password */
+        case 5:    /* 3.1.1: not authorized */
+        case 0x84: /* 5: unsupported protocol version */
+        case 0x85: /* 5: client identifier not valid */
+        case 0x86: /* 5: bad user name or password */
+        case 0x87: /* 5: not authorized */
+        case 0x8A: /* 5: banned */
+        case 0x8C: /* 5: bad authentication method */
+        case 0x9A: /* 5: retain not supported */
+        case 0x9B: /* 5: QoS not supported */
+            return ERROR_PREFIX_PERMANENT;
+        default: /* server unavailable, busy, quota, rate limit, ... */
+            return ERROR_PREFIX_RETRYABLE;
+        }
+    }
+    if (rc == MOSQ_ERR_TLS)
+        return ERROR_PREFIX_RETRYABLE;
+    return mqtt_classify_error(rc);
+}
+
+const char *mqtt_classify_publish_reason(int reason_code) {
+    switch (reason_code) {
+    case 0x87: /* not authorized */
+    case 0x90: /* topic name invalid */
+    case 0x99: /* payload format invalid */
+        return ERROR_PREFIX_PERMANENT;
+    default: /* unspecified, implementation specific, packet id in use, quota exceeded */
+        return ERROR_PREFIX_RETRYABLE;
+    }
+}
+
+/**
+ * @private
+ * @brief Protocol version named by a "protocol_version" config value.
+ * @param val JSONB value of the key.
+ * @return MQTT_PROTOCOL_V311 for "3.1.1", MQTT_PROTOCOL_V5 for "5", 0 otherwise.
+ */
+static int mqtt_parse_protocol_version(const JsonbValue *val) {
+    if (val->type != jbvString)
+        return 0;
+    if (val->val.string.len == 5 && memcmp(val->val.string.val, "3.1.1", 5) == 0)
+        return MQTT_PROTOCOL_V311;
+    if (val->val.string.len == 1 && val->val.string.val[0] == '5')
+        return MQTT_PROTOCOL_V5;
+    return 0;
 }
 
 /** Forward declaration */
@@ -86,6 +149,7 @@ Dispatcher *mqtt_dispatcher_create(Jsonb *config) {
         password_val, options_val;
     JsonbValue tls_val, tls_ca_cert_val, tls_cert_val, tls_key_val, tls_insecure_val;
     JsonbValue will_topic_val, will_payload_val, will_qos_val, will_retain_val, clean_session_val;
+    JsonbValue protocol_version_val;
     int default_qos;
     int default_port;
     const char *client_id;
@@ -127,9 +191,10 @@ Dispatcher *mqtt_dispatcher_create(Jsonb *config) {
     }
     mqtt_dispatcher->topic = pnstrdup(topic_val.val.string.val, topic_val.val.string.len);
 
-    /* Get QoS (optional, default from GUC) */
+    /* Get QoS (optional, default from GUC). The default is 1: QoS 0 is marked
+     * delivered once the PUBLISH is written, with no broker acknowledgment */
     default_qos =
-        (ulak_mqtt_default_qos >= 0 && ulak_mqtt_default_qos <= 2) ? ulak_mqtt_default_qos : 0;
+        (ulak_mqtt_default_qos >= 0 && ulak_mqtt_default_qos <= 2) ? ulak_mqtt_default_qos : 1;
     mqtt_dispatcher->qos = default_qos;
     if (extract_jsonb_value(config, MQTT_CONFIG_KEY_QOS, &qos_val) && qos_val.type == jbvNumeric) {
         mqtt_dispatcher->qos = jsonb_get_int32((Jsonb *)config, MQTT_CONFIG_KEY_QOS, default_qos);
@@ -264,10 +329,18 @@ Dispatcher *mqtt_dispatcher_create(Jsonb *config) {
     }
     mqtt_dispatcher->clean_session = clean_session;
 
+    /* Parse protocol_version (optional, default 3.1.1; validated above) */
+    mqtt_dispatcher->protocol_version = MQTT_PROTOCOL_V311;
+    if (extract_jsonb_value(config, MQTT_CONFIG_KEY_PROTOCOL_VERSION, &protocol_version_val) &&
+        mqtt_parse_protocol_version(&protocol_version_val) != 0) {
+        mqtt_dispatcher->protocol_version = mqtt_parse_protocol_version(&protocol_version_val);
+    }
+
     /* Initialize extended fields */
     mqtt_dispatcher->last_mid = 0;
     mqtt_dispatcher->sync_wait_mid = 0;
     mqtt_dispatcher->sync_acked = false;
+    mqtt_dispatcher->sync_reason_code = 0;
 
     /* Initialize connection pooling state */
     mqtt_dispatcher->connected = false;
@@ -277,6 +350,20 @@ Dispatcher *mqtt_dispatcher_create(Jsonb *config) {
      * MQTT "session taken over" when multiple workers connect to same broker.
      * MQTT protocol requires unique client_id per connection. */
     if (mqtt_dispatcher->client_id) {
+        /* Every worker builds its own dispatcher from the same config; with
+         * more than one worker a fixed id makes the broker drop the previous
+         * holder's connection on every connect (MQTT 3.1.1 §3.1.4). Keep the
+         * configured id as a stable prefix and add the worker number. */
+        int total_workers =
+            MyBgworkerEntry ? (DatumGetInt32(MyBgworkerEntry->bgw_main_arg) >> 16) : 0;
+
+        if (total_workers > 1) {
+            char *per_worker = psprintf("%s_%d", mqtt_dispatcher->client_id,
+                                        DatumGetInt32(MyBgworkerEntry->bgw_main_arg) & 0xFFFF);
+
+            pfree(mqtt_dispatcher->client_id);
+            mqtt_dispatcher->client_id = per_worker;
+        }
         client_id = mqtt_dispatcher->client_id;
     } else {
         char auto_id[64];
@@ -293,10 +380,26 @@ Dispatcher *mqtt_dispatcher_create(Jsonb *config) {
         return NULL;
     }
 
-    /* Set callbacks */
+    /* MQTT 5 has to be chosen before the connect. Its acknowledgments carry a
+     * reason code, so a publish the broker refuses (e.g. by ACL) is reported;
+     * MQTT 3.1.1 has no way to say so, and Mosquitto acknowledges it anyway. */
+    if (mqtt_dispatcher->protocol_version == MQTT_PROTOCOL_V5) {
+        int opt_ret = mosquitto_int_option(mqtt_dispatcher->client, MOSQ_OPT_PROTOCOL_VERSION,
+                                           MQTT_PROTOCOL_V5);
+        if (opt_ret != MOSQ_ERR_SUCCESS) {
+            ulak_log("error", "Failed to select MQTT 5: %s", mosquitto_strerror(opt_ret));
+            mosquitto_destroy(mqtt_dispatcher->client);
+            mqtt_cleanup_strings(mqtt_dispatcher);
+            pfree(mqtt_dispatcher);
+            return NULL;
+        }
+    }
+
+    /* Set callbacks. The v5 publish callback also runs on 3.1.1 connections,
+     * with reason code 0. */
     mosquitto_connect_callback_set(mqtt_dispatcher->client, mqtt_connect_callback);
     mosquitto_message_callback_set(mqtt_dispatcher->client, mqtt_message_callback);
-    mosquitto_publish_callback_set(mqtt_dispatcher->client, mqtt_publish_callback);
+    mosquitto_publish_v5_callback_set(mqtt_dispatcher->client, mqtt_publish_callback);
 
     /* Set username and password if provided */
     if (mqtt_dispatcher->username) {
@@ -406,12 +509,13 @@ bool mqtt_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char 
 
         mqtt_dispatcher->sync_wait_mid = mid;
         mqtt_dispatcher->sync_acked = false;
+        mqtt_dispatcher->sync_reason_code = 0;
 
         clock_gettime(CLOCK_MONOTONIC, &start);
         while (!mqtt_dispatcher->sync_acked && elapsed_ms < mqtt_timeout) {
             ret = mosquitto_loop(mqtt_dispatcher->client, 100, 1);
             if (ret != MOSQ_ERR_SUCCESS) {
-                const char *prefix = mqtt_classify_error(ret);
+                const char *prefix = mqtt_classify_loop_error(mqtt_dispatcher, ret);
                 ulak_log("warning", "MQTT loop failed: %s", mosquitto_strerror(ret));
                 if (error_msg) {
                     *error_msg =
@@ -437,12 +541,26 @@ bool mqtt_dispatcher_dispatch(Dispatcher *dispatcher, const char *payload, char 
             }
             return false;
         }
+
+        if (mqtt_dispatcher->sync_reason_code >= 0x80) {
+            int reason = mqtt_dispatcher->sync_reason_code;
+
+            ulak_log("warning", "MQTT broker refused the publish to %s: %s (reason code %d)",
+                     mqtt_dispatcher->topic, mosquitto_reason_string(reason), reason);
+            if (error_msg) {
+                *error_msg = psprintf("%s MQTT broker refused the publish: %s (reason code %d)",
+                                      mqtt_classify_publish_reason(reason),
+                                      mosquitto_reason_string(reason), reason);
+            }
+            mqtt_dispatcher->last_activity = time(NULL);
+            return false;
+        }
     } else {
         /* QoS 0: single non-blocking loop iteration to flush write buffer.
          * timeout=0 means don't block -- just send pending data and return. */
         ret = mosquitto_loop(mqtt_dispatcher->client, 0, 1);
         if (ret != MOSQ_ERR_SUCCESS) {
-            const char *prefix = mqtt_classify_error(ret);
+            const char *prefix = mqtt_classify_loop_error(mqtt_dispatcher, ret);
             ulak_log("warning", "MQTT loop failed: %s", mosquitto_strerror(ret));
             if (error_msg) {
                 *error_msg = psprintf("%s MQTT loop failed: %s", prefix, mosquitto_strerror(ret));
@@ -613,7 +731,7 @@ int mqtt_dispatcher_flush(Dispatcher *dispatcher, int timeout_ms, int64 **failed
                     mqtt->pending_messages[i].delivered = true;
                     mqtt->pending_messages[i].success = false;
                     snprintf(mqtt->pending_messages[i].error, MQTT_ERROR_BUFFER_SIZE,
-                             "%s MQTT loop failed: %s", mqtt_classify_error(ret),
+                             "%s MQTT loop failed: %s", mqtt_classify_loop_error(mqtt, ret),
                              mosquitto_strerror(ret));
                 }
             }
@@ -730,7 +848,8 @@ bool mqtt_dispatcher_validate_config(Jsonb *config) {
                  "MQTT config contains unknown key '%s'. "
                  "Allowed keys: broker, topic, qos, port, client_id, retain, username, "
                  "password, options, tls, tls_ca_cert, tls_cert, tls_key, tls_insecure, "
-                 "will_topic, will_payload, will_qos, will_retain, clean_session",
+                 "will_topic, will_payload, will_qos, will_retain, clean_session, "
+                 "protocol_version",
                  unknown_key ? unknown_key : "unknown");
         if (unknown_key) {
             pfree(unknown_key);
@@ -825,6 +944,12 @@ bool mqtt_dispatcher_validate_config(Jsonb *config) {
 
     if (extract_jsonb_value(config, MQTT_CONFIG_KEY_CLEAN_SESSION, &val) && val.type != jbvBool) {
         ulak_log("error", "MQTT config: 'clean_session' must be a boolean");
+        return false;
+    }
+
+    if (extract_jsonb_value(config, MQTT_CONFIG_KEY_PROTOCOL_VERSION, &val) &&
+        mqtt_parse_protocol_version(&val) == 0) {
+        ulak_log("error", "MQTT config: 'protocol_version' must be \"3.1.1\" or \"5\"");
         return false;
     }
 

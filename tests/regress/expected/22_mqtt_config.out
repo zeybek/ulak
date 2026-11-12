@@ -112,6 +112,25 @@ SELECT ulak.validate_endpoint_config(
  t
 (1 row)
 
+-- protocol_version: "3.1.1" (the default) or "5"
+SELECT ulak.validate_endpoint_config(
+    'mqtt',
+    '{"broker": "localhost", "topic": "test", "protocol_version": "3.1.1"}'::jsonb
+) AS valid_protocol_311;
+ valid_protocol_311 
+--------------------
+ t
+(1 row)
+
+SELECT ulak.validate_endpoint_config(
+    'mqtt',
+    '{"broker": "localhost", "topic": "test", "protocol_version": "5"}'::jsonb
+) AS valid_protocol_5;
+ valid_protocol_5 
+------------------
+ t
+(1 row)
+
 -- ============================================================================
 -- INVALID MQTT CONFIGS
 -- ============================================================================
@@ -236,12 +255,33 @@ WARNING:  [ulak] ERROR: MQTT config: 'will_qos' must be between 0 and 2
  f
 (1 row)
 
+-- protocol_version is a string, "3.1.1" or "5"
+SELECT ulak.validate_endpoint_config(
+    'mqtt',
+    '{"broker": "localhost", "topic": "test", "protocol_version": 5}'::jsonb
+) AS invalid_protocol_number;
+WARNING:  [ulak] ERROR: MQTT config: 'protocol_version' must be "3.1.1" or "5"
+ invalid_protocol_number 
+-------------------------
+ f
+(1 row)
+
+SELECT ulak.validate_endpoint_config(
+    'mqtt',
+    '{"broker": "localhost", "topic": "test", "protocol_version": "3.1"}'::jsonb
+) AS invalid_protocol_31;
+WARNING:  [ulak] ERROR: MQTT config: 'protocol_version' must be "3.1.1" or "5"
+ invalid_protocol_31 
+---------------------
+ f
+(1 row)
+
 -- Unknown config key
 SELECT ulak.validate_endpoint_config(
     'mqtt',
     '{"broker": "localhost", "topic": "test", "unknown_key": "value"}'::jsonb
 ) AS unknown_key;
-WARNING:  [ulak] ERROR: MQTT config contains unknown key 'unknown_key'. Allowed keys: broker, topic, qos, port, client_id, retain, username, password, options, tls, tls_ca_cert, tls_cert, tls_key, tls_insecure, will_topic, will_payload, will_qos, will_retain, clean_session
+WARNING:  [ulak] ERROR: MQTT config contains unknown key 'unknown_key'. Allowed keys: broker, topic, qos, port, client_id, retain, username, password, options, tls, tls_ca_cert, tls_cert, tls_key, tls_insecure, will_topic, will_payload, will_qos, will_retain, clean_session, protocol_version
  unknown_key 
 -------------
  f

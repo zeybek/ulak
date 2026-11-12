@@ -109,6 +109,50 @@ send_msg() {
   $PSQL -c "SELECT ulak.send('$endpoint', '$payload'::jsonb);" > /dev/null 2>&1
 }
 
+# Poll a scalar query until it returns the expected value (or time runs out);
+# prints the last value seen.
+wait_for_value() {
+  local sql="$1" expected="$2" max_wait="${3:-20}" value=""
+  local i
+  for i in $(seq 1 $((max_wait * 2))); do
+    value=$($PSQL_OUT -c "$sql" 2>/dev/null || true)
+    [ "$value" = "$expected" ] && break
+    sleep 0.5
+  done
+  echo "$value"
+}
+
+# Change a SIGHUP GUC for a test and put it back afterwards (the ALTER SYSTEM
+# value if postgresql.auto.conf had one, otherwise RESET), so the suite leaves
+# GUCs as found. Saved per GUC name, so different GUCs can overlap.
+guc_set() {
+  local name="$1" value="$2" key="${1//[^a-zA-Z0-9]/_}" auto old
+  auto=$($PSQL_OUT -c "SELECT coalesce(sourcefile LIKE '%postgresql.auto.conf', false) FROM pg_settings WHERE name = '$name';")
+  old=$($PSQL_OUT -c "SELECT setting FROM pg_settings WHERE name = '$name';")
+  printf -v "GUC_SAVED_AUTO_${key}" '%s' "$auto"
+  printf -v "GUC_SAVED_VALUE_${key}" '%s' "$old"
+  $PSQL -c "ALTER SYSTEM SET $name = '$value';" > /dev/null 2>&1
+  $PSQL -c "SELECT pg_reload_conf();" > /dev/null 2>&1
+  sleep 1
+}
+
+guc_restore() {
+  local name="$1" key="${1//[^a-zA-Z0-9]/_}"
+  local auto_var="GUC_SAVED_AUTO_${key}" value_var="GUC_SAVED_VALUE_${key}"
+  if [ "${!auto_var:-f}" = "t" ]; then
+    $PSQL -c "ALTER SYSTEM SET $name = '${!value_var:-}';" > /dev/null 2>&1
+  else
+    $PSQL -c "ALTER SYSTEM RESET $name;" > /dev/null 2>&1
+  fi
+  $PSQL -c "SELECT pg_reload_conf();" > /dev/null 2>&1
+  sleep 1
+}
+
+endpoint_row() {
+  local name="$1" column="$2"
+  $PSQL_OUT -c "SELECT $column FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = '$name' ORDER BY q.id LIMIT 1;"
+}
+
 cleanup() {
   echo ""
   echo -e "${CYAN}Cleaning up...${NC}"
@@ -300,6 +344,8 @@ ce_struct_data=$(echo "$CE_STRUCT_RESP" | python3 -c "import sys,json; r=json.lo
 assert_eq "CE structured: type in body" "com.test.structured" "$ce_struct_type"
 assert_eq "CE structured: specversion" "1.0" "$ce_struct_ver"
 assert_eq "CE structured: data.test preserved" "cloudevents-structured" "$ce_struct_data"
+ce_struct_ctype=$(echo "$CE_STRUCT_RESP" | python3 -c "import sys,json; r=json.load(sys.stdin)['requests']; print(r[0]['headers'].get('content-type','MISSING'))" 2>/dev/null)
+assert_eq "CE structured: Content-Type is the event format" "application/cloudevents+json" "$ce_struct_ctype"
 
 # ═════════════════════════════════════════════════
 # TEST 8: Batch Dispatch (N messages to same endpoint)
@@ -641,6 +687,149 @@ else
   echo -e "  ${RED}✗${NC} TTL: message not expired (status: $TTL_STATUS)"
   FAIL=$((FAIL + 1))
 fi
+
+# ═════════════════════════════════════════════════
+# TEST 21: OAuth2 — token response larger than libcurl's 16 KB chunk
+# ═════════════════════════════════════════════════
+section "TEST 21: OAuth2 — Large Token Response"
+
+# A 20 KB token arrives in 16 KB chunks, more than one doubling of the 4 KB
+# start buffer per write callback.
+create_endpoint "test-oauth-large" "{\"url\": \"${WEBHOOK_URL}/auth/bearer-oauth/large\", \"method\": \"POST\", \"auth\": {\"type\": \"oauth2\", \"token_url\": \"${WEBHOOK_URL}/oauth/token-large\", \"client_id\": \"cid\", \"client_secret\": \"csecret\"}}"
+send_msg "test-oauth-large" "{\"test\": \"oauth-large\"}"
+
+oauth_large_status=$(wait_for_value "SELECT status FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'test-oauth-large';" "completed" 20)
+assert_eq "OAuth2 large token: message delivered" "completed" "$oauth_large_status"
+oauth_large_len=$(webhook_get "auth/bearer-oauth/large" | python3 -c "import sys,json; r=json.load(sys.stdin)['requests']; print(len(r[0]['headers'].get('authorization','')) if r else 0)" 2>/dev/null)
+assert_eq "OAuth2 large token: whole token in Authorization (7 + 20000 bytes)" "20007" "$oauth_large_len"
+
+# ═════════════════════════════════════════════════
+# TEST 22: OAuth2 — non-JSON token reply, failure backoff
+# ═════════════════════════════════════════════════
+section "TEST 22: OAuth2 — Non-JSON Token Reply"
+
+# A form-encoded 200 is a retryable auth failure, not an ERROR that aborts the
+# batch, and one failed fetch stops the other rows from fetching again for 10 s.
+OAUTH_FORM_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+OAUTH_WORKERS=$($PSQL_OUT -c "SELECT current_setting('ulak.workers');")
+OAUTH_ROWS=$((OAUTH_WORKERS * 3))
+create_endpoint "test-oauth-form" "{\"url\": \"${WEBHOOK_URL}/auth/bearer-oauth/form\", \"method\": \"POST\", \"auth\": {\"type\": \"oauth2\", \"token_url\": \"${WEBHOOK_URL}/oauth/token-form\", \"client_id\": \"cid\", \"client_secret\": \"csecret\"}}"
+$PSQL -c "SELECT ulak.send_batch('test-oauth-form', ARRAY(SELECT jsonb_build_object('i', g) FROM generate_series(1, ${OAUTH_ROWS}) g));" > /dev/null 2>&1
+
+oauth_form_retried=$(wait_for_value "SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'test-oauth-form' AND q.status = 'pending' AND q.retry_count >= 1 AND q.last_error = '[RETRYABLE] HTTP auth failed';" "$OAUTH_ROWS" 20)
+assert_eq "OAuth2 non-JSON reply: every row retryable with 'HTTP auth failed'" "$OAUTH_ROWS" "$oauth_form_retried"
+oauth_form_fetches=$(webhook_count "oauth/token-form")
+TOTAL=$((TOTAL + 1))
+if [ "$oauth_form_fetches" -ge 1 ] && [ "$oauth_form_fetches" -le "$OAUTH_WORKERS" ]; then
+  echo -e "  ${GREEN}✓${NC} OAuth2 failure backoff: $oauth_form_fetches token fetch(es) for $OAUTH_ROWS rows (at most one per worker)"
+  PASS=$((PASS + 1))
+else
+  echo -e "  ${RED}✗${NC} OAuth2 failure backoff: $oauth_form_fetches token fetches for $OAUTH_ROWS rows (expected 1..$OAUTH_WORKERS)"
+  FAIL=$((FAIL + 1))
+fi
+oauth_form_errors=$(docker logs --since "$OAUTH_FORM_SINCE" ulak-postgres-1 2>&1 | grep -c "invalid input syntax for type json" || true)
+assert_eq "OAuth2 non-JSON reply: no JSON ERROR in the server log" "0" "$oauth_form_errors"
+$PSQL -c "SELECT ulak.disable_endpoint('test-oauth-form');" > /dev/null 2>&1
+
+# ═════════════════════════════════════════════════
+# TEST 23: 408 / 425 are retryable
+# ═════════════════════════════════════════════════
+section "TEST 23: HTTP 408 / 425 Retryable"
+
+for code in 408 425; do
+  create_endpoint "test-status-${code}" "{\"url\": \"${WEBHOOK_URL}/status/${code}/transient\", \"method\": \"POST\"}"
+  send_msg "test-status-${code}" "{\"test\": \"status-${code}\"}"
+  st=$(wait_for_value "SELECT q.status || ':' || (q.retry_count >= 1) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'test-status-${code}';" "pending:true" 20)
+  assert_eq "HTTP ${code}: row kept for retry (not dead-lettered)" "pending:true" "$st"
+  err=$(endpoint_row "test-status-${code}" "q.last_error")
+  assert_contains "HTTP ${code}: classified [RETRYABLE]" "RETRYABLE" "$err"
+  $PSQL -c "SELECT ulak.disable_endpoint('test-status-${code}');" > /dev/null 2>&1
+done
+
+# ═════════════════════════════════════════════════
+# TEST 24: Retry-After honoured in batch mode
+# ═════════════════════════════════════════════════
+section "TEST 24: Retry-After in Batch Mode"
+
+# TESTs 24-26 are about the batch path, which capture_response = on bypasses;
+# force it off for them, whatever the cluster has.
+guc_set "ulak.capture_response" "off"
+
+# The batch flush hands Retry-After to the worker as [RETRY_AFTER=n] in the
+# error string.
+create_endpoint "test-retry-after" "{\"url\": \"${WEBHOOK_URL}/status/429/retry-after?retry_after=120\", \"method\": \"POST\"}"
+send_msg "test-retry-after" "{\"test\": \"retry-after\"}"
+ra_retried=$(wait_for_value "SELECT (q.retry_count >= 1) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'test-retry-after';" "t" 20)
+assert_eq "429 + Retry-After: row retried" "t" "$ra_retried"
+ra_err=$(endpoint_row "test-retry-after" "q.last_error")
+assert_contains "429 + Retry-After: error carries the server's delay" "RETRY_AFTER=120" "$ra_err"
+ra_delay=$(endpoint_row "test-retry-after" "(extract(epoch FROM q.next_retry_at - now()) > 90)")
+assert_eq "429 + Retry-After: next attempt about 120 s away, not the 10 s backoff" "t" "$ra_delay"
+$PSQL -c "SELECT ulak.disable_endpoint('test-retry-after');" > /dev/null 2>&1
+
+# ═════════════════════════════════════════════════
+# TEST 25: Per-message headers and url_suffix in batch mode
+# ═════════════════════════════════════════════════
+section "TEST 25: Per-Message Headers + url_suffix"
+
+# queue.headers / queue.metadata are set by admin INSERT, replay and redrive.
+# Batch mode must send them and use the suffixed URL; url_suffix is joined
+# with exactly one '/' and must keep the endpoint's scheme, host and port.
+create_endpoint "test-suffix" "{\"url\": \"${WEBHOOK_URL}/ok/suffix-base/\", \"method\": \"POST\"}"
+$PSQL -c "INSERT INTO ulak.queue (endpoint_id, payload, headers, metadata)
+  SELECT id, '{\"test\": \"suffix-1\"}'::jsonb, '{\"X-Per-Message\": \"yes\"}'::jsonb, '{\"url_suffix\": \"sub/path\"}'::jsonb FROM ulak.endpoints WHERE name = 'test-suffix'
+  UNION ALL
+  SELECT id, '{\"test\": \"suffix-2\"}'::jsonb, NULL, '{\"url_suffix\": \"/sub2\"}'::jsonb FROM ulak.endpoints WHERE name = 'test-suffix'
+  UNION ALL
+  SELECT id, '{\"test\": \"suffix-3\"}'::jsonb, NULL, '{\"url_suffix\": \"@evil.example/x\"}'::jsonb FROM ulak.endpoints WHERE name = 'test-suffix';" > /dev/null 2>&1 || true
+
+suffix_done=$(wait_for_value "SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'test-suffix' AND q.status = 'completed';" "2" 20)
+assert_eq "url_suffix: two rows delivered" "2" "$suffix_done"
+assert_eq "url_suffix: 'sub/path' joined with one '/'" "1" "$(webhook_count 'ok/suffix-base/sub/path')"
+assert_eq "url_suffix: '/sub2' joined with one '/'" "1" "$(webhook_count 'ok/suffix-base/sub2')"
+suffix_hdr=$(webhook_get "ok/suffix-base/sub/path" | python3 -c "import sys,json; r=json.load(sys.stdin)['requests']; print(r[0]['headers'].get('x-per-message','MISSING') if r else 'MISSING')" 2>/dev/null)
+assert_eq "Per-message header delivered in batch mode" "yes" "$suffix_hdr"
+assert_eq "url_suffix: nothing posted to the bare base URL" "0" "$(curl -s "http://localhost:${WEBHOOK_PORT}/api/received" | python3 -c "import sys,json; print(sum(1 for r in json.load(sys.stdin)['requests'] if r['tag'] == 'ok/suffix-base'))")"
+suffix_bad=$(wait_for_value "SELECT count(*) FROM ulak.dlq d JOIN ulak.endpoints e ON d.endpoint_id = e.id WHERE e.name = 'test-suffix' AND d.last_error LIKE '[PERMANENT]%url_suffix%';" "1" 20)
+assert_eq "url_suffix with '@': dead-lettered as [PERMANENT]" "1" "$suffix_bad"
+
+# ═════════════════════════════════════════════════
+# TEST 26: Batch larger than ulak.http_batch_capacity
+# ═════════════════════════════════════════════════
+section "TEST 26: Batch Larger Than http_batch_capacity"
+
+# The pending array grows, so rows beyond its initial size are delivered too.
+guc_set "ulak.http_batch_capacity" "2"
+create_endpoint "test-capacity" "{\"url\": \"${WEBHOOK_URL}/ok/capacity\", \"method\": \"POST\"}"
+$PSQL -c "SELECT ulak.send_batch('test-capacity', ARRAY(SELECT jsonb_build_object('i', g) FROM generate_series(1, 40) g));" > /dev/null 2>&1
+cap_done=$(wait_for_value "SELECT count(*) FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'test-capacity' AND q.status = 'completed' AND q.retry_count = 0;" "40" 20)
+assert_eq "40 rows over a capacity of 2: all delivered on the first attempt" "40" "$cap_done"
+guc_restore "ulak.http_batch_capacity"
+guc_restore "ulak.capture_response"
+
+# ═════════════════════════════════════════════════
+# TEST 27: Captured response body that is not valid UTF-8
+# ═════════════════════════════════════════════════
+section "TEST 27: Captured Body Not Valid UTF-8"
+
+BADUTF8_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+guc_set "ulak.capture_response" "on"
+create_endpoint "test-badutf8" "{\"url\": \"${WEBHOOK_URL}/badutf8/capture\", \"method\": \"POST\"}"
+send_msg "test-badutf8" "{\"test\": \"badutf8\"}"
+badutf8_status=$(wait_for_value "SELECT status FROM ulak.queue q JOIN ulak.endpoints e ON q.endpoint_id = e.id WHERE e.name = 'test-badutf8';" "completed" 20)
+assert_eq "Invalid UTF-8 body: message completed" "completed" "$badutf8_status"
+badutf8_code=$(endpoint_row "test-badutf8" "q.response->>'http_status_code'")
+assert_eq "Invalid UTF-8 body: response captured" "200" "$badutf8_code"
+badutf8_errors=$(docker logs --since "$BADUTF8_SINCE" ulak-postgres-1 2>&1 | grep -cE "invalid byte sequence|invalid input syntax for type json|unsupported Unicode" || true)
+assert_eq "Invalid UTF-8 body: no encoding ERROR in the server log" "0" "$badutf8_errors"
+# jsonb input does not check the encoding, and a row with invalid bytes cannot
+# be restored from a dump (COPY FROM rejects it). Only the valid prefix of the
+# body is kept.
+badutf8_valid=$(endpoint_row "test-badutf8" "length(convert_from(convert_to(q.response::text, 'UTF8'), 'UTF8')) > 0" 2>/dev/null || true)
+assert_eq "Invalid UTF-8 body: stored response is valid UTF-8" "t" "$badutf8_valid"
+badutf8_body=$(endpoint_row "test-badutf8" "q.response->>'http_response_body'")
+assert_eq "Invalid UTF-8 body: valid prefix kept" '{"a":"' "$badutf8_body"
+guc_restore "ulak.capture_response"
 
 # ═════════════════════════════════════════════════
 # SUMMARY

@@ -104,6 +104,63 @@ void batch_processor_cleanup_on_error(void) {
  * Per-endpoint dispatch
  * ------------------------------------------------------------------------ */
 
+/*
+ * Rows of the endpoint group in delivery that an ERROR raised right now is
+ * charged to, as indices into the group: one row while it is produced or
+ * dispatched, the whole group while the dispatcher is built or flushed,
+ * none during a heartbeat. batch_deliver() reads it in its PG_CATCH.
+ */
+static int delivery_scope_from = 0;
+static int delivery_scope_to = 0;
+
+static void set_delivery_scope(int from, int to) {
+    delivery_scope_from = from;
+    delivery_scope_to = to;
+}
+
+/**
+ * @brief Deliver one message synchronously and record its outcome.
+ *
+ * Uses dispatch_ex when response capture is enabled or the message carries
+ * per-message headers/metadata, and the legacy dispatch() otherwise.
+ */
+static void dispatch_one_sync(Dispatcher *dispatcher, MessageBatchInfo *msg) {
+    bool use_dispatch_ex = (dispatcher->ops->dispatch_ex != NULL) &&
+                           (ulak_capture_response || msg->headers != NULL || msg->metadata != NULL);
+
+    if (use_dispatch_ex) {
+        DispatchResult *result = dispatch_result_create();
+        if (result != NULL)
+            result->message_id = msg->message_id;
+        if (result == NULL) {
+            msg->processed = true;
+            msg->success = false;
+            msg->error_message = pstrdup("Failed to allocate dispatch result");
+            msg->result = NULL;
+        } else {
+            bool success = dispatcher_dispatch_ex(dispatcher, msg->payload_str, msg->headers,
+                                                  msg->metadata, result);
+            msg->processed = true;
+            msg->success = success;
+            msg->error_message = result->error_msg ? pstrdup(result->error_msg) : NULL;
+            /* Retry-After applies whether or not the response is captured */
+            msg->retry_after_seconds = result->retry_after_seconds;
+            /* Keep result for response storage only when capture is on */
+            msg->result = ulak_capture_response ? result : NULL;
+            if (!ulak_capture_response)
+                dispatch_result_free(result);
+        }
+    } else {
+        /* Legacy dispatch path — no headers/metadata, no capture */
+        char *error_msg = NULL;
+        bool success = dispatcher->ops->dispatch(dispatcher, msg->payload_str, &error_msg);
+        msg->processed = true;
+        msg->success = success;
+        msg->error_message = error_msg;
+        msg->result = NULL;
+    }
+}
+
 /**
  * @brief Process a batch of messages for a single endpoint.
  *
@@ -133,6 +190,10 @@ static void process_endpoint_batch(MessageBatchInfo *messages, int count, const 
 
     if (count == 0)
         return;
+
+    /* An error while the dispatcher is built or the rate limit is read
+     * concerns every row of the group */
+    set_delivery_scope(0, count);
 
     /* Convert protocol string to enum */
     if (!protocol_string_to_type(protocol, &proto_type)) {
@@ -186,10 +247,13 @@ static void process_endpoint_batch(MessageBatchInfo *messages, int count, const 
      * When capture_response is enabled, force sync mode so dispatch_ex
      * can capture per-message HTTP response bodies.
      * Batch mode uses produce_ex when available to forward per-message
-     * headers/metadata; falls back to produce otherwise. */
+     * headers/metadata. A dispatcher without produce_ex delivers those rows
+     * one by one through dispatch_ex before the batch instead of dropping
+     * their headers/metadata. */
     if (!ulak_capture_response && dispatcher->ops->supports_batch &&
         dispatcher->ops->supports_batch(dispatcher)) {
         /* BATCH MODE - produce all messages without waiting, then flush once */
+        int produced_count = 0;
 
         /* Verify batch operations are implemented */
         if (dispatcher->ops->produce == NULL || dispatcher->ops->flush == NULL) {
@@ -204,13 +268,28 @@ static void process_endpoint_batch(MessageBatchInfo *messages, int count, const 
             return;
         }
 
+        /* Rows with per-message headers/metadata on a dispatcher without
+         * produce_ex: synchronous dispatch_ex keeps them */
+        if (dispatcher->ops->produce_ex == NULL && dispatcher->ops->dispatch_ex != NULL) {
+            for (i = 0; i < count; i++) {
+                if (messages[i].rate_limited ||
+                    (messages[i].headers == NULL && messages[i].metadata == NULL))
+                    continue;
+                set_delivery_scope(0, 0);
+                batch_heartbeat_if_due();
+                set_delivery_scope(i, i + 1);
+                dispatch_one_sync(dispatcher, &messages[i]);
+            }
+        }
+
         /* Phase 1: Produce all messages (non-blocking), skip rate-limited.
          * Use produce_ex when available to forward per-message headers/metadata. */
         for (i = 0; i < count; i++) {
             char *error_msg = NULL;
             bool produced;
-            if (messages[i].rate_limited)
+            if (messages[i].rate_limited || messages[i].processed)
                 continue;
+            set_delivery_scope(i, i + 1);
             if (dispatcher->ops->produce_ex != NULL &&
                 (messages[i].headers != NULL || messages[i].metadata != NULL)) {
                 produced = dispatcher->ops->produce_ex(dispatcher, messages[i].payload_str,
@@ -232,7 +311,14 @@ static void process_endpoint_batch(MessageBatchInfo *messages, int count, const 
                 messages[i].success = false;
                 messages[i].error_message =
                     error_msg ? error_msg : pstrdup("Failed to enqueue message");
+            } else {
+                produced_count++;
             }
+        }
+
+        if (produced_count == 0) {
+            set_delivery_scope(0, 0);
+            return;
         }
 
         /* Phase 2: Flush and wait for all deliveries */
@@ -260,6 +346,7 @@ static void process_endpoint_batch(MessageBatchInfo *messages, int count, const 
         {
             flush_timeout = ulak_http_flush_timeout;
         }
+        set_delivery_scope(0, count);
         success_count = dispatcher->ops->flush(dispatcher, flush_timeout, &failed_ids,
                                                &failed_count, &failed_errors);
         (void)success_count; /* Used for logging in debug builds */
@@ -311,51 +398,17 @@ static void process_endpoint_batch(MessageBatchInfo *messages, int count, const 
          *  - the message carries per-message headers/metadata.
          * Fall back to legacy dispatch() only when neither applies. */
         for (i = 0; i < count; i++) {
-            bool use_dispatch_ex;
-
             if (messages[i].rate_limited)
                 continue;
             /* Long synchronous groups: keep stale recovery away from our rows */
+            set_delivery_scope(0, 0);
             batch_heartbeat_if_due();
 
-            use_dispatch_ex = (dispatcher->ops->dispatch_ex != NULL) &&
-                              (ulak_capture_response || messages[i].headers != NULL ||
-                               messages[i].metadata != NULL);
-
-            if (use_dispatch_ex) {
-                DispatchResult *result = dispatch_result_create();
-                if (result != NULL)
-                    result->message_id = messages[i].message_id;
-                if (result == NULL) {
-                    messages[i].processed = true;
-                    messages[i].success = false;
-                    messages[i].error_message = pstrdup("Failed to allocate dispatch result");
-                    messages[i].result = NULL;
-                } else {
-                    bool success =
-                        dispatcher_dispatch_ex(dispatcher, messages[i].payload_str,
-                                               messages[i].headers, messages[i].metadata, result);
-                    messages[i].processed = true;
-                    messages[i].success = success;
-                    messages[i].error_message =
-                        result->error_msg ? pstrdup(result->error_msg) : NULL;
-                    /* Keep result for response storage only when capture is on */
-                    messages[i].result = ulak_capture_response ? result : NULL;
-                    if (!ulak_capture_response)
-                        dispatch_result_free(result);
-                }
-            } else {
-                /* Legacy dispatch path — no headers/metadata, no capture */
-                char *error_msg = NULL;
-                bool success =
-                    dispatcher->ops->dispatch(dispatcher, messages[i].payload_str, &error_msg);
-                messages[i].processed = true;
-                messages[i].success = success;
-                messages[i].error_message = error_msg;
-                messages[i].result = NULL;
-            }
+            set_delivery_scope(i, i + 1);
+            dispatch_one_sync(dispatcher, &messages[i]);
         }
     }
+    set_delivery_scope(0, 0);
 
     /* Dispatcher stays in cache for connection reuse across batches.
      * Cleanup happens via: idle eviction, config change, SIGHUP,
@@ -379,9 +432,11 @@ static void process_endpoint_batch(MessageBatchInfo *messages, int count, const 
  *                circuit-breaker bookkeeping, COMMIT.
  *
  * A worker that dies between 1 and 3 leaves rows in 'processing'; stale
- * recovery (ulak.stale_recovery_timeout) returns them to 'pending'. An
- * error raised between 1 and 3 goes through batch_processor_release_claimed()
- * from the worker's PG_CATCH, which puts the rows back immediately.
+ * recovery (ulak.stale_recovery_timeout) returns them to 'pending'. An error
+ * raised while delivering to one endpoint is charged to the rows it concerns
+ * (batch_deliver()); any other error raised between 1 and 3 goes through
+ * batch_processor_release_claimed() from the worker's PG_CATCH, which puts
+ * the rows back immediately.
  * ------------------------------------------------------------------------ */
 
 /* Rows claimed by the current batch, for release on error (see above). */
@@ -502,6 +557,7 @@ static void batch_release_claimed_rows(MessageBatchInfo *messages, uint64 count)
 }
 
 void batch_processor_release_claimed(void) {
+    MemoryContext caller_context = CurrentMemoryContext;
     MessageBatchInfo *messages = in_flight.messages;
     uint64 count = in_flight.count;
     bool claimed = in_flight.claimed;
@@ -521,13 +577,21 @@ void batch_processor_release_claimed(void) {
     }
     PG_CATCH();
     {
-        ErrorData *edata = CopyErrorData();
-        FreeErrorData(edata);
+        ErrorData *edata;
+
+        /* errfinish() left us in ErrorContext, which CopyErrorData() refuses */
+        MemoryContextSwitchTo(caller_context);
+        edata = CopyErrorData();
         FlushErrorState();
-        if (IsTransactionState())
-            AbortCurrentTransaction();
-        elog(WARNING, "[ulak] Releasing claimed messages failed; stale recovery will "
-                      "return them to pending");
+        /* Unconditional: an error raised while starting or committing leaves
+         * a transaction that IsTransactionState() does not report */
+        AbortCurrentTransaction();
+        MemoryContextSwitchTo(caller_context);
+        elog(WARNING,
+             "[ulak] Releasing claimed messages failed (%s); stale recovery will "
+             "return them to pending",
+             edata->message ? edata->message : "unknown error");
+        FreeErrorData(edata);
     }
     PG_END_TRY();
 }
@@ -572,11 +636,18 @@ static bool batch_claim(int worker_id, int total_workers, MemoryContext batch_co
     /*
      * READ COMMITTED + SKIP LOCKED is the pattern for concurrent queue
      * consumers; REPEATABLE READ would raise serialization failures between
-     * workers. synchronous_commit is off for worker transactions: the
-     * status transitions are idempotent and redone after a crash, so we
-     * trade durability of the bookkeeping for faster commits.
+     * workers.
+     *
+     * The claim commit is flushed locally even when the server default is
+     * off: a sender that committed asynchronously (ulak.enable_fast_mode())
+     * is visible before its WAL is flushed, and flushing our commit record
+     * flushes the sender's too, so a crash cannot leave a delivered event for
+     * a transaction that never happened. 'local' rather than 'on', so a
+     * missing synchronous standby neither stops delivery nor blocks SIGTERM.
+     * The results transaction stays asynchronous: losing it only means
+     * redelivery after stale recovery.
      */
-    SPI_execute_with_args("SET LOCAL synchronous_commit = off", 0, NULL, NULL, NULL, false, 0);
+    SPI_execute_with_args("SET LOCAL synchronous_commit = local", 0, NULL, NULL, NULL, false, 0);
     PushActiveSnapshot(GetTransactionSnapshot());
 
     /* Extension schema present? (worker may start before CREATE EXTENSION) */
@@ -593,7 +664,9 @@ static bool batch_claim(int worker_id, int total_workers, MemoryContext batch_co
     /*
      * Select pending messages with their endpoint in one query. Workers
      * partition the queue: unkeyed rows by id, keyed rows by
-     * abs(hashtext(ordering_key)), so per-key FIFO holds with N workers.
+     * abs(hashtext(ordering_key)::bigint), so per-key FIFO holds with N
+     * workers. The cast comes first: hashtext() can return INT32_MIN, whose
+     * int4 abs() raises "integer out of range" and would fail every claim.
      * For a keyed row only the head of its key is eligible (no 'processing'
      * row and no lower pending id with the same key).
      */
@@ -626,7 +699,7 @@ static bool batch_claim(int worker_id, int total_workers, MemoryContext batch_co
     if (total_workers > 1)
         appendStringInfo(&query,
                          "  AND ((CASE WHEN q.ordering_key IS NULL THEN q.id "
-                         "             ELSE abs(hashtext(q.ordering_key))::bigint "
+                         "             ELSE abs(hashtext(q.ordering_key)::bigint) "
                          "        END) %% %d) = %d ",
                          total_workers, worker_id);
     appendStringInfo(&query,
@@ -806,28 +879,33 @@ static bool batch_claim(int worker_id, int total_workers, MemoryContext batch_co
 
     /*
      * Circuit breaker decisions, per endpoint group (rows are ordered by
-     * endpoint_id). Rows behind an open circuit go straight back to
-     * 'pending' with a delay in this same transaction and are flagged
-     * `deferred` so the delivery phase skips them. The breaker counters are
-     * left alone for deferred rows: nothing was attempted.
+     * endpoint_id). Rows behind an open circuit, or a half_open one whose
+     * probe is still out, go straight back to 'pending' with a delay in this
+     * same transaction and are flagged `deferred` so the delivery phase skips
+     * them. The breaker counters are left alone for deferred rows: nothing
+     * was attempted.
      */
     batch_start = 0;
     while (batch_start < total_messages) {
         int64 endpoint_id = all_messages[batch_start].endpoint_id;
+        bool cb_open = strcmp(all_messages[batch_start].circuit_state, "open") == 0;
+        bool cb_half_open = strcmp(all_messages[batch_start].circuit_state, "half_open") == 0;
         uint64 k;
 
         batch_end = batch_start;
         while (batch_end < total_messages && all_messages[batch_end].endpoint_id == endpoint_id)
             batch_end++;
 
-        if (strcmp(all_messages[batch_start].circuit_state, "open") == 0) {
+        if (cb_open || cb_half_open) {
             const char *defer_query;
             uint64 defer_from = batch_start;
+            TimestampTz probe_at = all_messages[batch_start].circuit_half_open_at;
 
-            if (all_messages[batch_start].circuit_half_open_at > 0 &&
-                GetCurrentTimestamp() >= all_messages[batch_start].circuit_half_open_at) {
-                /* Cooldown elapsed: one worker wins the half_open transition and
-                 * sends the first row as the probe; everybody else defers. */
+            if ((probe_at > 0 && GetCurrentTimestamp() >= probe_at) ||
+                (cb_half_open && probe_at == 0)) {
+                /* Cooldown elapsed (open) or the probe deadline passed with no
+                 * result (half_open): one worker wins the transition and sends
+                 * the first row as the probe; everybody else defers. */
                 if (cb_try_half_open_transition(endpoint_id)) {
                     elog(LOG, "[ulak] Circuit breaker half_open for endpoint %lld — sending probe",
                          (long long)endpoint_id);
@@ -844,6 +922,13 @@ static bool batch_claim(int worker_id, int total_workers, MemoryContext batch_co
                                   "last_error = 'Circuit breaker transition lost — another worker "
                                   "is probing' WHERE id = $1";
                 }
+            } else if (cb_half_open) {
+                /* A probe is out: sending more would defeat the single probe */
+                defer_query = "UPDATE ulak.queue SET status = 'pending', "
+                              "processing_started_at = NULL, "
+                              "next_retry_at = NOW() + '5 seconds'::interval, "
+                              "last_error = 'Circuit breaker half_open - waiting for probe "
+                              "result' WHERE id = $1";
             } else {
                 defer_query = "UPDATE ulak.queue SET status = 'pending', "
                               "processing_started_at = NULL, "
@@ -881,7 +966,9 @@ static bool batch_claim(int worker_id, int total_workers, MemoryContext batch_co
  *
  * Runs with no transaction open. Allocations (error strings, dispatch
  * results) land in the current memory context, which the caller sets to
- * the batch context.
+ * the batch context. An ERROR raised while delivering one endpoint group is
+ * caught here: the rows it concerns get a retryable failure, the endpoint's
+ * dispatcher is dropped from the cache and the next group goes on.
  */
 static void batch_deliver(MessageBatchInfo *all_messages, uint64 total_messages) {
     uint64 batch_start = 0;
@@ -904,14 +991,95 @@ static void batch_deliver(MessageBatchInfo *all_messages, uint64 total_messages)
         while (live_end < batch_end && !all_messages[live_end].deferred)
             live_end++;
 
-        if (live_end > batch_start)
-            process_endpoint_batch(&all_messages[batch_start], (int)(live_end - batch_start),
-                                   all_messages[batch_start].protocol,
-                                   all_messages[batch_start].config,
-                                   all_messages[batch_start].retry_policy);
+        if (live_end > batch_start) {
+            MessageBatchInfo *group = &all_messages[batch_start];
+            int group_count = (int)(live_end - batch_start);
+            MemoryContext delivery_context = CurrentMemoryContext;
+            bool raised = false;
+
+            set_delivery_scope(0, 0);
+            PG_TRY();
+            {
+                process_endpoint_batch(group, group_count, group->protocol, group->config,
+                                       group->retry_policy);
+            }
+            PG_CATCH();
+            {
+                /*
+                 * Keep the outcomes we have, charge the rows the error belongs
+                 * to like any retryable failure, and leave the untouched rest
+                 * unattempted. Unwinding to the worker loop would put the whole
+                 * batch back uncharged, so a deterministic error would deliver
+                 * the same rows again on every cycle and never reach the DLQ.
+                 */
+                ErrorData *edata;
+                int charged = 0;
+                int k;
+
+                MemoryContextSwitchTo(delivery_context);
+                edata = CopyErrorData();
+                /* A cancel is not the rows' fault: let the worker loop release them */
+                if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED) {
+                    FreeErrorData(edata);
+                    PG_RE_THROW();
+                }
+                FlushErrorState();
+                /* A heartbeat transaction may have been open */
+                AbortCurrentTransaction();
+                MemoryContextSwitchTo(delivery_context);
+
+                for (k = Max(delivery_scope_from, 0); k < Min(delivery_scope_to, group_count);
+                     k++) {
+                    if (group[k].processed || group[k].rate_limited)
+                        continue;
+                    group[k].processed = true;
+                    group[k].success = false;
+                    group[k].error_message =
+                        psprintf(ERROR_PREFIX_RETRYABLE " Delivery error: %s",
+                                 edata->message ? edata->message : "unknown error");
+                    charged++;
+                }
+                elog(WARNING,
+                     "[ulak] Delivery to endpoint %lld raised an error, %d message(s) charged a "
+                     "retry: %s",
+                     (long long)endpoint_id, charged,
+                     edata->message ? edata->message : "unknown error");
+                FreeErrorData(edata);
+                set_delivery_scope(0, 0);
+                raised = true;
+            }
+            PG_END_TRY();
+
+            /* The dispatcher may be half-way through a batch: rebuild it next time */
+            if (raised)
+                dispatcher_cache_invalidate(endpoint_id);
+        }
 
         batch_start = batch_end;
     }
+}
+
+/**
+ * @brief Retry-After seconds carried in a batch-mode error string.
+ *
+ * Batch flushes report only an error string per failed row, so dispatchers
+ * append ERROR_MARKER_RETRY_AFTER "<seconds>]" there. Same bounds as the
+ * synchronous path (1..86400).
+ *
+ * @return The delay in seconds, or 0 when absent or invalid.
+ */
+static int32 retry_after_from_error(const char *error_str) {
+    const char *p;
+    char *end;
+    long val;
+
+    if (error_str == NULL || (p = strstr(error_str, ERROR_MARKER_RETRY_AFTER)) == NULL)
+        return 0;
+    p += strlen(ERROR_MARKER_RETRY_AFTER);
+    val = strtol(p, &end, 10);
+    if (end == p || *end != ']' || val < 1 || val > 86400)
+        return 0;
+    return (int32)val;
 }
 
 /**
@@ -1074,12 +1242,18 @@ static bool batch_write_results(MessageBatchInfo *all_messages, uint64 total_mes
                 bool is_permanent_error = (error_str && strncmp(error_str, ERROR_PREFIX_PERMANENT,
                                                                 ERROR_PREFIX_PERMANENT_LEN) == 0);
 
-                /* Retry-After override: use server-specified delay if available */
-                if (all_messages[i].result != NULL &&
-                    all_messages[i].result->retry_after_seconds > 0) {
-                    delay_seconds = all_messages[i].result->retry_after_seconds;
-                    elog(DEBUG1, "[ulak] Using Retry-After=%d for message %lld", delay_seconds,
-                         (long long)all_messages[i].message_id);
+                /* Retry-After override: use the server-specified delay when the
+                 * sync path recorded one or a batch flush put it in the error */
+                {
+                    int32 retry_after = all_messages[i].retry_after_seconds;
+
+                    if (retry_after <= 0)
+                        retry_after = retry_after_from_error(error_str);
+                    if (retry_after > 0) {
+                        delay_seconds = retry_after;
+                        elog(DEBUG1, "[ulak] Using Retry-After=%d for message %lld", delay_seconds,
+                             (long long)all_messages[i].message_id);
+                    }
                 }
 
                 /* 410 Gone auto-disable: check error string for [DISABLE] marker */

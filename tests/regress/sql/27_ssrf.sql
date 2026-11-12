@@ -1,0 +1,42 @@
+-- 27_ssrf.sql: SSRF classification of endpoint URLs at validation time.
+-- 00_setup turns the guard off for the suite; this session turns it back on.
+-- Only address literals and numeric forms are used, so no DNS is needed.
+
+SET ulak.http_allow_internal_urls = off;
+
+SELECT url, ulak.validate_endpoint_config('http', jsonb_build_object('url', url)) AS accepted
+FROM (VALUES
+    (1, 'http://127.0.0.1/hook'),
+    (2, 'http://LocalHost:8080/hook'),
+    (3, 'http://[::1]/hook'),
+    (4, 'http://[::]/hook'),                       -- Linux connects :: to ::1
+    (5, 'http://0.0.0.0/hook'),
+    (6, 'http://2130706433/hook'),                 -- 127.0.0.1 as one number
+    (7, 'http://0x7f.1/hook'),                     -- 127.0.0.1 in hex shorthand
+    (8, 'http://169.254.169.254/latest/meta-data'),
+    (9, 'http://100.64.0.1/hook'),
+    (10, 'http://255.255.255.255/hook'),
+    (11, 'http://[::ffff:10.0.0.1]/hook'),         -- IPv4-mapped
+    (12, 'http://[64:ff9b::a9fe:a9fe]/hook'),      -- NAT64 form of 169.254.169.254
+    (13, 'http://[fe80::1]/hook'),
+    (14, 'http://[fd00::1]:8443/hook'),
+    (15, 'http://8.8.8.8/hook'),
+    (16, 'https://[2001:4860:4860::8888]:8443/hook'),
+    (17, 'http://[64:ff9b::808:808]/hook'),        -- NAT64 form of 8.8.8.8
+    (18, 'http://:8080/hook'),                     -- no host
+    (19, 'http://[2001:db8::1/hook')               -- unterminated IPv6 literal
+) AS t(n, url)
+ORDER BY n;
+
+-- The OAuth2 token endpoint goes through the same check
+SELECT ulak.validate_endpoint_config('http',
+    '{"url": "http://8.8.8.8/hook",
+      "auth": {"type": "oauth2", "token_url": "http://[::]/token",
+               "client_id": "id", "client_secret": "secret"}}'::jsonb) AS token_url_unspecified;
+
+SELECT ulak.validate_endpoint_config('http',
+    '{"url": "http://8.8.8.8/hook",
+      "auth": {"type": "oauth2", "token_url": "https://8.8.4.4/token",
+               "client_id": "id", "client_secret": "secret"}}'::jsonb) AS token_url_public;
+
+RESET ulak.http_allow_internal_urls;

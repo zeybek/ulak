@@ -16,6 +16,7 @@
 
 #include <hiredis/hiredis.h>
 #include <hiredis/hiredis_ssl.h>
+#include <openssl/ssl.h>
 #include <time.h>
 
 /* Redis Configuration Keys */
@@ -96,10 +97,10 @@ typedef struct {
 
     /** @name Runtime connection state */
     /** @{ */
-    redisContext *context;        /**< Active hiredis connection (NULL if disconnected). */
-    char resolved_ip[64];         /**< Cached numeric address of host ('' = not resolved). */
-    time_t resolved_at;           /**< When resolved_ip was obtained (60 s TTL). */
-    redisSSLContext *ssl_context; /**< TLS context (NULL if TLS disabled). */
+    redisContext *context; /**< Active hiredis connection (NULL if disconnected). */
+    char resolved_ip[64];  /**< Cached numeric address of host ('' = not resolved). */
+    time_t resolved_at;    /**< When resolved_ip was obtained (60 s TTL). */
+    SSL_CTX *ssl_context;  /**< TLS context (NULL if TLS disabled). */
     /** @} */
 
     /** @name Connection health tracking */

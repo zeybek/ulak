@@ -17,11 +17,14 @@
 #include "postgres.h"
 
 /**
- * @brief Attempt to transition an endpoint from 'open' to 'half_open'.
+ * @brief Take the half_open probe for an endpoint.
  *
- * CAS-style UPDATE: only succeeds when the current state is still 'open',
- * so at most one worker wins the transition. Callers that lose the race
- * should defer their batch.
+ * CAS-style UPDATE: succeeds when the state is 'open' with its cooldown
+ * over, or 'half_open' whose probe deadline has passed (the earlier probe
+ * never reported, e.g. it was rate limited or its worker died), so at most
+ * one worker wins. The winner sets circuit_half_open_at to now +
+ * ulak.circuit_breaker_cooldown as the new probe deadline. Callers that lose
+ * the race should defer their batch.
  *
  * Must be invoked inside an active SPI transaction (SPI_connect() already
  * called). Does not manage its own transaction lifecycle.

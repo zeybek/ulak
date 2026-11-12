@@ -110,216 +110,234 @@ bool http_url_has_userinfo(const char *url, size_t url_len) {
 }
 
 /**
+ * @brief Check whether an IPv4 address (network byte order) is internal.
+ *
+ * Loopback 127.0.0.0/8, RFC 1918 (10/8, 172.16/12, 192.168/16), link-local and
+ * cloud metadata 169.254.0.0/16, CGNAT 100.64.0.0/10, "this network" 0.0.0.0/8
+ * (Linux connects 0.0.0.0 to the local host) and the limited broadcast
+ * address.
+ *
+ * @param ip  Four address bytes.
+ * @return true if the address is internal (should be blocked).
+ */
+static bool ulak_ipv4_is_internal(const unsigned char *ip) {
+    if (ip[0] == 127 || ip[0] == 10 || ip[0] == 0) /* loopback, 10/8, 0/8 */
+        return true;
+    if (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) /* 172.16.0.0/12 */
+        return true;
+    if (ip[0] == 192 && ip[1] == 168) /* 192.168.0.0/16 */
+        return true;
+    if (ip[0] == 169 && ip[1] == 254) /* 169.254.0.0/16 link-local / metadata */
+        return true;
+    if (ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127) /* 100.64.0.0/10 CGNAT */
+        return true;
+    if (ip[0] == 255 && ip[1] == 255 && ip[2] == 255 && ip[3] == 255) /* broadcast */
+        return true;
+    return false;
+}
+
+/**
+ * @brief Check whether a resolved socket address is internal/private.
+ *
+ * The single range table for every SSRF check: the getaddrinfo pass at
+ * validation time and the connect-time guard below use it, so the two cannot
+ * drift. IPv6: the unspecified address (Linux connects a TCP socket to :: as
+ * ::1, net/ipv6/tcp_ipv6.c tcp_v6_connect), loopback, link-local fe80::/10,
+ * unique-local fc00::/7, and the IPv4 address carried by IPv4-mapped
+ * (::ffff:a.b.c.d) and NAT64 well-known-prefix (64:ff9b::a.b.c.d, RFC 6052)
+ * addresses, so a rebind to ::ffff:169.254.169.254 or a DNS64 answer cannot
+ * bypass the IPv4 ranges.
+ *
+ * @param sa  Resolved socket address.
+ * @return true if the address is internal/private (should be blocked).
+ */
+static bool ulak_sockaddr_is_internal(const struct sockaddr *sa) {
+    static const unsigned char nat64_prefix[12] = {0x00, 0x64, 0xff, 0x9b};
+
+    if (sa == NULL) {
+        return false;
+    }
+
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)sa;
+
+        return ulak_ipv4_is_internal((const unsigned char *)&ipv4->sin_addr);
+    } else if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *ipv6 = (const struct sockaddr_in6 *)sa;
+        const unsigned char *ip6 = ipv6->sin6_addr.s6_addr;
+
+        if (IN6_IS_ADDR_UNSPECIFIED(&ipv6->sin6_addr)) /* :: */
+            return true;
+        if (IN6_IS_ADDR_LOOPBACK(&ipv6->sin6_addr)) /* ::1 */
+            return true;
+        if (IN6_IS_ADDR_LINKLOCAL(&ipv6->sin6_addr)) /* fe80::/10 */
+            return true;
+        if ((ip6[0] & 0xfe) == 0xfc) /* fc00::/7 unique-local */
+            return true;
+        if (IN6_IS_ADDR_V4MAPPED(&ipv6->sin6_addr) ||
+            memcmp(ip6, nat64_prefix, sizeof(nat64_prefix)) == 0)
+            return ulak_ipv4_is_internal(&ip6[12]);
+    }
+
+    return false;
+}
+
+/**
+ * @brief Extract the host curl will connect to from an http(s) URL.
+ *
+ * The host is the authority after the last '@' (userinfo is rejected by
+ * validation, but curl would connect to what follows it), without the port; a
+ * bracketed IPv6 literal ("http://[2001:db8::1]:8080/") is returned without
+ * its brackets.
+ *
+ * @param url            URL string (need not be NUL-terminated).
+ * @param url_len        Length of the URL string.
+ * @param hostname       Output buffer.
+ * @param hostname_size  Size of the output buffer.
+ * @return true if a non-empty host that fits the buffer was found.
+ */
+static bool http_url_host(const char *url, size_t url_len, char *hostname, size_t hostname_size) {
+    const char *end = url + url_len;
+    const char *p = url;
+    const char *authority;
+    const char *host_start;
+    const char *host_end;
+    size_t host_len;
+
+    /* Authority starts after "://" */
+    while (p + 3 <= end && !(p[0] == ':' && p[1] == '/' && p[2] == '/'))
+        p++;
+    if (p + 3 > end)
+        return false;
+    authority = p + 3;
+
+    /* Authority ends at the path, query or fragment */
+    p = authority;
+    while (p < end && *p != '/' && *p != '?' && *p != '#')
+        p++;
+    end = p;
+
+    host_start = authority;
+    for (p = authority; p < end; p++) {
+        if (*p == '@')
+            host_start = p + 1;
+    }
+
+    host_end = host_start;
+    if (host_start < end && *host_start == '[') {
+        host_start++;
+        host_end = host_start;
+        while (host_end < end && *host_end != ']')
+            host_end++;
+        if (host_end == end)
+            return false; /* unterminated IPv6 literal */
+    } else {
+        while (host_end < end && *host_end != ':')
+            host_end++;
+    }
+
+    host_len = host_end - host_start;
+    if (host_len == 0 || host_len >= hostname_size)
+        return false;
+
+    memcpy(hostname, host_start, host_len);
+    hostname[host_len] = '\0';
+    return true;
+}
+
+/**
+ * @brief Classify the host an http(s) URL points at (SSRF protection).
+ *
+ * Blocks localhost, every address literal in the internal ranges of
+ * ulak_sockaddr_is_internal(), and names that resolve to one of them (DNS
+ * rebinding: 169-254-169-254.nip.io -> 169.254.169.254). getaddrinfo also
+ * turns numeric forms such as "2130706433" or "0x7f.1" into the address they
+ * denote, so no string matching on the host is needed. A host that does not
+ * resolve is reported separately: it is not known to be internal, and the
+ * connect-time guard still checks whatever curl resolves later.
+ *
+ * Returns HTTP_URL_TARGET_PUBLIC for everything when
+ * ulak.http_allow_internal_urls is on.
+ *
+ * @param url      URL string (need not be NUL-terminated).
+ * @param url_len  Length of the URL string.
+ * @return HTTP_URL_TARGET_PUBLIC, HTTP_URL_TARGET_INTERNAL or HTTP_URL_TARGET_UNRESOLVED.
+ */
+HttpUrlTarget http_classify_url_target(const char *url, size_t url_len) {
+    char hostname[256];
+    struct in_addr addr4;
+    struct sockaddr_in6 literal6;
+    struct addrinfo hints, *result, *rp;
+    int gai_ret;
+
+    /* Check if internal URLs are explicitly allowed (for testing) */
+    if (ulak_http_allow_internal_urls) {
+        return HTTP_URL_TARGET_PUBLIC;
+    }
+
+    if (url == NULL || url_len == 0 || !http_url_host(url, url_len, hostname, sizeof(hostname))) {
+        return HTTP_URL_TARGET_UNRESOLVED;
+    }
+
+    if (pg_strcasecmp(hostname, "localhost") == 0) {
+        return HTTP_URL_TARGET_INTERNAL;
+    }
+
+    /* Address literals: no lookup, no warning */
+    if (inet_pton(AF_INET, hostname, &addr4) == 1) {
+        return ulak_ipv4_is_internal((const unsigned char *)&addr4) ? HTTP_URL_TARGET_INTERNAL
+                                                                    : HTTP_URL_TARGET_PUBLIC;
+    }
+    memset(&literal6, 0, sizeof(literal6));
+    if (inet_pton(AF_INET6, hostname, &literal6.sin6_addr) == 1) {
+        literal6.sin6_family = AF_INET6;
+        return ulak_sockaddr_is_internal((const struct sockaddr *)&literal6)
+                   ? HTTP_URL_TARGET_INTERNAL
+                   : HTTP_URL_TARGET_PUBLIC;
+    }
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC; /* IPv4 or IPv6 */
+    hints.ai_socktype = SOCK_STREAM;
+
+    gai_ret = getaddrinfo(hostname, NULL, &hints, &result);
+    if (gai_ret != 0) {
+        elog(DEBUG1, "[ulak] DNS resolution failed for '%s': %s", hostname, gai_strerror(gai_ret));
+        return HTTP_URL_TARGET_UNRESOLVED;
+    }
+
+    for (rp = result; rp != NULL; rp = rp->ai_next) {
+        if (ulak_sockaddr_is_internal(rp->ai_addr)) {
+            char addr_text[INET6_ADDRSTRLEN] = "?";
+            const void *raw = rp->ai_family == AF_INET6
+                                  ? (const void *)&((struct sockaddr_in6 *)rp->ai_addr)->sin6_addr
+                                  : (const void *)&((struct sockaddr_in *)rp->ai_addr)->sin_addr;
+
+            inet_ntop(rp->ai_family, raw, addr_text, sizeof(addr_text));
+            elog(WARNING, "[ulak] SSRF blocked: '%s' resolves to internal/private address %s",
+                 hostname, addr_text);
+            freeaddrinfo(result);
+            return HTTP_URL_TARGET_INTERNAL;
+        }
+    }
+
+    freeaddrinfo(result);
+    return HTTP_URL_TARGET_PUBLIC;
+}
+
+/**
  * @brief Check if URL targets an internal/private IP address (SSRF protection).
  *
- * Blocks requests to:
- *   - localhost (127.0.0.1, ::1)
- *   - Private networks (10.x.x.x, 172.16-31.x.x, 192.168.x.x)
- *   - Link-local / AWS metadata (169.254.x.x)
- *   - IPv6 local addresses
- *
- * Can be bypassed by setting ulak.http_allow_internal_urls = true.
+ * True only when the host is known to be internal; a host that does not
+ * resolve is not (use http_classify_url_target() to tell the two apart).
+ * Always false when ulak.http_allow_internal_urls is on.
  *
  * @param url URL string to check.
  * @param url_len Length of the URL string.
  * @return true if the URL targets an internal address (should be blocked).
  */
 bool http_is_internal_url(const char *url, size_t url_len) {
-    const char *host_start;
-    const char *host_end;
-    size_t remaining;
-    size_t host_len;
-    char hostname[256];
-
-    /* Check if internal URLs are explicitly allowed (for testing) */
-    if (ulak_http_allow_internal_urls) {
-        return false; /* Allow all URLs, skip SSRF check */
-    }
-
-    if (url == NULL || url_len == 0) {
-        return false;
-    }
-
-    /* Find hostname start (after ://) */
-    host_start = strstr(url, "://");
-    if (!host_start) {
-        return false;
-    }
-    host_start += 3;
-
-    /* Find end of hostname (port, path, or query) */
-    host_end = host_start;
-    remaining = url_len - (host_start - url);
-    while (remaining > 0 && *host_end && *host_end != '/' && *host_end != ':' && *host_end != '?') {
-        host_end++;
-        remaining--;
-    }
-
-    host_len = host_end - host_start;
-    if (host_len == 0 || host_len > 255) {
-        return false;
-    }
-
-    /* Copy hostname to null-terminated buffer */
-    memcpy(hostname, host_start, host_len);
-    hostname[host_len] = '\0';
-
-    /* Check for localhost patterns */
-    if (pg_strcasecmp(hostname, "localhost") == 0 || strcmp(hostname, "127.0.0.1") == 0 ||
-        strcmp(hostname, "::1") == 0 || strcmp(hostname, "0.0.0.0") == 0 ||
-        strncmp(hostname, "127.", 4) == 0) {
-        return true;
-    }
-
-    /* Check for private IP ranges */
-    /* 10.0.0.0/8 */
-    if (strncmp(hostname, "10.", 3) == 0) {
-        return true;
-    }
-
-    /* 192.168.0.0/16 */
-    if (strncmp(hostname, "192.168.", 8) == 0) {
-        return true;
-    }
-
-    /* 172.16.0.0/12 (172.16.x.x - 172.31.x.x) */
-    if (strncmp(hostname, "172.", 4) == 0) {
-        int second_octet = 0;
-        if (sscanf(hostname + 4, "%d", &second_octet) == 1) {
-            if (second_octet >= 16 && second_octet <= 31) {
-                return true;
-            }
-        }
-    }
-
-    /* 169.254.0.0/16 (link-local, includes AWS metadata 169.254.169.254) */
-    if (strncmp(hostname, "169.254.", 8) == 0) {
-        return true;
-    }
-
-    /* 100.64.0.0/10 (carrier-grade NAT / shared address space) */
-    if (strncmp(hostname, "100.", 4) == 0) {
-        int second_octet = -1;
-        if (sscanf(hostname + 4, "%d", &second_octet) == 1 && second_octet >= 64 &&
-            second_octet <= 127) {
-            return true;
-        }
-    }
-
-    /* IPv6 link-local and site-local */
-    if (pg_strncasecmp(hostname, "fe80:", 5) == 0 || pg_strncasecmp(hostname, "fc00:", 5) == 0 ||
-        pg_strncasecmp(hostname, "fd00:", 5) == 0) {
-        return true;
-    }
-
-    /*
-     * DNS rebinding protection: resolve hostname and check resolved IP.
-     * Without this, an attacker can use a domain that resolves to a private IP
-     * (e.g., 169-254-169-254.nip.io -> 169.254.169.254) to bypass string-based checks.
-     */
-    {
-        struct addrinfo hints, *result, *rp;
-        int gai_ret;
-
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_UNSPEC; /* IPv4 or IPv6 */
-        hints.ai_socktype = SOCK_STREAM;
-
-        gai_ret = getaddrinfo(hostname, NULL, &hints, &result);
-        if (gai_ret != 0) {
-            /* DNS resolution failed — block as suspicious */
-            elog(DEBUG1, "[ulak] DNS resolution failed for '%s': %s", hostname,
-                 gai_strerror(gai_ret));
-            return true;
-        }
-
-        for (rp = result; rp != NULL; rp = rp->ai_next) {
-            if (rp->ai_family == AF_INET) {
-                struct sockaddr_in *ipv4 = (struct sockaddr_in *)rp->ai_addr;
-                unsigned char *ip = (unsigned char *)&ipv4->sin_addr;
-
-                /* 127.0.0.0/8 (loopback) */
-                if (ip[0] == 127) {
-                    freeaddrinfo(result);
-                    elog(WARNING, "[ulak] DNS rebinding blocked: '%s' resolves to 127.x.x.x",
-                         hostname);
-                    return true;
-                }
-                /* 10.0.0.0/8 (private) */
-                if (ip[0] == 10) {
-                    freeaddrinfo(result);
-                    elog(WARNING, "[ulak] DNS rebinding blocked: '%s' resolves to 10.x.x.x",
-                         hostname);
-                    return true;
-                }
-                /* 172.16.0.0/12 (private) */
-                if (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) {
-                    freeaddrinfo(result);
-                    elog(WARNING, "[ulak] DNS rebinding blocked: '%s' resolves to 172.16-31.x.x",
-                         hostname);
-                    return true;
-                }
-                /* 192.168.0.0/16 (private) */
-                if (ip[0] == 192 && ip[1] == 168) {
-                    freeaddrinfo(result);
-                    elog(WARNING, "[ulak] DNS rebinding blocked: '%s' resolves to 192.168.x.x",
-                         hostname);
-                    return true;
-                }
-                /* 169.254.0.0/16 (link-local, AWS metadata) */
-                if (ip[0] == 169 && ip[1] == 254) {
-                    freeaddrinfo(result);
-                    elog(WARNING, "[ulak] DNS rebinding blocked: '%s' resolves to 169.254.x.x",
-                         hostname);
-                    return true;
-                }
-                /* 100.64.0.0/10 (CGNAT shared address space) */
-                if (ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127) {
-                    freeaddrinfo(result);
-                    elog(WARNING, "[ulak] DNS rebinding blocked: '%s' resolves to 100.64.0.0/10",
-                         hostname);
-                    return true;
-                }
-                /* 0.0.0.0/8 ("this network"; Linux treats it as local) — same
-                 * range the connect-time guard refuses, so reject early. */
-                if (ip[0] == 0) {
-                    freeaddrinfo(result);
-                    elog(WARNING, "[ulak] DNS rebinding blocked: '%s' resolves to 0.0.0.0/8",
-                         hostname);
-                    return true;
-                }
-            } else if (rp->ai_family == AF_INET6) {
-                struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)rp->ai_addr;
-                unsigned char *ip6 = ipv6->sin6_addr.s6_addr;
-
-                /* ::1 (loopback) */
-                if (IN6_IS_ADDR_LOOPBACK(&ipv6->sin6_addr)) {
-                    freeaddrinfo(result);
-                    elog(WARNING, "[ulak] DNS rebinding blocked: '%s' resolves to ::1", hostname);
-                    return true;
-                }
-                /* fe80::/10 (link-local) */
-                if (IN6_IS_ADDR_LINKLOCAL(&ipv6->sin6_addr)) {
-                    freeaddrinfo(result);
-                    elog(WARNING, "[ulak] DNS rebinding blocked: '%s' resolves to link-local IPv6",
-                         hostname);
-                    return true;
-                }
-                /* fc00::/7 (unique local) */
-                if (ip6[0] == 0xfc || ip6[0] == 0xfd) {
-                    freeaddrinfo(result);
-                    elog(WARNING,
-                         "[ulak] DNS rebinding blocked: '%s' resolves to unique-local IPv6",
-                         hostname);
-                    return true;
-                }
-            }
-        }
-
-        freeaddrinfo(result);
-    }
-
-    return false;
+    return http_classify_url_target(url, url_len) == HTTP_URL_TARGET_INTERNAL;
 }
 
 /**
@@ -343,68 +361,6 @@ bool http_is_valid_method(const char *method, size_t len) {
         (len == 5 && pg_strncasecmp(method, HTTP_METHOD_PATCH, 5) == 0) ||
         (len == 6 && pg_strncasecmp(method, HTTP_METHOD_DELETE, 6) == 0)) {
         return true;
-    }
-
-    return false;
-}
-
-/**
- * @brief Check whether a resolved socket address is internal/private.
- *
- * Operates on the actual sockaddr curl is about to connect to (IPv4, IPv6,
- * and IPv4-mapped IPv6), covering loopback, RFC 1918 private ranges, the
- * link-local / cloud-metadata range (169.254.0.0/16), 0.0.0.0/8, IPv6
- * loopback/link-local, and unique-local fc00::/7.
- *
- * NOTE: keep the blocked ranges in sync with the string/getaddrinfo checks in
- * http_is_internal_url(); this is the connect-time counterpart that closes the
- * DNS-rebinding TOCTOU (curl re-resolves independently at transfer time).
- *
- * @param sa  Resolved socket address.
- * @return true if the address is internal/private (should be blocked).
- */
-static bool ulak_sockaddr_is_internal(const struct sockaddr *sa) {
-    if (sa == NULL) {
-        return false;
-    }
-
-    if (sa->sa_family == AF_INET) {
-        const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)sa;
-        const unsigned char *ip = (const unsigned char *)&ipv4->sin_addr;
-
-        if (ip[0] == 127) /* 127.0.0.0/8 loopback */
-            return true;
-        if (ip[0] == 10) /* 10.0.0.0/8 private */
-            return true;
-        if (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) /* 172.16.0.0/12 */
-            return true;
-        if (ip[0] == 192 && ip[1] == 168) /* 192.168.0.0/16 */
-            return true;
-        if (ip[0] == 169 && ip[1] == 254) /* 169.254.0.0/16 link-local / metadata */
-            return true;
-        if (ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127) /* 100.64.0.0/10 CGNAT */
-            return true;
-        if (ip[0] == 0) /* 0.0.0.0/8 */
-            return true;
-    } else if (sa->sa_family == AF_INET6) {
-        const struct sockaddr_in6 *ipv6 = (const struct sockaddr_in6 *)sa;
-        const unsigned char *ip6 = ipv6->sin6_addr.s6_addr;
-
-        if (IN6_IS_ADDR_LOOPBACK(&ipv6->sin6_addr)) /* ::1 */
-            return true;
-        if (IN6_IS_ADDR_LINKLOCAL(&ipv6->sin6_addr)) /* fe80::/10 */
-            return true;
-        if (ip6[0] == 0xfc || ip6[0] == 0xfd) /* fc00::/7 unique-local */
-            return true;
-        /* IPv4-mapped IPv6 (::ffff:a.b.c.d) — re-check the embedded IPv4, so a
-         * rebind to ::ffff:169.254.169.254 cannot bypass the IPv4 blocklist. */
-        if (IN6_IS_ADDR_V4MAPPED(&ipv6->sin6_addr)) {
-            const unsigned char *m = &ip6[12];
-            if (m[0] == 127 || m[0] == 10 || m[0] == 0 ||
-                (m[0] == 172 && m[1] >= 16 && m[1] <= 31) || (m[0] == 192 && m[1] == 168) ||
-                (m[0] == 169 && m[1] == 254) || (m[0] == 100 && m[1] >= 64 && m[1] <= 127))
-                return true;
-        }
     }
 
     return false;

@@ -52,6 +52,7 @@ struct curl_slist *http_auth_sigv4_apply(HttpAuthConfig *auth, CURL *curl,
         char *token_header =
             psprintf("x-amz-security-token: %s", auth->config.aws_sigv4.session_token);
         headers = curl_slist_append(headers, token_header);
+        explicit_bzero(token_header, strlen(token_header));
         pfree(token_header);
     }
 

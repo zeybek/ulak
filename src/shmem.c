@@ -84,9 +84,11 @@ static void ulak_shmem_startup(void) {
         ulak_shmem->last_error_msg[0] = '\0';
 
         ulak_shmem->database_count = 0;
+        SpinLockInit(&ulak_shmem->active_count_mutex);
         ulak_shmem->active_count_dboid = InvalidOid;
         ulak_shmem->active_count_cache = 0;
         ulak_shmem->active_count_checked_at = 0;
+        ulak_shmem->active_count_refresh_at = 0;
 
         /* Initialize per-database spinlocks for metrics */
         {
