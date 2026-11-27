@@ -356,7 +356,11 @@ bool redis_connect_internal(RedisDispatcher *redis, char **error_msg) {
      * 15s interval matches hiredis default. Must re-apply after reconnect
      * since redisReconnect() does not preserve keepalive settings. */
     if (redis->context) {
+#if defined(HIREDIS_MAJOR) && (HIREDIS_MAJOR > 1 || (HIREDIS_MAJOR == 1 && HIREDIS_MINOR >= 2))
         redisEnableKeepAliveWithInterval(redis->context, 15);
+#else
+        redisEnableKeepAlive(redis->context);
+#endif
     }
 
     /* Authenticate if password provided (Redis 6+ ACL: AUTH username password) */
