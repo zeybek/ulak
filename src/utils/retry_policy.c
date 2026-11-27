@@ -14,6 +14,9 @@
 #include "catalog/pg_type.h"
 #include "utils/builtins.h"
 #include "utils/numeric.h"
+#if PG_VERSION_NUM >= 190000
+#include "nodes/miscnodes.h"
+#endif
 
 #include "config/guc.h"
 #include "core/entities.h"
@@ -36,7 +39,17 @@ int get_max_retries_from_policy(Jsonb *retry_policy) {
              * the worker's result transaction, which then puts the whole
              * batch back with no retry charged, on every cycle. A huge value
              * means "retry practically forever"; anything else falls back. */
+#if PG_VERSION_NUM >= 190000
+            {
+                ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+                max_retries = numeric_int4_safe(max_retries_val.val.numeric,
+                                               (Node *) &escontext);
+                out_of_range = escontext.error_occurred;
+            }
+#else
             max_retries = numeric_int4_opt_error(max_retries_val.val.numeric, &out_of_range);
+#endif
             if (out_of_range)
                 return DatumGetBool(DirectFunctionCall2(
                            numeric_gt, NumericGetDatum(max_retries_val.val.numeric),
